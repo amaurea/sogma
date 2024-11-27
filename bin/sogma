@@ -1,0 +1,147 @@
+#!/usr/bin/env python
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("obsinfo")
+parser.add_argument("area")
+parser.add_argument("odir")
+parser.add_argument("-p", "--prefix",  type=str, default=None)
+parser.add_argument("-v", "--verbose", action="count", default=1)
+parser.add_argument("-q", "--quiet",   action="count", default=0)
+parser.add_argument("-n", "--maxfiles",type=int, default=None)
+args = parser.parse_args()
+
+# Should some of this be factored out into an
+# SO-specific mapmaker class?
+
+import numpy as np, os, time
+from pixell import enmap, utils, mpi, colors
+import cupy
+import gpu_mm
+from sogma import gutils, logging, gmem, mapmaking, files, tiling, nmat
+from sogma.gmem import scratch
+
+def check_symmetry(mapmaker):
+	n = mapmaker.dof.ndof
+	m = n
+	A = np.zeros((m,m))
+	for i in range(m):
+		print("%4d/%d" % (i+1,m))
+		u = utils.uvec(n,i)
+		A[:,i] = mapmaker.A(u)[:m]
+	#np.savetxt("/dev/stdout", A, fmt="%10.5e")
+	np.save("test_A.npy", A)
+	1/0
+
+def check_symmetry2(mapmaker):
+	n    = mapmaker.dof.ndof
+	np.random.seed(1)
+	v, w = np.random.randn(2,n).astype(np.float32)
+	q1   = v.dot(mapmaker.A(w))
+	q2   = w.dot(mapmaker.A(v))
+	print("check_symmetry2")
+	print(q1, q2)
+	print(np.abs(q1-q2)/np.abs(q1))
+
+def check_symmetry3(pmat):
+	pointing = pmat.pfit.eval()
+	plan     = pmat._make_plan(pointing)
+	# make input and output local maps
+	v   = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
+	w   = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
+	PPv = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
+	PPw = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
+	tod = cupy.zeros((len(pmat.polang),len(pmat.ctime)), np.float32)
+	# Fill v and w with random numbers
+	v.arr[:], w.arr[:] = cupy.random.randn(2,w.arr.size)
+	# Perform our test
+	gpu_mm.map2tod(tod, v, pointing, plan)
+	gpu_mm.tod2map(PPv, tod, pointing, plan)
+	q1 = PPv.arr.dot(w.arr)
+	gpu_mm.map2tod(tod, w, pointing, plan)
+	gpu_mm.tod2map(PPw, tod, pointing, plan)
+	q2 = PPw.arr.dot(v.arr)
+	# Interesting! This works, but the version that used pmat did not!
+	print("check_symmetry3")
+	print(q1, q2)
+	print(np.abs(q1-q2)/np.abs(q1))
+
+def check_symmetry3b(pmat):
+	buf1 = gmem.CuBuffer("buf1")
+	buf2 = gmem.CuBuffer("buf2")
+	buf3 = gmem.CuBuffer("buf3")
+	buf4 = gmem.CuBuffer("buf4")
+	v    = tiledist.glmap(buf=buf1)
+	w    = tiledist.glmap(buf=buf2)
+	q1   = tiledist.glmap(buf=buf3)
+	q2   = tiledist.glmap(buf=buf4)
+	v.arr[:], w.arr[:] = cupy.random.randn(2,w.arr.size)
+	gtod = scratch.tod.zeros((len(pmat.polang),len(pmat.ctime)),dtype=np.float32)
+	pmat.forward(gtod, v)
+	pmat.backward(gtod, q1)
+	q1 = q1.arr.dot(w.arr)
+	pmat.forward(gtod, w)
+	pmat.backward(gtod, q2)
+	q2 = q2.arr.dot(v.arr)
+	print("check_symmetry3b")
+	print(q1, q2)
+	print(np.abs(q1-q2)/np.abs(q1))
+
+obsinfo = files.read_obsinfo(args.obsinfo, nmax=args.maxfiles)
+nfile  = len(obsinfo)
+comm   = mpi.COMM_WORLD
+dtype_tod  = np.float32
+dtype_map  = np.float32
+shape, wcs = enmap.read_map_geometry(args.area)
+L = logging.Logger(id=comm.rank, level=args.verbose-args.quiet).setdefault()
+L.print("Init", level=0, id=0, color=colors.lgreen)
+# Set up our gpu scratch memory. These will be used for intermediate calculations.
+# Comments give estimated memory requirements. May not need to declear all these
+# here any more. Only the ones that will be shared across multiple objects need to be
+scratch.tod      = gmem.CuBuffer("tod")       # 1 GB
+scratch.ft       = gmem.CuBuffer("ft")        # 1 GB
+scratch.pointing = gmem.CuBuffer("pointing")  # 3 GB
+scratch.plan     = gmem.CuBuffer("plan")      # 0.1  GB
+scratch.nmat_work= gmem.CuBuffer("nmat_work") # 0.15 GB
+scratch.cut      = gmem.CuBuffer("cut")       # 0.3  GB (up to 30% cut)
+# Disable the cufft cache. It uses too much gpu memory
+cupy.fft.config.get_plan_cache().set_memsize(0)
+L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
+prefix = args.odir + "/"
+if args.prefix: prefix += args.prefix + "_"
+utils.mkdir(args.odir)
+# Set up the signals we will solve for
+signal_map = mapmaking.SignalMapGpu2(shape, wcs, comm, dtype=np.float32)
+# FIXME: poly cuts need a better preconditioner or better basis.
+# The problem is probably that the legendre polynomials lose their orthogonality
+# with the truncated block approach used here
+#signal_cut = mapmaking.SignalCutPolyGpu(comm, precon="var")
+signal_cut = mapmaking.SignalCutFullGpu(comm)
+# Set up the mapmaker
+mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecsGpu())
+# Add our observations
+for ind in range(comm.rank, nfile, comm.size):
+	ifile = obsinfo.path[ind]
+	id    = ".".join(os.path.basename(ifile).split(".")[:-1])
+	t1    = time.time()
+	data  = files.read_tod(ifile)
+	t2    = time.time()
+	with gmem.leakcheck("mapmaker.add_obs"):
+		mapmaker.add_obs(id, data, deslope=False)
+		gmem.gpu_garbage_collect()
+	del data
+	t3    = time.time()
+	L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2))
+
+#mapmaker.prepare()
+#check_symmetry(mapmaker)
+#check_symmetry3(signal_map.data[signal_map.ids[0]].pmap)
+#check_symmetry3b(signal_map.data[signal_map.ids[0]].pmap)
+#check_symmetry2(mapmaker)
+
+# Solve the equation system
+for step in mapmaker.solve():
+	L.print("CG %4d %15.7e (%6.3f s)" % (step.i, step.err, step.t), id=0, level=1, color=colors.lgreen)
+	if step.i % 10 == 0:
+		for signal, val in zip(mapmaker.signals, step.x):
+			if signal.output:
+				signal.write(prefix, "map%04d" % step.i, val)

@@ -1,3 +1,6 @@
+import numpy as np, time
+from pixell import utils, fft, bunch
+
 def get_filelist(ifiles):
 	fnames = []
 	for gfile in ifiles:
@@ -9,6 +12,15 @@ def get_filelist(ifiles):
 			else:
 				fnames.append(ifile)
 	return fnames
+
+def read_obsinfo(fname, nmax=None):
+	dtype = [("path","U256"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
+	info  = np.loadtxt(fname, dtype=dtype, max_rows=nmax, ndmin=1).view(np.recarray)
+	# Convert to standard units
+	info.dur   *= utils.minute
+	info.r     *= utils.degree
+	info.sweep *= utils.degree # [ntod,npoint,{ra,dec}]
+	return info
 
 def read_tod(fname, mul=32):
 	"""Read a tod file in the simple npz format we use"""

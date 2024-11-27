@@ -1,12 +1,13 @@
 import numpy as np
-import cupy
+import cupy, time
+import gpu_mm
 from pixell import utils, bunch, enmap
-from . import nmat, pmat
+from . import nmat, pmat, tiling, gmem, gutils
 from .gmem import scratch
 from .logging import L
 
 class MLMapmaker:
-	def __init__(self, signals=[], noise_model=None, dtype=np.float32, verbose=False, mode="gpu"):
+	def __init__(self, signals=[], noise_model=None, dtype=np.float32, verbose=False):
 		"""Initialize a Maximum Likelihood Mapmaker.
 		Arguments:
 		* signals: List of Signal-objects representing the models that will be solved
@@ -24,11 +25,9 @@ class MLMapmaker:
 		self.data     = []
 		self.dof      = MultiZipper()
 		self.ready    = False
-		self.mode     = mode
 	def add_obs(self, id, obs, deslope=True, noise_model=None):
 		# Prepare our tod
 		t1 = time.time()
-		ap     = cupy if self.mode == "gpu" else np
 		ctime  = obs.ctime
 		srate  = (len(ctime)-1)/(ctime[-1]-ctime[0])
 		tod    = obs.tod.astype(self.dtype, copy=False)
@@ -36,7 +35,7 @@ class MLMapmaker:
 		if deslope:
 			utils.deslope(tod, w=5, inplace=True)
 		t3 = time.time()
-		gtod = scratch.tod.copy(tod)
+		gtod = scratch.tod.array(tod)
 		del tod
 		# Allow the user to override the noise model on a per-obs level
 		if noise_model is None: noise_model = self.noise_model
@@ -74,44 +73,47 @@ class MLMapmaker:
 	def A(self, x):
 		t1 = time.time()
 		iwork = [signal.to_work(m) for signal,m in zip(self.signals,self.dof.unzip(x))]
-		owork = [w*0 for w in iwork]
-		ap    = anypy(iwork[0])
+		owork = [signal.owork()    for signal in self.signals]
 		t2 = time.time()
 		for di, data in enumerate(self.data):
 			# This is the main place that needs to change for the GPU implementation
-			ta1 = cutime()
-			#gtod= ap.zeros([data.ndet, data.nsamp], self.dtype)
-			gtod = scratch.tod.view([data.ndet, data.nsamp], self.dtype)
-			ta2 = cutime()
+			ta1  = gutils.cutime()
+			gtod = scratch.tod.empty([data.ndet, data.nsamp], self.dtype)
+			ta2  = gutils.cutime()
 			for si, signal in reversed(list(enumerate(self.signals))):
 				signal.precalc_setup(data.id)
 				signal.forward(data.id, gtod, iwork[si])
-			ta3 = cutime()
+			ta3 = gutils.cutime()
 			data.nmat.apply(gtod)
-			ta4 = cutime()
+			ta4 = gutils.cutime()
 			for si, signal in enumerate(self.signals):
 				signal.backward(data.id, gtod, owork[si])
 				signal.precalc_free(data.id)
-			ta5 = cutime()
-			#gpu_garbage_collect()
-			ta6 = cutime()
+			ta5 = gutils.cutime()
+			#gmem.gpu_garbage_collect()
+			ta6 = gutils.cutime()
 			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f gc %6.4f %s" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, ta6-ta5, data.id), level=2)
-		t3 = cutime()
+		t3 = gutils.cutime()
 		result = self.dof.zip(*[signal.from_work(w) for signal,w in zip(self.signals,owork)])
-		t4 = cutime()
+		t4 = gutils.cutime()
 		L.print("A prep %6.3f PNP %6.3f finish %6.3f" % (t2-t1, t3-t2, t4-t3), level=2)
 		return result
 	def M(self, x):
-		t1 = cutime()
+		t1 = gutils.cutime()
 		iwork = self.dof.unzip(x)
+
+		#for si, (signal, w) in enumerate(zip(self.signals, iwork)):
+		#	np.save("test_%s.npy" % signal.name, np.array([w,signal.precon(w)]))
+
 		result = self.dof.zip(*[signal.precon(w) for signal, w in zip(self.signals, iwork)])
-		t2 = cutime()
+		t2 = gutils.cutime()
 		L.print("M %6.3f" % (t2-t1), level=2)
 		return result
 	def solve(self, maxiter=500, maxerr=1e-6):
 		self.prepare()
 		rhs    = self.dof.zip(*[signal.rhs for signal in self.signals])
 		solver = utils.CG(self.A, rhs, M=self.M, dot=self.dof.dot)
+		#solver = utils.Minres(self.A, rhs, dot=self.dof.dot)
 		while solver.i < maxiter and solver.err > maxerr:
 			t1 = time.time()
 			solver.step()
@@ -146,6 +148,152 @@ class Signal:
 	def to_work  (self, x): return x.copy()
 	def from_work(self, x): return x
 	def write   (self, prefix, tag, x): pass
+
+# This will be updated to take a tiling instead of a shape, wcs, comm.
+# Or could build the tiling internally, hiding that detail from the user.
+# No, we need obsinfo to set up the tiling. So have to change the interface
+# anyway.
+
+# rhs, div, hits would not be preallocated, but would be left to grow
+# in the dynamic pmap.
+# During prepare, the tiling would be finalized, and we would perform
+# our first reductions
+
+# Terminology:
+#  * gmap:  global tile map on cpu
+#  * lmap:  local  tile map on cpu
+#  * glmap: local  tile map on gpu
+#  * dmap:  dynamic map on gpu
+
+class SignalMapGpu2(Signal):
+	"""Signal describing a non-distributed sky map."""
+	def __init__(self, shape, wcs, comm, name="sky", ofmt="{name}", output=True,
+			ext="fits", dtype=np.float32, ibuf=None, obuf=None,
+			sys=None, interpol=None):
+		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
+		to equatorial coordinates. If tiled==True, then this will be a distributed map with
+		the given tile_shape, otherwise it will be a plain enmap. interpol controls the
+		pointing matrix interpolation mode. See so3g's Projectionist docstring for details."""
+		Signal.__init__(self, name, ofmt, output, ext)
+		self.sys   = sys
+		self.dtype = dtype
+		self.interpol = interpol
+		self.data  = {}
+		self.comps = "TQU"
+		self.ncomp = 3
+		self.comm  = comm
+		self.ids   = []
+		# Set up our internal tiling
+		self.shape,  self.wcs = shape, wcs
+		self.fshape, self.fwcs, self.off = tiling.infer_fullsky_geometry(shape, wcs)
+		self.tiledist = None # Will be built later
+		# Dynamic RHS map which we will accumulate into
+		self.drhs  = gpu_mm.DynamicMap(*self.fshape, dtype)
+		# Buffers to use
+		self.ibuf  = ibuf or gmem.CuBuffer(name + "_iwork").register()
+		self.obuf  = obuf or gmem.CuBuffer(name + "_owork").register()
+	def add_obs(self, id, obs, nmat, Nd, pmap=None):
+		"""Add and process an observation, building the pointing matrix
+		and our part of the RHS. "obs" should be an Observation axis manager,
+		nmat a noise model, representing the inverse noise covariance matrix,
+		and Nd the result of applying the noise model to the detector time-ordered data.
+		"""
+		#Nd     = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		ctime  = obs.ctime
+		t1     = time.time()
+		# could pass this in, but fast to construct. Should ideally match what's used in
+		# signal_cut to be safest, but only uses .clear which should be the same for all
+		# of them anyway
+		pcut   = pmat.PmatCutFullGpu(obs.cuts)
+		#pcut   = PmatCutNull(obs.cuts)
+		if pmap is None:
+			pmap = pmat.PmatMapGpu2(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=Nd.dtype)
+			gmem.gpu_garbage_collect()
+		# Precompute pointing for the upcoming pmap observations
+		# Accumulate local rhs
+		t2 = time.time()
+		pcut.clear(Nd)
+		pmap.backward(Nd, self.drhs)
+		gmem.gpu_garbage_collect()
+		t3 = time.time()
+		L.print("Init map pmat %6.3f rhs %6.3f %s" % (t2-t1,t3-t2,id), level=2)
+		# Save the per-obs things we need. Just the pointing matrix in our case.
+		# Nmat and other non-Signal-specific things are handled in the mapmaker itself.
+		self.data[id] = bunch.Bunch(pmap=pmap, pcut=pcut, nmat=nmat, tod_shape=Nd.shape, tod_dtype=Nd.dtype)
+		self.ids.append(id)
+	def calc_hits(self, weight=False):
+		"""Calculate the local div or hits map. Tiling must be
+		finalized before we do this. Will need a different function for non-scalar div"""
+		# Could save one map buffer by calculating these separately,
+		# but that would be slower
+		glhits = self.tiledist.gomap(buf=self.obuf, dtype=self.dtype) # gpu_mm.LocalMap
+		for i, id in enumerate(self.ids):
+			d   = self.data[id]
+			t1  = time.time()
+			tod = scratch.tod.full(d.tod_shape, 1, d.tod_dtype)
+			if weight: d.nmat.white(tod)
+			d.pmap.backward(tod, glhits)
+			t2  = time.time()
+			L.print("Init map hits %d %6.3f %s" % (weight, t2-t1,id), level=2)
+		return glhits
+	def prepare(self):
+		"""Called when we're done adding everything. Sets up the map distribution,
+		degrees of freedom and preconditioner."""
+		if self.ready: return
+		t1 = time.time()
+		# Ok, this is where we finally know enough to finish the tiledist
+		glrhs  = self.drhs.finalize(); del self.drhs
+		self.tiledist = tiling.TileDistribution(self.fshape, self.fwcs, glrhs.pixelization, self.comm)
+		# Reduce to global tiles and free up the arrays on the dpu
+		t2 = time.time()
+		self.rhs   = self.tiledist.gomap2dmap(glrhs);  del glrhs
+		t3 = time.time()
+		glhits = self.calc_hits(weight=False)
+		gmem.gpu_garbage_collect()
+		t4 = time.time()
+		self.hits  = self.tiledist.gomap2dmap(glhits); del glhits
+		self.hits  = self.hits[:,:1]
+		t5 = time.time()
+		gldiv = self.calc_hits(weight=True)
+		gmem.gpu_garbage_collect()
+		t6 = time.time()
+		self.div   = self.tiledist.gomap2dmap(gldiv); del gldiv
+		self.div   = self.div[:,:1]
+		t7 = time.time()
+		# Set up our degrees of freedom
+		self.dof   = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
+		self.idiv  = gutils.safe_inv(self.div)
+		t8 = time.time()
+		L.print("Prep fin %6.3f div %6.3f red %6.3f prec %6.3f" % (t2-t1, t4-t3+t6-t5, t3-t2+t5-t4+t7-t6, t8-t7), level=2)
+		self.ready = True
+	def forward(self, id, gtod, glmap, tmul=1):
+		"""map2tod operation. For tiled maps, the map should be in work distribution,
+		as returned by unzip. Adds into tod."""
+		if id not in self.data: return # Should this really skip silently like this?
+		if tmul != 1: gtod *= tmul
+		self.data[id].pmap.forward(gtod, glmap)
+	def backward(self, id, gtod, glmap, mmul=1):
+		"""tod2map operation. For tiled maps, the map should be in work distribution,
+		as returned by unzip. Adds into map"""
+		if id not in self.data: return
+		if mmul != 1: glmap *= mmul
+		self.data[id].pmap.backward(gtod, glmap)
+	def precalc_setup(self, id): self.data[id].pmap.precalc_setup()
+	def precalc_free (self, id): self.data[id].pmap.precalc_free()
+	def precon(self, gmap):
+		return self.idiv * gmap
+	def to_work(self, gmap): return self.tiledist.dmap2gomap(gmap, buf=self.ibuf)
+	def from_work(self, glmap): return self.tiledist.gomap2dmap(glmap)
+	def owork(self): return self.tiledist.gomap(self.obuf, dtype=self.dtype)
+	def write(self, prefix, tag, m):
+		if not self.output: return
+		oname = self.ofmt.format(name=self.name)
+		#oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+		# This should reduce the global map into the target map. For now
+		# will just dump tiles directly
+		oname = "%s%s_%s_%03d.%s" % (prefix, oname, tag, self.comm.rank, self.ext)
+		np.save(oname, m)
+		return oname
 
 class SignalMapGpu(Signal):
 	"""Signal describing a non-distributed sky map."""
@@ -184,12 +332,12 @@ class SignalMapGpu(Signal):
 		#pcut   = PmatCutNull(obs.cuts)
 		if pmap is None:
 			pmap = pmat.PmatMapGpu(self.rhs.shape, self.rhs.wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=Nd.dtype)
-			gpu_garbage_collect()
+			gmem.gpu_garbage_collect()
 		# Build the RHS for this observation
 		t2 = time.time()
 		pcut.clear(Nd)
 		obs_rhs = pmap.backward(Nd)
-		gpu_garbage_collect()
+		gmem.gpu_garbage_collect()
 		t3 = time.time()
 		# Build the per-pixel inverse variance for this observation.
 		# This will be scalar to make the preconditioner fast, but uses
@@ -201,14 +349,14 @@ class SignalMapGpu(Signal):
 		pcut.clear(Nd)
 		Nd = nmat.white(Nd)
 		obs_div = pmap.backward(Nd)[0]
-		gpu_garbage_collect()
+		gmem.gpu_garbage_collect()
 		t4 = time.time()
 		# Build hitcount
 		Nd[:]        = 0
 		pmap.forward(Nd, ones)
 		pcut.clear(Nd)
 		obs_hits = pmap.backward(Nd)[0]
-		gpu_garbage_collect()
+		gmem.gpu_garbage_collect()
 		t5 = time.time()
 		del Nd, ones
 		# Update our full rhs and div. This works for both plain and distributed maps
@@ -218,7 +366,7 @@ class SignalMapGpu(Signal):
 		self.rhs = self.rhs .insert(obs_rhs , op=np.ndarray.__iadd__)
 		self.div = self.div .insert(obs_div , op=np.ndarray.__iadd__)
 		self.hits= self.hits.insert(obs_hits, op=np.ndarray.__iadd__)
-		gpu_garbage_collect()
+		gmem.gpu_garbage_collect()
 		t6 = time.time()
 		L.print("Init map pmat %6.3f rhs %6.3f div %6.3f hit %6.3f add %6.3f %s" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,id), level=2)
 		# Save the per-obs things we need. Just the pointing matrix in our case.
@@ -234,8 +382,7 @@ class SignalMapGpu(Signal):
 			self.div  = utils.allreduce(self.div, self.comm)
 			self.hits = utils.allreduce(self.hits,self.comm)
 		self.dof   = MapZipper(*self.rhs.geometry, dtype=self.dtype)
-		#self.idiv  = safe_invert_ivar(self.div)
-		self.idiv  = safe_inv(self.div)
+		self.idiv  = gutils.safe_inv(self.div)
 		t2 = time.time()
 		L.print("Prep map %6.3f" % (t2-t1), level=2)
 		self.ready = True
@@ -257,7 +404,7 @@ class SignalMapGpu(Signal):
 		return self.idiv * map
 	def to_work(self, map):
 		#return cupy.array(map)
-		return scratch.map.copy(map)
+		return scratch.map.array(map)
 	def from_work(self, gmap):
 		map = enmap.enmap(gmap.get(), self.rhs.wcs, self.rhs.dtype, copy=False)
 		if self.comm is None: return map
@@ -303,7 +450,7 @@ class SignalCutFullGpu(Signal):
 		self.off += pcut.ndof
 		self.rhs.append(obs_rhs)
 		self.idiv.append(obs_idiv)
-		gpu_garbage_collect()
+		gmem.gpu_garbage_collect()
 	def prepare(self):
 		"""Process the added observations, determining our degrees of freedom etc.
 		Should be done before calling forward and backward."""
@@ -317,8 +464,6 @@ class SignalCutFullGpu(Signal):
 		d = self.data[id]
 		d.pcut.forward(gtod, gjunk[d.i1:d.i2])
 	def precon(self, junk):
-		print("A", np.std(junk))
-		print("B", np.std(junk*self.idiv))
 		return junk*self.idiv
 	def backward(self, id, gtod, gjunk):
 		if id not in self.data: return
@@ -326,6 +471,7 @@ class SignalCutFullGpu(Signal):
 		d.pcut.backward(gtod, gjunk[d.i1:d.i2])
 	def to_work  (self, x): return cupy.array(x)
 	def from_work(self, x): return x.get()
+	def owork(self): return cupy.zeros(self.rhs.shape, self.rhs.dtype)
 	def write(self, prefix, tag, m):
 		if not self.output: return
 		if self.comm is None:
@@ -376,7 +522,7 @@ class SignalCutPolyGpu(SignalCutFullGpu):
 		self.off += pcut.ndof
 		self.rhs.append(obs_rhs)
 		self.idiv.append(obs_idiv)
-		gpu_garbage_collect()
+		gmem.gpu_garbage_collect()
 	def precon(self, junk):
 		# For some reason this fails with negative residuals when I use this well-motivated
 		# and symmetric preconditioner, but suddenly works fine when I use no preconditioner at all.

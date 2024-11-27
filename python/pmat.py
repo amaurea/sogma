@@ -7,6 +7,56 @@ from . import gutils
 from .gmem import scratch
 from .logging import L
 
+class PmatMapGpu2:
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
+		"""shape, wcs should be for a fullsky geometry, since we assume
+		x wrapping and no negative y pixels"""
+		self.ctime = ctime
+		self.bore  = bore
+		self.offs  = offs
+		self.polang= polang
+		self.dtype = dtype
+		self.ncomp = ncomp
+		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype)
+		self.preplan  = gpu_mm.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
+		self.pointing = None
+		self.plan     = None
+	def forward(self, gtod, glmap):
+		"""Argument is a LocalMap or equivalent"""
+		t1 = gutils.cutime()
+		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
+		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
+		t2 = gutils.cutime()
+		gpu_mm.map2tod(gtod, glmap, pointing, plan)
+		t3 = gutils.cutime()
+		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		return gtod
+	def backward(self, gtod, glmap):
+		t1 = gutils.cutime()
+		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
+		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
+		t2 = gutils.cutime()
+		gpu_mm.tod2map(glmap, gtod, pointing, plan)
+		t3 = gutils.cutime()
+		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		return glmap
+	def precalc_setup(self):
+		t1 = gutils.cutime()
+		self.pointing = self.pfit.eval()
+		self.plan     = self._make_plan(self.pointing)
+		t2 = gutils.cutime()
+		L.print("Pprep %6.4f" % (t2-t1), level=3)
+	def precalc_free (self):
+		self.pointing = None
+		self.plan     = None
+	def _make_plan(self, pointing):
+		# Here it would have been convenient if BufAllocator could grow.
+		# Instead we have to calculate and reserve the size needed
+		size = scratch.plan.aligned_size(self.preplan.plan_nbytes, self.preplan.plan_constructor_tmp_nbytes)
+		scratch.plan.reserve(size)
+		with scratch.plan.as_allocator():
+			return gpu_mm.PointingPlan(self.preplan, pointing)
+
 class PmatMapGpu:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
 		self.shape = shape
@@ -161,8 +211,8 @@ def calc_pointing(ctime, bore, offs, polang, site="so", weather="typical", dtype
 class PointingFit:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang,
 			subsamp=200, site="so", weather="typical", dtype=np.float64,
-			nt=1, nx=3, ny=3, store_basis=False):
-		"""Jon's polynomial pointing fit. This predicts each detectors celestial
+			nt=1, nx=3, ny=3, store_basis=False, positive_x=False):
+		"""Jon's polynomial pointing fit. This predicts each detector's celestial
 		coordinates based on the array center's celestial coordinates. The model
 		fit is
 		 pos_det = B a + n
@@ -181,13 +231,12 @@ class PointingFit:
 		self.dtype = dtype
 		self.store_basis = store_basis
 		self.subsamp     = subsamp
-		self.nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[1]))
+		self.nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
 		# 1. Find the typical detector offset
 		off0 = np.mean(offs, 0)
 		# 2. We want to be able to calculate y,x,psi for any detector offset
 		p0 = enmap.pix2sky(shape, wcs, [0,0]) # [{dec,ra}]
 		dp = wcs.wcs.cdelt[::-1]*utils.degree # [{dec,ra}]
-		nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
 		def calc_pixs(ctime, bore, offs, polang):
 			offs, polang = np.asarray(offs), np.asarray(polang)
 			ndet, nsamp  = len(offs), bore.shape[1]
@@ -202,6 +251,17 @@ class PointingFit:
 		ref_pixs = cupy.array(calc_pixs(ctime, bore, off0[None], [0])[:,0])
 		# 4. Calculate a sparse pointing for the individual detectors
 		det_pixs = cupy.array(calc_pixs(ctime[::subsamp], bore[:,::subsamp], offs, polang))
+		# 4b. Add multiples of the sky wrapping so all x pixels are positive.
+		# This is useful if we do map-space wrapping instead of per-sample wrapping
+		if positive_x:
+			# Assume we move at most 1 pixel per sample when accounting for worst
+			# case underestimate of minimum x position. The tiling must be wide enough
+			# to accomodate this of course
+			offset = (subsamp-cupy.min(det_pixs[1])+self.nphi)//self.nphi*self.nphi
+			ref_pixs[1] += offset
+			det_pixs[1] += offset
+		# 4b. This is where we would add a multiple of nphi to ref_pixs and det_pixs if we wanted
+		# all pixel indices to be positive
 		# 5. Calculate the basis
 		B        = self.basis(ref_pixs)
 		# Store either the basis or the reference pointing
@@ -241,13 +301,6 @@ class PointingFit:
 			B = self.B if self.store_basis else self.basis(self.ref_pixs)
 		if coeffs is None:
 			coeffs = self.coeffs
-		#return self.wrap(coeffs.dot(B))
-		pointing = scratch.pointing.view(coeffs.shape[:-1]+B.shape[1:], B.dtype)
+		pointing = scratch.pointing.empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
 		coeffs.dot(B, out=pointing)
-		pointing = self.wrap(pointing)
 		return pointing
-	def wrap(self, pixs):
-		# FIXME: Remove this when mapmaker handles this itself
-		gpu_mm.clip(pixs[0], 1, self.shape[-2]-2)
-		gpu_mm.clip(pixs[1], 1, self.shape[-1]-2)
-		return pixs

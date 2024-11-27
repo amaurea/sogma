@@ -1,6 +1,7 @@
 import time
 import numpy as np
 import cupy
+from pixell import utils
 
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
@@ -83,3 +84,16 @@ def leginverses(basis):
 			iBBs[i,j,j] = 1
 	return iBBs
 
+def safe_inv(a):
+	with utils.nowarn():
+		res = 1/a
+		res[~np.isfinite(res)] = 0
+	return res
+
+def safe_invert_ivar(ivar, tol=1e-3):
+	vals = ivar[ivar!=0]
+	ref  = np.mean(vals[::100])
+	iivar= ivar*0
+	good = ivar>ref*tol
+	iivar[good] = 1/ivar[good]
+	return iivar

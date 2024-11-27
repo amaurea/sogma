@@ -1,8 +1,9 @@
 import numpy as np
 import cupy
+import gpu_mm
 from cupy.cuda import cublas
 from pixell import utils, bunch
-from . import gutils
+from . import gutils, gmem
 from .gutils import anypy
 from .gmem import scratch
 from .logging import L
@@ -106,7 +107,7 @@ class NmatDetvecsGpu(Nmat):
 		tod   = cupy.asarray(tod)
 		gutils.apply_window(tod, nwin)
 		#ft   = cupy.fft.rfft(tod)
-		ft    = gpu_mm.cufft.rfft(tod, plan_cache=plan_cache)
+		ft    = gpu_mm.cufft.rfft(tod, plan_cache=gmem.plan_cache)
 		# Unapply window again
 		gutils.apply_window(tod, nwin, -1)
 		del tod
@@ -153,17 +154,17 @@ class NmatDetvecsGpu(Nmat):
 				bins=bins, iD=iD, V=V, Kh=Kh, ivar=ivar)
 		return nmat
 	def apply(self, gtod, inplace=True):
-		t1 = cutime()
+		t1 =gutils.cutime()
 		if not inplace: god = gtod.copy()
 		gutils.apply_window(gtod, self.nwin)
-		t2 = cutime()
+		t2 =gutils.cutime()
 		#with scratch.ft.as_allocator():
 		#	ft = cupy.fft.rfft(gtod, axis=1)
-		ft = scratch.ft.view((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
-		gpu_mm.cufft.rfft(gtod, ft, plan_cache=plan_cache)
+		ft = scratch.ft.empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
+		gpu_mm.cufft.rfft(gtod, ft, plan_cache=gmem.plan_cache)
 		# If we don't cast to real here, we get the same result but much slower
 		rft = ft.view(gtod.dtype)
-		t3 = cutime()
+		t3 =gutils.cutime()
 		# Work arrays. Safe to overwrite tod array here, since we'll overwrite it with the ifft afterwards anyway
 		ndet, nmode = self.V.shape
 		nbin        = len(self.bins)
@@ -174,11 +175,11 @@ class NmatDetvecsGpu(Nmat):
 			divtmp = cupy.empty([ndet,nmode],         dtype=rft.dtype)
 			apply_vecs_gpu(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, handle=self.handle, out=rft)
 		cupy.cuda.runtime.deviceSynchronize()
-		t4 = cutime()
-		gpu_mm.cufft.irfft(ft, gtod, plan_cache=plan_cache)
-		t5 = cutime()
+		t4 =gutils.cutime()
+		gpu_mm.cufft.irfft(ft, gtod, plan_cache=gmem.plan_cache)
+		t5 =gutils.cutime()
 		gutils.apply_window(gtod, self.nwin)
-		t6 = cutime()
+		t6 =gutils.cutime()
 		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
 		return gtod
 	def white(self, gtod, inplace=True):
@@ -305,20 +306,6 @@ def sichol(A):
 	except np.linalg.LinAlgError:
 		return np.linalg.cholesky(-iA), -1
 
-def safe_inv(a):
-	with utils.nowarn():
-		res = 1/a
-		res[~np.isfinite(res)] = 0
-	return res
-
-def safe_invert_ivar(ivar, tol=1e-3):
-	vals = ivar[ivar!=0]
-	ref  = np.mean(vals[::100])
-	iivar= ivar*0
-	good = ivar>ref*tol
-	iivar[good] = 1/ivar[good]
-	return iivar
-
 def woodbury_invert(D, V, s=1):
 	"""Given a compressed representation C = D + sVV', compute a
 	corresponding representation for inv(C) using the Woodbury
@@ -329,7 +316,7 @@ def woodbury_invert(D, V, s=1):
 	V = V.reshape(-1, V.shape[-2], V.shape[-1])
 	I = np.eye(V.shape[2])
 	# Allocate our output arrays
-	iD = safe_inv(D)
+	iD = gutils.safe_inv(D)
 	iV = V*0
 	# Invert each
 	for i in range(len(D)):

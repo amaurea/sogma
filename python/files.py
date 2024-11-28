@@ -40,7 +40,7 @@ def read_tod(fname, mul=32):
 		res.cuts         = mask2cuts(f["cuts"][:,:n])
 	for key in res:
 		res[key] = np.ascontiguousarray(res[key])
-	print("ndet %d nsamp %d primes %s" % (res.tod.shape[0], res.tod.shape[1], utils.primes(res.tod.shape[1])))
+	#print("ndet %d nsamp %d primes %s" % (res.tod.shape[0], res.tod.shape[1], utils.primes(res.tod.shape[1])))
 	return res
 
 # Cuts will be represented by det[nrange], start[nrange], len[nrange]. This is similar to

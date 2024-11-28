@@ -20,72 +20,6 @@ import gpu_mm
 from sogma import gutils, logging, gmem, mapmaking, files, tiling, nmat
 from sogma.gmem import scratch
 
-def check_symmetry(mapmaker):
-	n = mapmaker.dof.ndof
-	m = n
-	A = np.zeros((m,m))
-	for i in range(m):
-		print("%4d/%d" % (i+1,m))
-		u = utils.uvec(n,i)
-		A[:,i] = mapmaker.A(u)[:m]
-	#np.savetxt("/dev/stdout", A, fmt="%10.5e")
-	np.save("test_A.npy", A)
-	1/0
-
-def check_symmetry2(mapmaker):
-	n    = mapmaker.dof.ndof
-	np.random.seed(1)
-	v, w = np.random.randn(2,n).astype(np.float32)
-	q1   = v.dot(mapmaker.A(w))
-	q2   = w.dot(mapmaker.A(v))
-	print("check_symmetry2")
-	print(q1, q2)
-	print(np.abs(q1-q2)/np.abs(q1))
-
-def check_symmetry3(pmat):
-	pointing = pmat.pfit.eval()
-	plan     = pmat._make_plan(pointing)
-	# make input and output local maps
-	v   = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
-	w   = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
-	PPv = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
-	PPw = gpu_mm.LocalMap(tiledist.loc, cupy.zeros(tiledist.locsize, np.float32))
-	tod = cupy.zeros((len(pmat.polang),len(pmat.ctime)), np.float32)
-	# Fill v and w with random numbers
-	v.arr[:], w.arr[:] = cupy.random.randn(2,w.arr.size)
-	# Perform our test
-	gpu_mm.map2tod(tod, v, pointing, plan)
-	gpu_mm.tod2map(PPv, tod, pointing, plan)
-	q1 = PPv.arr.dot(w.arr)
-	gpu_mm.map2tod(tod, w, pointing, plan)
-	gpu_mm.tod2map(PPw, tod, pointing, plan)
-	q2 = PPw.arr.dot(v.arr)
-	# Interesting! This works, but the version that used pmat did not!
-	print("check_symmetry3")
-	print(q1, q2)
-	print(np.abs(q1-q2)/np.abs(q1))
-
-def check_symmetry3b(pmat):
-	buf1 = gmem.CuBuffer("buf1")
-	buf2 = gmem.CuBuffer("buf2")
-	buf3 = gmem.CuBuffer("buf3")
-	buf4 = gmem.CuBuffer("buf4")
-	v    = tiledist.glmap(buf=buf1)
-	w    = tiledist.glmap(buf=buf2)
-	q1   = tiledist.glmap(buf=buf3)
-	q2   = tiledist.glmap(buf=buf4)
-	v.arr[:], w.arr[:] = cupy.random.randn(2,w.arr.size)
-	gtod = scratch.tod.zeros((len(pmat.polang),len(pmat.ctime)),dtype=np.float32)
-	pmat.forward(gtod, v)
-	pmat.backward(gtod, q1)
-	q1 = q1.arr.dot(w.arr)
-	pmat.forward(gtod, w)
-	pmat.backward(gtod, q2)
-	q2 = q2.arr.dot(v.arr)
-	print("check_symmetry3b")
-	print(q1, q2)
-	print(np.abs(q1-q2)/np.abs(q1))
-
 obsinfo = files.read_obsinfo(args.obsinfo, nmax=args.maxfiles)
 nfile  = len(obsinfo)
 comm   = mpi.COMM_WORLD
@@ -110,7 +44,7 @@ prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
 utils.mkdir(args.odir)
 # Set up the signals we will solve for
-signal_map = mapmaking.SignalMapGpu2(shape, wcs, comm, dtype=np.float32)
+signal_map = mapmaking.SignalMapGpu(shape, wcs, comm, dtype=np.float32)
 # FIXME: poly cuts need a better preconditioner or better basis.
 # The problem is probably that the legendre polynomials lose their orthogonality
 # with the truncated block approach used here
@@ -125,18 +59,12 @@ for ind in range(comm.rank, nfile, comm.size):
 	t1    = time.time()
 	data  = files.read_tod(ifile)
 	t2    = time.time()
-	with gmem.leakcheck("mapmaker.add_obs"):
-		mapmaker.add_obs(id, data, deslope=False)
-		gmem.gpu_garbage_collect()
+	#with gmem.leakcheck("mapmaker.add_obs"):
+	mapmaker.add_obs(id, data, deslope=False)
+	gmem.gpu_garbage_collect()
 	del data
 	t3    = time.time()
 	L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2))
-
-#mapmaker.prepare()
-#check_symmetry(mapmaker)
-#check_symmetry3(signal_map.data[signal_map.ids[0]].pmap)
-#check_symmetry3b(signal_map.data[signal_map.ids[0]].pmap)
-#check_symmetry2(mapmaker)
 
 # Solve the equation system
 for step in mapmaker.solve():

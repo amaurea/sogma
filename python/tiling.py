@@ -96,73 +96,98 @@ from . import gmem
 # make sure we still work with DynamicMap
 
 class TileDistribution:
-	def __init__(self, shape, wcs, local_pixelization, comm):
+	def __init__(self, shape, wcs, local_pixelization, comm, pixbox=None):
 		# hardcoded constants
 		self.tshape = (64,64)
 		self.ncomp  = 3
 		self.tsize  = self.ncomp*np.prod(self.tshape)
+		# Our geometry
+		shape = shape[-2:]
 		self.shape, self.wcs = shape, wcs
-		# Set up the observation workspace tiling. Would be nice if the
+		# Sub-rectangle we're actually interested in.
+		# Used when reducing the map
+		self.pixbox = pixbox
+		# Set up the work tiling. Would be nice if the
 		# latter could be part of 
 		lp = local_pixelization
-		self.obs  = bunch.Bunch(lp=lp)
-		self.obs.ntile = np.sum(lp.cell_offsets_cpu>=0)
-		self.obs.size  = self.obs.ntile*self.tsize
-		self.obs.cell_offsets = lp.cell_offsets_cpu # alias to avoid annoying name
-		self.obs.cell_inds    = self.obs.cell_offsets//self.tsize
+		self.work  = bunch.Bunch(lp=lp)
+		self.work.ntile = np.sum(lp.cell_offsets_cpu>=0)
+		self.work.size  = self.work.ntile*self.tsize
+		self.work.cell_offsets = lp.cell_offsets_cpu # alias to avoid annoying name
+		self.work.cell_inds    = self.work.cell_offsets//self.tsize
 		# Set up the distributed tile tiling
-		downer    = distribute_global_tiles_exposed_simple(self.obs.cell_inds, comm)
+		downer    = distribute_global_tiles_exposed_simple(self.work.cell_inds, comm)
 		self.dist = build_dist_tiling(downer, comm, tsize=self.tsize)
 		# Set up the mpi communication info
-		self.mpi  = build_mpi_info(self.dist.cell_inds, self.obs.cell_inds, comm)
-	def dmap2gomap(self, dmap, gomap=None, buf=None):
-		omap = self.dmap2omap(dmap)
-		if gomap is None:
-			gomap = self.gomap(buf=buf, dtype=omap.dtype)
-		gmem.copy(omap, gomap.arr)
-		return gomap
-	def gomap2dmap(self, gomap, dmap=None):
-		return self.omap2dmap(gomap.arr.get(), dmap=dmap)
-	def dmap2omap(self, dmap, omap=None):
+		self.mpi  = build_mpi_info(self.dist.cell_inds, self.work.cell_inds, comm)
+		self.ompi = build_omap_mpi(shape, wcs, self.tshape, self.dist.cell_inds, comm, pixbox=pixbox)
+
+	def dmap2gwmap(self, dmap, gwmap=None, buf=None):
+		wmap = self.dmap2wmap(dmap)
+		if gwmap is None:
+			gwmap = self.gwmap(buf=buf, dtype=wmap.dtype)
+		gmem.copy(wmap, gwmap.arr)
+		return gwmap
+	def gwmap2dmap(self, gwmap, dmap=None):
+		return self.wmap2dmap(gwmap.arr.get(), dmap=dmap)
+	def dmap2wmap(self, dmap, wmap=None):
 		"""Distributed to observational tile transfer on the CPU."""
-		# dmap and omap should be numpy arrays with shape [ntile,:,tshape[0],tshape[1]]
-		if omap is None: omap = np.zeros(self.oshape, dmap.dtype)
-		omap  = omap.reshape(self.oshape) # to 4d in case 1d form is passed
-		sbuf  = dmap[self.mpi.d2o_sinds]
-		rbuf  = np.zeros(omap.shape, omap.dtype)
-		sinfo = (self.mpi.d2o_scount*self.tsize, self.mpi.d2o_soffs*self.tsize)
-		rinfo = (self.mpi.d2o_rcount*self.tsize, self.mpi.d2o_roffs*self.tsize)
+		# dmap and wmap should be numpy arrays with shape [ntile,:,tshape[0],tshape[1]]
+		if wmap is None: wmap = np.zeros(self.oshape, dmap.dtype)
+		wmap  = wmap.reshape(self.oshape) # to 4d in case 1d form is passed
+		sbuf  = dmap[self.mpi.d2w_sinds]
+		rbuf  = np.zeros(wmap.shape, wmap.dtype)
+		sinfo = (self.mpi.d2w_scount*self.tsize, self.mpi.d2w_soffs*self.tsize)
+		rinfo = (self.mpi.d2w_rcount*self.tsize, self.mpi.d2w_roffs*self.tsize)
 		self.mpi.comm.Alltoallv((sbuf.reshape(-1),sinfo), (rbuf.reshape(-1),rinfo))
-		omap[self.mpi.d2o_rinds] = rbuf
-		return omap
-	def omap2dmap(self, omap, dmap=None):
+		wmap[self.mpi.d2w_rinds] = rbuf
+		return wmap
+	def wmap2dmap(self, wmap, dmap=None):
 		"""Observational to distributed transfer and reduction on the CPU"""
-		omap= omap.reshape(self.oshape) # to 4D in case 1D form is passed
-		if dmap is None: dmap = self.dmap(dtype=omap.dtype)
+		wmap= wmap.reshape(self.oshape) # to 4D in case 1D form is passed
+		if dmap is None: dmap = self.dmap(dtype=wmap.dtype)
 		tshape= dmap.shape[1:]
-		rbuf  = np.zeros((self.mpi.d2o_stot,)+tshape, dmap.dtype)
-		sbuf  = np.ascontiguousarray(omap[self.mpi.d2o_rinds])
-		rinfo = (self.mpi.d2o_scount*self.tsize, self.mpi.d2o_soffs*self.tsize)
-		sinfo = (self.mpi.d2o_rcount*self.tsize, self.mpi.d2o_roffs*self.tsize)
+		rbuf  = np.zeros((self.mpi.d2w_stot,)+tshape, dmap.dtype)
+		sbuf  = np.ascontiguousarray(wmap[self.mpi.d2w_rinds])
+		rinfo = (self.mpi.d2w_scount*self.tsize, self.mpi.d2w_soffs*self.tsize)
+		sinfo = (self.mpi.d2w_rcount*self.tsize, self.mpi.d2w_roffs*self.tsize)
 		self.mpi.comm.Alltoallv((sbuf.reshape(-1),sinfo), (rbuf.reshape(-1),rinfo))
 		# At this point we will have multiple contributions to each of our
 		# distal tiles, which we need to reduce. Loop in python for now.
 		# This performs 3*64*64 = 12k operations per iteration, so overhead
 		# might not be too bad. But could try numba otherwise.
 		dmap[:] = 0
-		for i, gi in enumerate(self.mpi.d2o_sinds):
+		for i, gi in enumerate(self.mpi.d2w_sinds):
 			dmap[gi] += rbuf[i]
 		return dmap
+	def dmap2omap(self, dmap, root=0):
+		"""Turn the distributed tile map dmap into a full enmap
+		on the mpi rank root (defaults to 0). If the pixbox
+		argument was passed to the constructor, then this subset
+		of the full map will be output."""
+		sbuf = np.ascontiguousarray(dmap[self.ompi.sinds].reshape(-1))
+		rbuf = np.zeros(self.ompi.rtot*self.tsize, dmap.dtype) if self.ompi.comm.rank == 0 else None
+		rinfo= (self.ompi.rcount*self.tsize, self.ompi.roffs*self.tsize)
+		self.ompi.comm.Gatherv(sbuf, (rbuf, rinfo))
+		if self.ompi.comm.rank == 0:
+			rbuf = rbuf.reshape(-1,self.ncomp,self.tshape[0],self.tshape[1])
+			omap = np.zeros((self.ompi.onty,self.ompi.ontx,self.ncomp,self.tshape[0],self.tshape[1]),dmap.dtype)
+			omap[self.ompi.rinds[0],self.ompi.rinds[1]] = rbuf
+			omap = np.moveaxis(omap, (2,3,4), (0,2,4))
+			omap = omap.reshape(omap.shape[0],omap.shape[1]*omap.shape[2],omap.shape[3]*omap.shape[4])
+			omap = enmap.ndmap(omap, self.wcs)
+			omap = omap.extract_pixbox(self.ompi.obox)
+			return omap
 	@property
-	def oshape(self): return (self.obs .ntile,self.ncomp,self.tshape[0],self.tshape[1])
+	def oshape(self): return (self.work .ntile,self.ncomp,self.tshape[0],self.tshape[1])
 	@property
 	def dshape(self): return (self.dist.ntile,self.ncomp,self.tshape[0],self.tshape[1])
 	def dmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.dshape, dtype)
-	def omap(self, dtype=np.float32, ncomp=3): return np.zeros(self.oshape, dtype)
-	def gomap(self, buf=None, dtype=np.float32):
-		if buf: arr = buf .zeros(self.obs.size, dtype)
-		else:   arr = cupy.zeros(self.obs.size, dtype)
-		return gpu_mm.LocalMap(self.obs.lp, arr)
+	def wmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.oshape, dtype)
+	def gwmap(self, buf=None, dtype=np.float32):
+		if buf: arr = buf .zeros(self.work.size, dtype)
+		else:   arr = cupy.zeros(self.work.size, dtype)
+		return gpu_mm.LocalMap(self.work.lp, arr)
 
 def build_dist_tiling(dist_owner, comm, tsize=1):
 	dist = bunch.Bunch(owner=dist_owner)
@@ -182,198 +207,90 @@ def distoff_owners(dmine, comm):
 	owners[nhit==0] = -1
 	return owners
 
-def build_mpi_info(dist_inds, obs_inds, comm):
-	"""Set up information needed for transfer between dist and obs tilings.
+def build_mpi_info(dist_inds, work_inds, comm):
+	"""Set up information needed for transfer between dist and work tilings.
 	Everything is in tile units. Multiply by tsize to get indices into flattened
 	arrays."""
 	# Build owners
 	mpi   = bunch.Bunch(comm=comm)
 	dmine = dist_inds >= 0
-	omine = obs_inds  >= 0
+	wmine = work_inds  >= 0
 	owners= distoff_owners(dmine, comm)
 
 	# We order tiles in buffers in send order
 	# We assume that there aren't any missing tiles in dist
 
-	# Part 1: What to sent to each, for a dist→obs operation
+	# Part 1: What to sent to each, for a dist→work operation
 	# My dist inds for all tiles everybody wants
-	my_oty,  my_otx  = np.ascontiguousarray(np.nonzero(omine)) # [{ty,tx},nobs]
+	my_oty,  my_otx  = np.ascontiguousarray(np.nonzero(wmine)) # [{ty,tx},nobs]
 	all_oty          = utils.allgatherv(my_oty, comm)
 	all_otx          = utils.allgatherv(my_otx, comm)
-	all_on           = utils.allgather(np.sum(omine), comm)
+	all_on           = utils.allgather(np.sum(wmine), comm)
 	all_ranks        = np.repeat(np.arange(comm.size), all_on)
-	mpi.d2o_sinds    = dist_inds[all_oty,all_otx]
+	mpi.d2w_sinds    = dist_inds[all_oty,all_otx]
 	# Which of these are actually valid
-	svalid           = mpi.d2o_sinds >= 0
-	mpi.d2o_sinds    = mpi.d2o_sinds[svalid]
+	svalid           = mpi.d2w_sinds >= 0
+	mpi.d2w_sinds    = mpi.d2w_sinds[svalid]
 	# Corresponding send counts
-	mpi.d2o_scount   = np.bincount(all_ranks, svalid, minlength=comm.size).astype(int)
-	mpi.d2o_stot     = np.sum(mpi.d2o_scount)
+	mpi.d2w_scount   = np.bincount(all_ranks, svalid, minlength=comm.size).astype(int)
+	mpi.d2w_stot     = np.sum(mpi.d2w_scount)
 	# The offset in the send array for each
-	mpi.d2o_soffs    = utils.cumsum(mpi.d2o_scount)
+	mpi.d2w_soffs    = utils.cumsum(mpi.d2w_scount)
 
-	# Part 2: What to receive from each, for a dist→obs operation
-	# Which of my obs tiles everybody has
+	# Part 2: What to receive from each, for a dist→work operation
+	# Which of my work tiles everybody has
 	my_owners = owners[my_oty,my_otx]
 	rvalid    = my_owners >= 0
 	# How much to receive from each
-	mpi.d2o_rcount = np.bincount(my_owners[rvalid], minlength=comm.size).astype(int)
-	mpi.d2o_roffs  = utils.cumsum(mpi.d2o_rcount)
-	# Mapping from our obs inds to the buffer
-	# Need to know which tiles everybody will send to us
-	#  [y,x for rank in size for y,x in zip(my_oty,my_otx) if owners[y,x]==rank]
-	# How do I write this efficiently? Can collapse yx
-	#  [yx for rank in size for yx in yxs if owners[yx]==rank]
-	#  for yx in yxs: subs[owners[yx]].append(yx)
-	# Could be done with an alltoallv, but that's overkill
-	yxlist = [[] for i in range(comm.size)]
-	for ty,tx in zip(my_oty,my_otx):
-		if owners[ty,tx] >= 0:
-			yxlist[owners[ty,tx]].append((ty,tx))
-	recv_y, recv_x = np.concatenate(yxlist, 0).T
-	mpi.d2o_rinds  = obs_inds[recv_y,recv_x]
+	mpi.d2w_rcount = np.bincount(my_owners[rvalid], minlength=comm.size).astype(int)
+	mpi.d2w_roffs  = utils.cumsum(mpi.d2w_rcount)
+	# Mapping from our work inds to the buffer
+	recv_y, recv_x = owners2rtiles(owners, my_oty, my_otx)
+	mpi.d2w_rinds  = work_inds[recv_y,recv_x]
 
 	return mpi
 
+def build_omap_mpi(shape, wcs, tshape, dist_inds, comm, pixbox=None):
+	"""Build the information needed to go from the distributed
+	maps to a single enmap on the root node"""
+	if pixbox is None: pixbox = [[0,0],list(shape[-2:])]
+	# 1. Split pixbox into tile fragments consisting of
+	#    [tyx,subpixbox]
+	tinfo    = tile_pixbox(pixbox, tshape)
+	# 2. Wrap tyx to be within nty,ntx
+	tinds    = tinfo.tinds % dist_inds.shape
+	# Flatten tinds to make it a bit easier to work with
+	oty, otx = tinds.reshape(-1,2).T
+	# 3. Find which parts we own, building the send info
+	out_inds = dist_inds[oty,otx].reshape(tinfo.nty,tinfo.ntx)
+	mine     = out_inds >= 0
+	sinds    = out_inds[mine]
+	scount   = np.sum(sinds)
+	# 4. Build the receive info. This is only relevant for the
+	#    root. Find out which cells everybody will send to root.
+	owners   = distoff_owners(dist_inds>=0, comm)
+	rinds    = np.array(owners2rtiles(owners, oty, otx))
+	# Just because a tile is owned doesn't mean we want it.
+	oowners  = owners[oty,otx]
+	rcount   = np.bincount(oowners[oowners>=0], minlength=comm.size).astype(int)
+	roffs    = utils.cumsum(rcount)
+	# Make rinds relative to output tiles
+	rinds   -= (tinfo.t1 % dist_inds.shape)[:,None]
+	rtot     = np.sum(rcount)
+	# Infer the output geometry we will get after slicing
+	return bunch.Bunch(onty=tinfo.nty, ontx=tinfo.ntx, obox=tinfo.obox, sinds=sinds, scount=scount, rinds=rinds, rcount=rcount, roffs=roffs, rtot=rtot, comm=comm)
 
-#class TileDistribution:
-#	def __init__(self, target, glob, mpi, loc=None):
-#		self.target = target
-#		self.glob   = glob
-#		self.mpi    = mpi
-#		self.loc    = loc
-#	@staticmethod
-#	def build(shape, wcs, obsinfo, comm, local_pixelization=None):
-#		tshape = (64,64)
-#		shape  = shape[-2:]
-#		fshape, fwcs, off = infer_fullsky_geometry(shape, wcs)
-#		# Ownership of the active global tiles
-#		xperiod  = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
-#		nty, ntx = utils.ceil_div(np.asanyarray(fshape[-2:]), tshape)
-#		# TOD distribution
-#		tinfo    = distribute_tods_semibrute(fshape, fwcs, obsinfo, comm.size)
-#		# Find my active tiles
-#		tiling= TileDistribution(
-#			target=bunch.Bunch(shape=shape,  wcs=wcs,  off=off),
-#			glob=bunch.Bunch(shape=fshape, wcs=fwcs, nty=nty, ntx=ntx, tshape=tshape, periodic=True,
-#				ncomp=3)
-#			mpi=bunch.Bunch(comm=comm), # will contain buffer info later
-#		)
-#		if local_pixelization:
-#			tiling.finish(local_pixelization)
-#		return tiling
-#	def finalize(self, local_pixelization):
-#		"""Finalize a tiling info givin an initalized one and a gpu_mm.LocalPixelization"""
-#		self.loc  = local_pixelization
-#		# Set up global stuff
-#		owner     = distribute_global_tiles_exposed_simple(self.loc.cell_offsets_cpu, self.mpi.comm)
-#		print("owner")
-#		print(owner)
-#		gmine     = owner == self.mpi.comm.rank
-#		self.glob.owners       = owner
-#		self.glob.ncell        = np.sum(gmine)
-#		self.glob.cell_offsets[gmine] = np.arange(self.glob.ncell)
-#		# Build the mpi buffers. We will be performing
-#		# local→global reductions and global→local broadcasts
-#		# In both cases we need to know how much data to send
-#		# and receive from each task. Let's start with global→local.
-#		# 1. Find out how many cells to receive from each
-#		lmine     = self.loc.cell_offsets_cpu >= 0
-#		self.nloc = np.sum(lmine)
-#		self.locsize = self.loc.npix*self.glob.ncomp
-#		sources   = self.glob.owners[lmine]
-#		self.mpi.g2l_rcount = np.bincount(sources, minlength=self.mpi.comm.size)
-#		self.mpi.g2l_roffs  = utils.cumsum(self.mpi.g2l_rcount)
-#		# We don't need g2l_rinds, since local storage is already flat
-#		# 2. Find out how many cells to send to each. Here we need some
-#		# communication, since we don't know all the others' local
-#		# ownership
-#		all_nloc      = utils.allgather (np.sum(lmine), self.mpi.comm)
-#		my_lcells_2d  = np.array(np.where(lmine)).T # [nloc,{ty,tx}]
-#		all_lcells_2d = utils.allgatherv(my_lcells_2d, self.mpi.comm) # [sum(nloc),{ty,tx}]
-#		all_ranks     = np.repeat(np.arange(self.mpi.comm.size), all_nloc)
-#		# What glob tiles I would send if I had everything. This will contain
-#		# -1 for ones I don't actually own, and so shouldn't send. With this,
-#		# the send buffer can be constructed as gtiles[g2l_sinds],
-#		# how much to send to each will be g2l_scount*tsize,
-#		# and the offset to start at will be at g2l_soffs*tsize
-#		print("self.glob")
-#		print(self.glob)
-#		print("self.loc.cell_offsets_cpu")
-#		print(self.loc.cell_offsets_cpu)
-#
-#		g2l_sinds   = self.glob.cell_offsets[all_lcells_2d[:,0],all_lcells_2d[:,1]]
-#		print("glob.cell_offsets", self.glob.cell_offsets)
-#		print("all_lcells_2d", all_lcells_2d)
-#		print("g2l_sinds", g2l_sinds)
-#		self.mpi.g2l_scount  = np.bincount(all_ranks, g2l_sinds>=0, minlength=self.mpi.comm.size).astype(int)
-#		self.mpi.g2l_sinds   = g2l_sinds[g2l_sinds>=0]
-#		self.mpi.g2l_soffs   = utils.cumsum(self.mpi.g2l_scount)
-#		self.mpi.g2l_stot    = np.sum(self.mpi.g2l_scount)
-#	def glob2loc_gpu(self, gmap, glmap=None, buf=None):
-#		lmap = self.glob2loc(gmap)
-#		if glmap is None: glmap = self.glmap(buf, dtype=lmap.dtype)
-#		gmem.copy(lmap, glmap.arr)
-#		return glmap
-#	def loc2glob_gpu(self, glmap, gmap=None):
-#		return self.loc2glob(glmap.arr.get(), gmap=gmap)
-#	def glob2loc(self, gmap, lmap=None):
-#		"""Global to local tile transfer on the CPU."""
-#		# gmap and lmap should be numpy arrays with shape [ntile,:,tshape[0],tshape[1]]
-#		if lmap is None:
-#			lmap = np.zeros((self.nloc,)+gmap.shape[1:], gmap.dtype)
-#		lmap= self.lunzip(lmap) # to 4D in case 1D form is passed
-#		tsize = np.prod(gmap.shape[1:])
-#		sbuf  = gmap[self.mpi.g2l_sinds]
-#		sinfo = (self.mpi.g2l_scount*tsize, self.mpi.g2l_soffs*tsize)
-#		rinfo = (self.mpi.g2l_rcount*tsize, self.mpi.g2l_roffs*tsize)
-#		self.mpi.comm.Alltoallv((sbuf.reshape(-1),sinfo), (lmap.reshape(-1),rinfo))
-#		return lmap
-#	def loc2glob(self, lmap, gmap=None):
-#		"""Local to global transfer and reduction on the CPU"""
-#		lmap= self.lunzip(lmap) # to 4D in case 1D form is passed
-#		if gmap is None: gmap = self.gmap(dtype=lmap.dtype)
-#		tshape= gmap.shape[1:]
-#		tsize = np.prod(tshape)
-#		rbuf  = np.zeros((self.mpi.g2l_stot,)+tshape, gmap.dtype)
-#		sbuf  = lmap
-#		rinfo = (self.mpi.g2l_scount*tsize, self.mpi.g2l_soffs*tsize)
-#		sinfo = (self.mpi.g2l_rcount*tsize, self.mpi.g2l_roffs*tsize)
-#		self.mpi.comm.Alltoallv((sbuf.reshape(-1),sinfo), (rbuf.reshape(-1),rinfo))
-#		# At this point we will have multiple contributions to each of our
-#		# global tiles, which we need to reduce. Loop in python for now.
-#		# This performs 3*64*64 = 12k operations per iteration, so overhead
-#		# might not be too bad. But could try numba otherwise.
-#		gmap[:] = 0
-#		for i, gi in enumerate(self.mpi.g2l_sinds):
-#			gmap[gi] += rbuf[i]
-#		return gmap
-#	def lunzip(self, lmap):
-#		"""Reshape a 1d local tile representation to [ntile,ncomp,tshape[0],tshape[1]].
-#		lmap must already have this ordering!"""
-#		return lmap.reshape(self.nloc,-1,self.glob.tshape[0],self.glob.tshape[1])
-#	def gmap(self, dtype=np.float32, ncomp=3):
-#		return np.zeros((self.glob.ncell,ncomp,self.glob.tshape[0],self.glob.tshape[1]), dtype)
-#	def lmap(self, dtype=np.float32, ncomp=3):
-#		return np.zeros((self.nloc,ncomp,self.glob.tshape[0],self.glob.tshape[1]), dtype)
-#	def glmap(self, buf, dtype=np.float32):
-#		return gpu_mm.LocalMap(self.loc, buf.zeros(self.locsize, dtype))
-
-# We want to distribute both tod ownership and tile ownership.
-# We also need to decide which tiles should exist at all, so we
-# don't use more memory than necessary.
-# Alternatives:
-#  1. global tiling = full sky, but only tiles overlapping with
-#     target geometry have ownership
-#  2. global tiling = target geometry, but with whole tiles
-# In either case, need to figure out how to handle tods that
-# go outside the global tiling.
-#  1. don't allocate these tiles in the work tiling either. Only
-#     possible if pointing matrix handles skipping missing tiles.
-#     This seems to be the case
-#  2. allocate them in work, but skip them when reducing
-# Let's go with global tiling = target geometry and skipping
-# irrelevant local tiles.
+def tile_pixbox(pixbox, tshape):
+	pixbox   = np.asarray(pixbox)
+	t1       = pixbox[0]    //tshape
+	t2       = (pixbox[1]-1)//tshape+1
+	nty,ntx  = t2-t1
+	obox     = pixbox - t1*tshape
+	# Build full list of indices
+	tinds        = np.zeros((nty,ntx,2),int)
+	tinds[:,:,0] = np.arange(t1[0],t2[0])[:,None]
+	tinds[:,:,1] = np.arange(t1[1],t2[1])[None,:]
+	return bunch.Bunch(t1=t1, t2=t2, nty=nty, ntx=ntx, obox=obox, tinds=tinds)
 
 def infer_fullsky_geometry(shape, wcs):
 	"""Given a cylindrical geometry shape,wcs, return the fullsky geometry
@@ -392,8 +309,9 @@ def infer_fullsky_geometry(shape, wcs):
 	iy2 = utils.floor(y2)+1
 	ny  = iy2+1-iy1
 	owcs.wcs.crpix[1] -= iy1
-	off = utils.nint(owcs.wcs.crpix-wcs.wcs.crpix)[::-1]
-	return (ny,nx), owcs, off
+	off    = utils.nint(owcs.wcs.crpix-wcs.wcs.crpix)[::-1]
+	pixbox = np.array([off,off+shape[-2:]])
+	return (ny,nx), owcs, pixbox
 
 def distribute_global_tiles_bands(fshape, fwcs, off, shape, tshape, nsplit):
 	"""Sets up the global tile ownership. This determines which
@@ -456,6 +374,22 @@ def distribute_tods_semibrute(shape, wcs, obsinfo, nsplit, npass=2, niter=10, ve
 		dists = calc_dist(state[refs,None],state)
 		gid, gweight = assign_to_group_semibrute(dists, weight, nsplit, niter=niter, state=state, verbose=verbose)
 	return bunch.Bunch(owner=gid, weights=gweight)
+
+def owners2rtiles(owners, tys, txs):
+	# Mapping from our work inds to the buffer
+	# Need to know which tiles everybody will send to us
+	#  [y,x for rank in size for y,x in zip(my_oty,my_otx) if owners[y,x]==rank]
+	# How do I write this efficiently? Can collapse yx
+	#  [yx for rank in size for yx in yxs if owners[yx]==rank]
+	#  for yx in yxs: subs[owners[yx]].append(yx)
+	# Could be done with an alltoallv, but that's overkill
+	n = max(np.max(owners)+1,1)
+	yxlist = [[] for i in range(n)]
+	for ty,tx in zip(tys,txs):
+		if owners[ty,tx] >= 0:
+			yxlist[owners[ty,tx]].append((ty,tx))
+	rty, rtx = np.concatenate(yxlist, 0).T
+	return rty, rtx
 
 ###########
 # Helpers #

@@ -7,7 +7,7 @@ from . import gutils
 from .gmem import scratch
 from .logging import L
 
-class PmatMapGpu2:
+class PmatMapGpu:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels"""
@@ -56,48 +56,6 @@ class PmatMapGpu2:
 		scratch.plan.reserve(size)
 		with scratch.plan.as_allocator():
 			return gpu_mm.PointingPlan(self.preplan, pointing)
-
-class PmatMapGpu:
-	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
-		self.shape = shape
-		self.wcs   = wcs
-		self.ctime = ctime
-		self.bore  = bore
-		self.offs  = offs
-		self.polang= polang
-		self.dtype = dtype
-		self.ncomp = ncomp
-		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype)
-		# Precompute a pointing plan. This is slow, and uses quite a bit of
-		# memory, but will be changed later
-		self.plan = gpu_mm.PointingPlan(self.pfit.eval().get(), self.shape[-2], self.shape[-1])
-		self.pointing = None
-	def forward(self, gtod, gmap):
-		# For now transfer the tod and map each time. Later these will stay on the
-		# gpu as long as possible
-		t1 = gutils.cutime()
-		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
-		t2 = gutils.cutime()
-		gpu_mm.gpu_map2tod(gtod, gmap, pointing)
-		t3 = gutils.cutime()
-		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
-		return gtod
-	def backward(self, gtod, gmap=None):
-		if gmap is None:
-			gmap = cupy.zeros((self.ncomp,)+self.shape[-2:], self.dtype)
-		t1 = gutils.cutime()
-		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
-		t2 = gutils.cutime()
-		gpu_mm.gpu_tod2map(gmap, gtod, pointing, self.plan)
-		t3 = gutils.cutime()
-		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
-		return gmap
-	def precalc_setup(self):
-		t1 = gutils.cutime()
-		self.pointing = self.pfit.eval()
-		t2 = gutils.cutime()
-		L.print("Pprep %6.4f" % (t2-t1), level=3)
-	def precalc_free (self): self.pointing = None
 
 # Cuts
 

@@ -106,7 +106,6 @@ class NmatDetvecsGpu(Nmat):
 		nfreq = nsamp//2+1
 		tod   = cupy.asarray(tod)
 		gutils.apply_window(tod, nwin)
-		#ft   = cupy.fft.rfft(tod)
 		ft    = gpu_mm.cufft.rfft(tod, plan_cache=gmem.plan_cache)
 		# Unapply window again
 		gutils.apply_window(tod, nwin, -1)

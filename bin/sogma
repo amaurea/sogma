@@ -20,8 +20,6 @@ import gpu_mm
 from sogma import gutils, logging, gmem, mapmaking, files, tiling, nmat
 from sogma.gmem import scratch
 
-obsinfo = files.read_obsinfo(args.obsinfo, nmax=args.maxfiles)
-nfile  = len(obsinfo)
 comm   = mpi.COMM_WORLD
 dtype_tod  = np.float32
 dtype_map  = np.float32
@@ -39,6 +37,10 @@ scratch.nmat_work= gmem.CuBuffer("nmat_work") # 0.15 GB
 scratch.cut      = gmem.CuBuffer("cut")       # 0.3  GB (up to 30% cut)
 # Disable the cufft cache. It uses too much gpu memory
 cupy.fft.config.get_plan_cache().set_memsize(0)
+# Set up our data loader
+loader  = files.SimpleLoader(args.obsinfo)
+obsinfo = loader.query()[:args.maxfiles]
+nfile   = len(obsinfo)
 L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
 prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
@@ -59,7 +61,6 @@ for ind in range(comm.rank, nfile, comm.size):
 	t1    = time.time()
 	data  = files.read_tod(ifile)
 	t2    = time.time()
-	#with gmem.leakcheck("mapmaker.add_obs"):
 	mapmaker.add_obs(id, data, deslope=False)
 	gmem.gpu_garbage_collect()
 	del data

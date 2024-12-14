@@ -55,6 +55,7 @@ class CuBuffer:
 		self.memptr = mempool.malloc(self.size)
 		self.align  = align
 		self.name   = name
+		# FIXME: We're not using growth_factor when growing
 		self.growth_factor = growth_factor
 		self.allocator = allocator or cupy.cuda.get_allocator()
 	def empty(self, shape, dtype=np.float32):

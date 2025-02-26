@@ -92,7 +92,7 @@ class MLMapmaker:
 			ta5 = gutils.cutime()
 			#gmem.gpu_garbage_collect()
 			ta6 = gutils.cutime()
-			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f gc %6.4f %s" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, ta6-ta5, data.id), level=2)
+			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f gc %6.4f %s %4d %6d" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, ta6-ta5, data.id, *gtod.shape), level=2)
 		t3 = gutils.cutime()
 		result = self.dof.zip(*[signal.from_work(w) for signal,w in zip(self.signals,owork)])
 		t4 = gutils.cutime()

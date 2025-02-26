@@ -27,6 +27,7 @@ def aranges(lens):
 
 def cumsum0(vals):
 	res = np.empty(len(vals), vals.dtype)
+	if res.size == 0: return res
 	res[0] = 0
 	res[1:] = np.cumsum(vals[:-1])
 	return res
@@ -97,3 +98,25 @@ def safe_invert_ivar(ivar, tol=1e-3):
 	good = ivar>ref*tol
 	iivar[good] = 1/ivar[good]
 	return iivar
+
+# Not done
+#def gemm(alpha, A, B, beta, C, Aop="N", Bop="N", Cop="N", handle=None):
+#	iscup = [isinstance(a, cupy.ndarray) for a in [A,B,C]]
+#	if iscup[1] != iscup[0] or iscup[2] != iscup[0]: raise ValueError("All arrays must agree on cpu/gpu-ness")
+#	if B.dtype  != A.dtype  or C.dtype  != A.dtype: raise ValueError("All arrays must have the same dtype")
+#	dtype = A.dtype
+#	if isinstance(A, cupy.ndarray):
+#		# We're on the gpu
+#		if handle is None: handle = cupy.cuda.Device().cublas_handle
+#		if   dtype == np.float32: fun = cublas.sgemm
+#		elif dtype == np.float64: fun = cublas.dgemm
+#		else: raise ValueError("Only float32 and float64 supported")
+#		opmap = {"N": cublas.CUBLAS_OP_N, "T": cublas.CUBLAS_OP_T, "L": cublas.CUBLAS_SIDE_RIGHT}
+#		fun(handle, opmap[Aop], 
+
+
+
+
+
+
+

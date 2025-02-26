@@ -161,8 +161,8 @@ def calc_pointing(ctime, bore, offs, polang, site="so", weather="typical", dtype
 	offs, polang = np.asarray(offs), np.asarray(polang)
 	ndet, nsamp = len(offs), bore.shape[1]
 	sightline = so3g.proj.coords.CelestialSightLine.az_el(ctime, bore[1], bore[0], site="so", weather="typical")
-	q_det     = so3g.proj.quat.rotation_xieta(offs[:,1], offs[:,0], np.pi/2-polang)
-	pos_equ   = np.moveaxis(sightline.coords(q_det),2,0) # [{ra,dec,c1,s1},ndet,nsamp]
+	fplane    = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], np.pi/2-polang)
+	pos_equ   = np.moveaxis(sightline.coords(fplane),2,0) # [{ra,dec,c1,s1},ndet,nsamp]
 	pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
 	return pos_equ
 

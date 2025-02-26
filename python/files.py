@@ -1,7 +1,7 @@
 import numpy as np, time
 from numpy.lib import recfunctions
-from pixell import utils, fft, bunch
-import gpu_mm
+from pixell import utils, fft, bunch, bench
+import gpu_mm, cupy
 from .gmem import scratch, plan_cache
 
 # Loading of obs lists, metadata and data. The interface needs at least these:
@@ -20,6 +20,10 @@ from .gmem import scratch, plan_cache
 # database, so having them as independent functions is wasteful. Let's make a
 # class that can be queried.
 
+def Loader(dbfile, mul=32):
+	if dbfile.endswith(".yaml"): return SotodlibLoader(dbfile, mul=mul)
+	else: return SimpleLoader(dbfile, mul=mul)
+
 class SimpleLoader:
 	def __init__(self, infofile, mul=32):
 		"""context is really just a list of tods and meta here"""
@@ -37,69 +41,74 @@ class SimpleLoader:
 		obs.tod = scratch.tod.array(obs.tod)
 		return obs
 
-# Standard Sotodlib slow load
 class SotodlibLoader:
-	def __init__(self, contextfile, mul=32, mode="standard"):
-		from sotodlib import core
-		self.context = core.Context(contextfile)
+	def __init__(self, configfile, mul=32, mode="standard"):
+		from . import sodata
+		# Set up our metadata loader
+		self.config, self.context = sodata.preprocess.preprocess_util.get_preprocess_context(configfile)
+		self.fast_meta = sodata.FastMeta(self.config, self.context)
 		self.mul     = mul
 		self.mode    = mode
 	def query(self, query=None, wafers=None, bands=None):
 		# wafers and bands should ideally be a part of the query!
 		from sotodlib import mapmaking
-		subids = mapmaking.get_subids(args.query, context=self.context)
+		subids = mapmaking.get_subids(query, context=self.context)
 		subids = mapmaking.filter_subids(subids, wafers=wafers, bands=bands)
 		# Need base ids to look up rest of the info in obsdb
-		obs_ids, wafs, bands = mapmaking.split_subid(subids)
+		obs_ids, wafs, bands = mapmaking.split_subids(subids)
 		info     = self.context.obsdb.query()
 		inds     = utils.find(info["obs_id"], obs_ids)
 		# Build obsinfo for these ids
 		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
-		obsinfo = np.zeros(len(ids), dtype).view(np.recarray)
+		obsinfo       = np.zeros(len(inds), dtype).view(np.recarray)
 		obsinfo.id    = subids
 		obsinfo.ndet  = 1000 # no simple way to get this :(
 		obsinfo.nsamp = info["n_samples"][inds]
 		obsinfo.ctime = info["start_time"][inds]
-		obsinfo.dur   = info["end_time"][inds]-info["start_time"][inds]
+		obsinfo.dur   = info["stop_time"][inds]-info["start_time"][inds]
 		# How come the parts that have to do with pointing.
-		baz0  = info["az_center"][inds]
-		waz   = info["az_throw" ][inds]
-		bel0  = info["el_center"][inds]
-		# Need the wafer det positions. First find a representative observation
-		# that has as many of the wafers we care about as possible. This is really
-		# clunky!
-		winfo   = get_wafer_info(context, info)
-		wind    = utils.find(winfo.wafers, wafs[inds])
-		obsinfo.r = winfo.r[wind]
-		obsinfo.sweep = make_sweep(obsinfo.ctime, baz0, waz, bel0, winfo.pos[wind])
+		# These arrays have a nasty habit of being object dtype
+		baz0  = info["az_center"][inds].astype(np.float64)
+		waz   = info["az_throw" ][inds].astype(np.float64)
+		bel0  = info["el_center"][inds].astype(np.float64)
+		# Need the rough pointing for each observation. This isn't
+		# directly available in the obsid. We will assume that each wafer-slot
+		# has approximately constant pointing offsets.
+		# 1. Find a reference subid for each wafer slot
+		ref_ids, inds = get_ref_subids(subids)
+		wafer_centers = []
+		wafer_rads    = []
+		for ri, ref_id in enumerate(ref_ids):
+			# 2. Get the focal plane offsets for this subid
+			focal_plane = get_focal_plane(self.fast_meta, ref_id)
+			mid, rad    = get_fplane_extent(focal_plane)
+			wafer_centers.append(mid)
+			wafer_rads   .append(rad)
+		# 3. Expand to [nobs,{xi,eta}]
+		wafer_centers = np.array(wafer_centers)[inds]
+		wafer_rads    = np.array(wafer_rads   )[inds]
+		# Fill in the last entries in obsinfo
+		obsinfo.r     = wafer_rads
+		obsinfo.sweep = make_sweep(obsinfo.ctime, baz0, waz, bel0, wafer_centers)
 		return obsinfo
 	def load(self, subid):
-		import so3g
-		meta = self.context.get_meta(subid)
-		n    = fft.fft_len(meta.samps.count//mul, factors=[2,3,5,7])*mul
-		meta.restrict("samps", [0,n])
-		# add dummy cuts if missing
-		if "glitch_flags" not in meta.flags:
-			meta.flags.wrap("glitch_flags", shape=("dets","samps"), cls=so3g.proj.RangesMatrix.zeros)
-		# Restrict to detectors with useful calibration. May raise DataMissing
-		meta = validate_meta(meta)
-		# Read our actual data
-		if   self.mode == "standard":
-			obs  = self.context.get_obs(subid, meta=meta)
-		elif self.mode == "fast":
-			obs  = read_obs_fast(self.context, meta)
-		obs  = calibrate_obs_real(obs)
-		tod  = scratch.tod.array(obs.signal)
-		tod  = calibrate_obs_fourier(obs, tod)
-		# Transform it to our current work format
-		res  = bunch.Bunch()
-		res.dets         = obs.dets.vals
-		res.point_offset = np.array([obs.focal_plane.eta,obs.focal_plane.xi]).T
-		res.polangle     = obs.focal_plane.gamma
-		res.ctime        = obs.timestamps
-		res.boresight    = np.array([obs.boresight.el,obs.boresight.az]) # FIXME: roll
-		res.tod          = obs.signal
-		return res
+		from . import sodata
+		try:
+			with bench.show("read meta (total)"):
+					meta = self.fast_meta.read(subid)
+			# Load the raw data
+			with bench.show("read data (total)"):
+				data = sodata.fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
+			# Calibrate the data
+			with bench.show("calibrate (total)"):
+				obs = sodata.calibrate_gpu(data, meta)
+				#obs = sodata.calibrate(data, meta)
+				#obs.tod = scratch.tod.array(obs.tod)
+		except Exception as e:
+			# FIXME: Make this less broad
+			raise utils.DataMissing(str(e))
+		# Place obs.tod on gpu. Hardcoded to use scratch.tod for now
+		return obs
 
 # Helpers below
 
@@ -119,7 +128,7 @@ def read_obsinfo(fname, nmax=None):
 	dtype = [("path","U256"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
 	info  = np.loadtxt(fname, dtype=dtype, max_rows=nmax, ndmin=1).view(np.recarray)
 	ids   = np.char.rpartition(np.char.rpartition(info.path,"/")[:,2],".")[:,0]
-	info  = recfunctions.rec_append_field(info, "id", ids)
+	info  = recfunctions.rec_append_fields(info, "id", ids)
 	# Convert to standard units
 	info.dur   *= utils.minute
 	info.r     *= utils.degree
@@ -173,17 +182,38 @@ def mask2cuts(mask):
 	t02 = time.time()
 	return dets, starts, lens
 
+def get_ref_subids(subids):
+	"""Return one subid for each :ws:band combination"""
+	subs = np.char.partition(subids, ":")[:,2]
+	usubs, uinds, inds = np.unique(subs, return_index=True, return_inverse=True)
+	return subids[inds], inds
+
+def get_focal_plane(fast_meta, subid):
+	fp_info     = fast_meta.fp_cache.get_by_subid(subid, fast_meta.det_cache)
+	focal_plane = np.array([fp_info["xi"], fp_info["eta"], fp_info["gamma"]]).T # [:,{xi,eta,gamma}]
+	good        = np.all(np.isfinite(focal_plane),1)
+	focal_plane = focal_plane[good]
+	return focal_plane
+
+def get_fplane_extent(focal_plane):
+	mid = np.mean(focal_plane,0)[:2]
+	rad = np.max(utils.angdist(focal_plane[:,:2],mid[:,None]))
+	return mid, rad
+
 def get_wafer_info(context, obs_info):
+	print("A", obs_info)
 	ref_obs = find_ref_obs(obs_info["obs_id"])
+	print("B", ref_obs)
 	return get_wafer_pointing_rough(context, ref_obs)
 
 def find_ref_obs(ids):
 	nwaf = np.char.count(np.char.rpartition(ids, "_")[:,2],"1")
 	good = np.where(nwaf==np.max(nwaf))[0]
-	return good[len(good)//2]
+	return ids[good[len(good)//2]]
 
 def get_wafer_pointing_rough(context, ref_obs_id):
 	from scipy import ndimage
+	print("get_meta", ref_obs_id)
 	meta = context.get_meta(ref_obs_id)
 	good = np.isfinite(meta.focal_plane.xi) & np.isfinite(meta.focal_plane.eta)
 	# Classify them by wafer slot
@@ -204,145 +234,18 @@ def get_wafer_pointing_rough(context, ref_obs_id):
 
 def make_sweep(ctime, baz0, waz, bel0, off, npoint=4):
 	import so3g
+	from pixell import coordinates
+	# given ctime,baz0,waz,bel [ntod], off[ntod,{xi,eta}], make
 	# make sweeps[ntod,npoint,{ra,dec}]
-	baz = baz0[:,None]  + np.linspace(-0.5,0.5,npoint)*waz[:,None]
-	bel = bel0[:,None]  + baz*0
-	ts  = ctime[:,None] + baz*0
+	# so3g can't handle per-sample pointing offsets, so it would
+	# force us to loop here. We therefore simply modify the pointing
+	# offsets to we can simply add them to az,el
+	az_off, el = coordinates.euler_rot((0.0, -bel0, 0.0), off.T)
+	az  = (baz0+az_off)[:,None] + np.linspace(-0.5,0.5,npoint)*waz[:,None]
+	el  = el   [:,None] + az*0
+	ts  = ctime[:,None] + az*0
 	sightline = so3g.proj.coords.CelestialSightLine.az_el(
-		ts.reshape(-1), baz.reshape(-1), bel.reshape(-1), site="so", weather="typical")
-	# A single dummy detector at the wafer center
-	q_det = so3g.proj.quat.rotation_xieta(off[None,0], off[None,1], 0)
-	pos_equ = sightline.coords(q_det) # [{ra,dec,c1,s1},1,nsamp]
-	sweep   = np.moveaxis(pos_equ[:2,0].reshape(2,len(ctime),npoint),(1,2,0),(0,1,2)) # [nobs,npoint,{az,el}]
-	sweep[:,:,0] = utils.unwind(sweep[:,:,0])
+		ts.reshape(-1), az.reshape(-1), el.reshape(-1), site="so", weather="typical")
+	pos_equ = np.asarray(sightline.coords()) # [ntot,{ra,dec,cos,sin}]
+	sweep   = pos_equ.reshape(len(ctime),npoint,4)[:,:,:2]
 	return sweep
-
-def make_dummy_cuts(ndet, nsamp):
-	dets, starts, lens = np.zeros((3,0),np.int32)
-	return dets, starts, lens
-
-# This stuff is just temporary. We will call sotodlib stuff when it's ready.
-# Much of the validation here would also be unnecessary with more mature metadata
-
-class DataMissing(Exception): pass
-
-def validate_meta(meta):
-	# We have the obligatory fields, right?
-	for field in ["signal", "boresight", "focal_plane", "det_cal", "timestamps"]:
-		if field not in meta:
-			raise DataMissing("field '%s' missing" % field)
-	# Disqualify overly cut detectors
-	good  = mapmaking.find_usable_detectors(obs)
-	# Require valid detector offsets
-	good &= np.isfinite(obs.focal_plane.xi)
-	good &= np.isfinite(obs.focal_plane.eta)
-	good &= np.isfinite(obs.focal_plane.gamma)
-	# Require valid gains
-	good &= np.isfinite(obs.det_cal.phase_to_pW)
-	good &= np.isfinite(obs.det_cal.tau_eff)
-	if np.sum(good) == 0: raise DataMissing("gain")
-	# Restrict to these detectors
-	meta.restrict("dets", meta.dets.vals[good])
-	return meta # orig was modified, but return can be handy for chaining
-
-def calibrate_obs_real(obs):
-	"""The real-space part of the detector calibration. The parts
-	that can be done without Fourier transforming. This assumes
-	validate_meta has already been called To eliminate detectors
-	with invalid metadata."""
-	from sotodlib import mapmaking
-	from sotodlib.hwp import hwp_angle_model
-	# We have the obligatory fields, right?
-	for field in ["signal", "boresight", "focal_plane", "det_cal", "timestamps"]:
-		if field not in obs:
-			raise DataMissing("field '%s' missing" % field)
-	# We're scanning, right?
-	speeds = estimate_scanspeed(obs, quantile=[0.1,0.9])
-	if speeds[0] < 0.05*utils.degree or speeds[1] > 10*utils.degree:
-		raise DataMissing("unreasonable scanning speed")
-	## Fix buggy hwp angles
-	#try: obs = hwp_angle_model.apply_hwp_angle_model(obs)
-	#except ValueError: raise DataMissing("ambiguous hwp angle")
-	#obs.hwp_angle = utils.unwind(obs.hwp_angle)
-	# Fix boresight
-	mapmaking.fix_boresight_glitches(obs)
-	# Fix the signal itself
-	obs.signal *= (obs.det_cal.phase_to_pW * obs.abscal.abscal_cmb * 1e6)[:,None]
-	utils.deslope(obs.signal, w=5, inplace=True)
-	tod_ops.get_gap_fill(obs, flags=obs.glitch_flags, swap=True)
-	# Reject detectors with unreasonable sensitivity
-	dsens = estimate_dsens(obs)
-	asens = np.sum(dsens**-2)**-0.5
-	good  = (dsens > 50)&(dsens < 4000)
-	obs.restrict("dets", obs.dets.vals[good])
-	if obs.dets.count == 0: raise DataMissing("unrealistic sensitivity")
-	# Reject detctors with crazy values. We could make this test more
-	# sensitive by putting it after demodulationg, but we're looking for
-	# very strong values anyway, so it should be OK to put it here
-	sig = estimate_max_signal(obs)
-	good = sig < 1e8
-	obs.restrict("dets", obs.dets.vals[good])
-	if obs.dets.count == 0: raise DataMissing("unrealistic signal strength")
-	return obs
-
-def calibrate_obs_fourier(obs, gtod):
-	ft = scratch.ft.empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
-	gpu_mm.cufft.rfft(gtod, ft, plan_cache=plan_cache)
-	wafers, edges, order = utils.find_equal_groups_fast(obs.det_info.wafer.array)
-	for wi, wafer in enumerate(wafers):
-		params = obs.iir_params["ufm_"+wafer]
-		if params["a"] is None or params["b"] is None: raise DataMissing("iir_params")
-			ft[order[edges[wi]:edges[wi+1]]] /= cupy.array(filters.iir_filter(iir_params=params)(freq, obs))
-		# Timeconst filter handles per-detector values directly, so it's easier to deal with
-	ft /= cupy.array(filters.timeconst_filter(timeconst=obs.det_cal.tau_eff)(freq, obs))
-	gpu_mm.cufft.irfft(ft, gtod, plan_cache=plan_cache)
-	# Normalize?
-	gtod /= gtod.shape[1]
-	return gtod
-
-def estimate_scanspeed(obs, step=100, quantile=0.5):
-	speeds = np.abs(np.diff(obs.boresight.az[::step])/np.diff(obs.timestamps[::step]))
-	return np.quantile(speeds, quantile)
-
-def estimate_max_signal(obs):
-	return np.max(np.abs(np.diff(obs.signal,axis=1)),1)
-
-def read_obs_fast(context, meta, dtype=np.float32):
-	detsets = np.unique(meta.det_info.detset)
-	if len(detsets) > 1: raise DataMissing("Detectors from different detsets must be in different subobs")
-	detset  = detsets[0]
-	obs_id, wafer, band = subid.split(":")
-	files = context.obsfiledb.get_files(obs_id)[detset]
-	files = [v[0] for v in files]
-	# Allocate signal
-	obs   = meta
-	obs.wrap_new("signal", shape=("dets","samps"), dtype=dtype)
-	bore  = core.AxisManager(obs.samps)
-	bore.wrap_new("az",   ("samps",), dtype=np.float64)
-	bore.wrap_new("el",   ("samps",), dtype=np.float64)
-	bore.wrap_new("roll", ("samps",), dtype=np.float64)
-	obs.wrap("boresight", bore)
-	# And read into these arrays
-	fsamp1 = 0
-	with fast_g3.open_multi(files) as reader:
-		inds = utils.find(reader.fields["signal/data"].names, obs.dets.vals)
-		data.queue("signal/data", rows=inds)
-		data.queue("signal/times")
-		data.queue("ancil/az_enc")
-		data.queue("ancil/el_enc")
-		data.queue("ancil/boresight_enc")
-		for fi, data in enumerate(reader.read):
-			n      = data["signal/times"].size
-			fsamp2 = fsamp1 + n
-			# fsamp1:fsamp2 is the range into the full timestream we cover.
-			# But we may not want all this
-			off1 = max(obs.samps.offset-fsamp1,0)
-			off2 = min(fsamp2,obs.samps.offset+obs.samps.count,0)
-			oslice = (Ellipsis,slice(max(fsamp1-off1,0),fsamp2-off1-off2))
-			islice = (Ellipsis,slice(off1,n-off2))
-			obs.signal        [oslice] = data["signal/data"]        [islice].astype(dtype)
-			obs.boresight.az  [oslice] = data["ancil/az_enc"]       [islice]
-			obs.boresight.el  [oslice] = data["ancil/el_enc"]       [islice]
-			obs.boresight.roll[oslice] = data["ancil/boresight_enc"][islice]
-			fsamp1 = fsamp2
-	return obs

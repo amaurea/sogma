@@ -4,16 +4,20 @@ parser = argparse.ArgumentParser()
 parser.add_argument("obsinfo")
 parser.add_argument("area")
 parser.add_argument("odir")
+parser.add_argument("-Q", "--query",   type=str, default=None)
+parser.add_argument(      "--wafers",  type=str, default=None)
+parser.add_argument(      "--bands",   type=str, default=None)
 parser.add_argument("-p", "--prefix",  type=str, default=None)
 parser.add_argument("-v", "--verbose", action="count", default=1)
 parser.add_argument("-q", "--quiet",   action="count", default=0)
 parser.add_argument("-n", "--maxfiles",type=int, default=None)
+parser.add_argument("-i", "--startfile",type=int, default=None)
 args = parser.parse_args()
 
 # Should some of this be factored out into an
 # SO-specific mapmaker class?
 
-import numpy as np, os, time
+import numpy as np, os, time, sys
 from pixell import enmap, utils, mpi, colors
 import cupy
 import gpu_mm
@@ -38,8 +42,8 @@ scratch.cut      = gmem.CuBuffer("cut")       # 0.3  GB (up to 30% cut)
 # Disable the cufft cache. It uses too much gpu memory
 cupy.fft.config.get_plan_cache().set_memsize(0)
 # Set up our data loader
-loader  = files.SimpleLoader(args.obsinfo)
-obsinfo = loader.query()[:args.maxfiles]
+loader  = files.Loader(args.obsinfo)
+obsinfo = loader.query(args.query, wafers=args.wafers, bands=args.bands)[args.startfile:][:args.maxfiles]
 nfile   = len(obsinfo)
 L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
 prefix = args.odir + "/"
@@ -56,16 +60,25 @@ signal_cut = mapmaking.SignalCutFullGpu(comm)
 mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecsGpu())
 # Add our observations
 for ind in range(comm.rank, nfile, comm.size):
-	ifile = obsinfo.path[ind]
-	id    = ".".join(os.path.basename(ifile).split(".")[:-1])
+	id    = obsinfo.id[ind]
 	t1    = time.time()
-	data  = files.read_tod(ifile)
+	try:
+		data  = loader.load(id)
+	except utils.DataMissing as e:
+		L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
+		continue
 	t2    = time.time()
 	mapmaker.add_obs(id, data, deslope=False)
 	gmem.gpu_garbage_collect()
 	del data
 	t3    = time.time()
-	L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2))
+	L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2), level=2)
+
+nobs = comm.allreduce(len(mapmaker.data))
+if nobs == 0:
+	L.print("No tods survived!", id=0, level=0, color=colors.red)
+	mpi.Finalize()
+	sys.exit(1)
 
 # Solve the equation system
 for step in mapmaker.solve():

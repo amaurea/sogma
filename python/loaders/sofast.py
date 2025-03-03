@@ -56,7 +56,7 @@ class SoFastLoader:
 	def load(self, subid):
 		try:
 			with bench.show("read meta (total)"):
-					meta = self.fast_meta.read(subid)
+				meta = self.fast_meta.read(subid)
 			# Load the raw data
 			with bench.show("read data (total)"):
 				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)

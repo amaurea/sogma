@@ -57,6 +57,58 @@ class PmatMapGpu:
 		with scratch.plan.as_allocator():
 			return gpu_mm.PointingPlan(self.preplan, pointing)
 
+class PmatMapGpuOnthefly(PmatMapGpu):
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
+		"""shape, wcs should be for a fullsky geometry, since we assume
+		x wrapping and no negative y pixels"""
+		self.ctime = ctime
+		self.bore  = bore
+		self.offs  = offs
+		self.polang= polang
+		self.dtype = dtype
+		self.ncomp = ncomp
+		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype, store_basis=True)
+		self.preplan  = gpu_mm.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
+		self.pointing = None
+		self.plan     = None
+	def forward(self, gtod, glmap):
+		"""Argument is a LocalMap or equivalent"""
+		import gpu_mm_test
+		t1 = gutils.cutime()
+		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
+		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
+		t2 = gutils.cutime()
+		gpu_mm_test.onthefly_map2tod(gtod, glmap, self.pfit.B, self.pfit.coeffs, plan)
+		t3 = gutils.cutime()
+		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		return gtod
+	def backward(self, gtod, glmap):
+		import gpu_mm_test
+		t1 = gutils.cutime()
+		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
+		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
+		t2 = gutils.cutime()
+		gpu_mm_test.onthefly_tod2map(glmap, gtod, self.pfit.B, self.pfit.coeffs, plan)
+		t3 = gutils.cutime()
+		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		return glmap
+	def precalc_setup(self):
+		t1 = gutils.cutime()
+		self.pointing = self.pfit.eval()
+		self.plan     = self._make_plan(self.pointing)
+		t2 = gutils.cutime()
+		L.print("Pprep %6.4f" % (t2-t1), level=3)
+	def precalc_free (self):
+		self.pointing = None
+		self.plan     = None
+	def _make_plan(self, pointing):
+		# Here it would have been convenient if BufAllocator could grow.
+		# Instead we have to calculate and reserve the size needed
+		size = scratch.plan.aligned_size(self.preplan.plan_nbytes, self.preplan.plan_constructor_tmp_nbytes)
+		scratch.plan.reserve(size)
+		with scratch.plan.as_allocator():
+			return gpu_mm.PointingPlan(self.preplan, pointing)
+
 # Cuts
 
 class PmatCutNull:
@@ -234,7 +286,10 @@ class PointingFit:
 		mins  = cupy.min(ref_pixs[:2],1)
 		maxs  = cupy.max(ref_pixs[:2],1)
 		t     = cupy.linspace(-1,1,nsamp,self.dtype)
-		y, x  = ref_pixs[:2]
+		# Must normalze these to avoid numerical problems. Pixel numbers can be
+		# quite high compared to the t values
+		y     = normalize(ref_pixs[0])
+		x     = normalize(ref_pixs[1])
 		B[0]  = 1
 		# I wish python had a better way to write this
 		for i in range(self.nt): B[1+i]                 = t**(i+1)
@@ -262,3 +317,8 @@ class PointingFit:
 		pointing = scratch.pointing.empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
 		coeffs.dot(B, out=pointing)
 		return pointing
+
+def normalize(x):
+    x1 = np.min(x)
+    x2 = np.max(x)
+    return (x-x1)/(x2-x1) if x2!=x1 else x

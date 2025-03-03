@@ -2,10 +2,72 @@ import numpy as np, contextlib, json, time, os, scipy
 from pixell import utils, fft, bunch, bench, sqlite
 from sotodlib import preprocess, core
 import fast_g3, h5py, yaml, ast, numba
+import so3g
 from so3g.proj import quat
-from . import gutils, gmem
+from .. import gutils, gmem
 import cupy, gpu_mm
 from cupy.cuda import cublas
+
+class SoFastLoader:
+	def __init__(self, configfile, mul=32):
+		# Set up our metadata loader
+		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
+		self.fast_meta = FastMeta(self.config, self.context)
+		self.mul     = mul
+	def query(self, query=None, wafers=None, bands=None):
+		# wafers and bands should ideally be a part of the query!
+		from sotodlib import mapmaking
+		subids = mapmaking.get_subids(query, context=self.context)
+		subids = mapmaking.filter_subids(subids, wafers=wafers, bands=bands)
+		# Need base ids to look up rest of the info in obsdb
+		obs_ids, wafs, bands = mapmaking.split_subids(subids)
+		info     = self.context.obsdb.query()
+		inds     = utils.find(info["obs_id"], obs_ids)
+		# Build obsinfo for these ids
+		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
+		obsinfo       = np.zeros(len(inds), dtype).view(np.recarray)
+		obsinfo.id    = subids
+		obsinfo.ndet  = 1000 # no simple way to get this :(
+		obsinfo.nsamp = info["n_samples"][inds]
+		obsinfo.ctime = info["start_time"][inds]
+		obsinfo.dur   = info["stop_time"][inds]-info["start_time"][inds]
+		# How come the parts that have to do with pointing.
+		# These arrays have a nasty habit of being object dtype
+		baz0  = info["az_center"][inds].astype(np.float64)
+		waz   = info["az_throw" ][inds].astype(np.float64)
+		bel0  = info["el_center"][inds].astype(np.float64)
+		# Need the rough pointing for each observation. This isn't
+		# directly available in the obsid. We will assume that each wafer-slot
+		# has approximately constant pointing offsets.
+		# 1. Find a reference subid for each wafer slot
+		ref_ids, order, edges = get_ref_subids(subids)
+		wafer_centers = np.zeros((len(subids),2))
+		wafer_rads    = np.zeros((len(subids)))
+		for ri, ref_id in enumerate(ref_ids):
+			# 2. Get the focal plane offsets for this subid
+			focal_plane = get_focal_plane(self.fast_meta, ref_id)
+			mid, rad    = get_fplane_extent(focal_plane)
+			wafer_centers[order[edges[ri]:edges[ri+1]]] = mid
+			wafer_rads   [order[edges[ri]:edges[ri+1]]] = rad
+		# Fill in the last entries in obsinfo
+		obsinfo.r     = wafer_rads
+		obsinfo.sweep = make_sweep(obsinfo.ctime, baz0, waz, bel0, wafer_centers)
+		return obsinfo
+	def load(self, subid):
+		try:
+			with bench.show("read meta (total)"):
+					meta = self.fast_meta.read(subid)
+			# Load the raw data
+			with bench.show("read data (total)"):
+				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
+			# Calibrate the data
+			with bench.show("calibrate (total)"):
+				obs = calibrate(data, meta)
+		except Exception as e:
+			# FIXME: Make this less broad
+			raise utils.DataMissing(type(e) + " " + str(e))
+		# Place obs.tod on gpu. Hardcoded to use scratch.tod for now
+		return obs
 
 class FastMeta:
 	def __init__(self, configs, context):
@@ -158,152 +220,30 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 			i += chunk.shape[-1]
 	return aman
 
-# CPU version of calibration
 def calibrate(data, meta):
-	with bench.show("ctime"):
-		ctime   = data.timestamps * meta.timestamp_to_ctime
-	# Calibrate the pointing
-	with bench.show("boresight"):
-		az      = data.az   * utils.degree
-		el      = data.el   * utils.degree
-		roll    = data.roll * utils.degree
-	with bench.show("pointing correction"):
-		az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
-	# Do we need to deslope at float64 before it is safe to drop to float32?
-	with bench.show("signal → float32"):
-		signal  = data.signal.astype(np.float32)
-	with bench.show("calibrate"):
-		# Calibrate to CMB µK
-		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] * meta.aman.relcal[:,None]
-		signal *= meta.dac_to_phase * phase_to_cmb
-	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
-	# it's large and doesn't follow the simple slopes and offsets we assume there
-	with bench.show("subtract_hwpss"):
-		nmode = 16
-		signal = subtract_hwpss(signal, meta.aman.hwp_angle, meta.aman.hwpss_coeffs[:,:nmode]*phase_to_cmb)
-	# Deglitching. Merge all cuts into a single, measure the values v1,v2 at the edge of
-	# each cut region. Subtract v2-v1 from everything following the cut, and fill the cut
-	# with v1
+	# Merge the cuts. Easier to deal with just a single cuts object
 	with bench.show("merge_cuts"):
 		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_slow"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
-
-	# For each cut region we want a region up to n samples wide on its borders, but not
-	# inside other cuts
-	w = 10
-	with bench.show("get_cut_borders"):
-		borders = get_cut_borders(cuts,w)
-	# Hm, need to read out mean in each of these border regions. No easy way to do this
-	# Let's see how expensive it is to loop. 28 ms. Probably worth implementing in
-	# low-level code
-	with bench.show("border vals"):
-		bvals = np.zeros((len(borders),2), signal.dtype)
-		for di, (b1,b2) in enumerate(cuts.bins):
-			for ri in range(b1,b2):
-				bor   = borders[ri]
-				bvals1= signal[di,bor[0,0]:bor[0,1]]
-				bvals2= signal[di,bor[1,0]:bor[1,1]]
-				if bvals1.size  > 0: v1 = np.mean(bvals1)
-				if bvals2.size  > 0: v2 = np.mean(bvals2)
-				if bvals1.size == 0: v1 = v2
-				if bvals2.size == 0: v2 = v1
-				bvals[ri,0] = v1
-				bvals[ri,1] = v2
-	# 45 ms for this one. Not as slow as I feared, but should still be
-	# optimized. Unless it's faster on a gpu
-	with bench.show("deglich"):
-		# Will subtract v2-v1 from entire region after that cut.
-		jumps = bvals[:,1]-bvals[:,0]
-		cumj  = np.cumsum(jumps)
-		# Will subtract cumj[i] for range[i,1]:range[i+1,0].
-		# Will set range[i,0]:range[i,1] to bvals[i,1]-cumj[i]
-		for di, (b1,b2) in enumerate(cuts.bins):
-			if b1 >= b2: continue
-			dcumj = cumj[b1:b2]
-			if b1 > 0: dcumj = dcumj - cumj[b1-1] # NB: -= would clobber!
-			for i, ri in enumerate(range(b1,b2)):
-				r1,r2 = cuts.ranges[ri]
-				r3    = cuts.ranges[ri+1,0] if ri < b2-1 else cuts.nsamp
-				signal[di,r1:r2]  = bvals[ri,1]-dcumj[i]
-				signal[di,r2:r3] -= dcumj[i]
-	# 100 ms for this :(
-	with bench.show("deslope"):
-		deslope(signal, w=w, inplace=True)
-	# Get a fourier-friendly length
+	# Go to a fourier-friendly length
 	mul   = 32
-	nsamp = fft.fft_len(signal.shape[1]//mul, factors=[2,3,5,7])*mul
-	ctime, signal, cuts, az, el, roll = [a[...,:nsamp] for a in [ctime,signal,cuts,az,el,roll]]
+	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=[2,3,5,7])*mul
+	timestamps, signal, cuts, az, el, roll, hwp_angle = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el,data.roll,meta.aman.hwp_angle]]
 
-	# FFT stuff should definitely be on the gpu. 640 ms
-	with bench.show("fft"):
-		ftod = fft.rfft(signal)
-	# Deconvolve iir and time constants
-	with bench.show("iir_filter"):
-		dt    = (ctime[-1]-ctime[0])/(ctime.size-1)
-		freqs = fft.rfftfreq(nsamp, dt, dtype=signal.dtype)
-		z     = np.exp(-2j*np.pi*meta.iir_params.fscale*freqs)
-		A     = np.polyval(meta.iir_params.a[:meta.iir_params.order+1][::-1], z)
-		B     = np.polyval(meta.iir_params.b[:meta.iir_params.order+1][::-1], z)
-		iir_filter = A/B # will multiply by this
-		ftod *= iir_filter
-	with bench.show("time consts"):
-		# I can't find an efficient way to do this. BLAS can't
-		# do it since it's a triple multiplication. Hopefully the
-		# gpu won't have trouble with it
-		ftod *= 1 + 2j*np.pi*meta.aman.tau_eff[:,None]*freqs
-	# Back to real space
-	with bench.show("ifft"):
-		fft.irfft(ftod, signal, normalize=True)
-
-	with bench.show("measure noise"):
-		rms  = measure_rms(signal)
-
-	# Restrict to these detectors
-	with bench.show("final detector prune"):
-		tol    = 0.1
-		ref    = np.median(rms[rms!=0])
-		good   = (rms > ref*tol)&(rms < ref/tol)
-		signal = signal[good] # 600 ms!
-		cuts   = cuts  [good]
-		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
-
-	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
-
-	#bunch.write("test2.hdf", bunch.Bunch(shape=signal.shape,
-	#	bins=cuts.bins, ranges=cuts.ranges, nsamp=cuts.nsamp))
-
-	with bench.show("cuts reformat"):
-		ocuts = np.array([
-			get_range_dets(cuts.bins, cuts.ranges),
-			cuts.ranges[:,0], cuts.ranges[:,1]-cuts.ranges[:,0]], dtype=np.int32)
-		ocuts = ocuts[:,ocuts[0]>=0]
-
-	# Our goal is to output what sogma needs. Sogma works on these fields:
-	res  = bunch.Bunch()
-	res.dets         = meta.aman.dets.vals[good]
-	res.point_offset = meta.aman.focal_plane[good,1::-1]
-	res.polangle     = meta.aman.focal_plane[good,2]
-	res.ctime        = ctime
-	res.boresight    = np.array([el,az]) # FIXME: roll
-	res.tod          = signal
-	res.cuts         = ocuts
-	return res
-
-def calibrate_gpu(data, meta):
 	with bench.show("ctime"):
-		ctime   = data.timestamps * meta.timestamp_to_ctime
+		ctime   = timestamps * meta.timestamp_to_ctime
 	# Calibrate the pointing
 	with bench.show("boresight"):
-		az      = data.az   * utils.degree
-		el      = data.el   * utils.degree
-		roll    = data.roll * utils.degree
+		az      = az   * utils.degree
+		el      = el   * utils.degree
+		roll    =-roll * utils.degree
 	with bench.show("pointing correction"):
 		az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.show("signal → gpu", tfun=gutils.cutime):
-		signal_ = gmem.scratch.ft.array(data.signal)
+		signal_ = gmem.scratch.ft.array(signal)
 	with bench.show("signal → float32", tfun=gutils.cutime):
-		signal  = gmem.scratch.tod.empty(data.signal.shape, np.float32)
+		signal  = gmem.scratch.tod.empty(signal.shape, np.float32)
 		signal[:] = signal_
 	with bench.show("calibrate", tfun=gutils.cutime):
 		# Calibrate to CMB µK
@@ -313,14 +253,10 @@ def calibrate_gpu(data, meta):
 	# it's large and doesn't follow the simple slopes and offsets we assume there
 	with bench.show("subtract_hwpss", tfun=gutils.cutime):
 		nmode = 16
-		signal = subtract_hwpss(signal, meta.aman.hwp_angle, meta.aman.hwpss_coeffs[:,:nmode]*phase_to_cmb)
-	# Deglitching. Merge all cuts into a single, measure the values v1,v2 at the edge of
+		signal = subtract_hwpss(signal, hwp_angle, meta.aman.hwpss_coeffs[:,:nmode]*phase_to_cmb)
+	# Deglitching. Measure the values v1,v2 at the edge of
 	# each cut region. Subtract v2-v1 from everything following the cut, and fill the cut
 	# with v1
-	with bench.show("merge_cuts"):
-		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_slow"]])
-		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
-
 	# For each cut region we want a region up to n samples wide on its borders, but not
 	# inside other cuts
 	w = 10
@@ -359,13 +295,10 @@ def calibrate_gpu(data, meta):
 				r3    = cuts.ranges[ri+1,0] if ri < b2-1 else cuts.nsamp
 				signal[di,r1:r2]  = bvals[ri,1]-dcumj[i]
 				signal[di,r2:r3] -= dcumj[i]
+
 	# 100 ms for this :(
 	with bench.show("deslope", tfun=gutils.cutime):
 		deslope(signal, w=w, inplace=True)
-	# Get a fourier-friendly length
-	mul   = 32
-	nsamp = fft.fft_len(signal.shape[1]//mul, factors=[2,3,5,7])*mul
-	ctime, signal, cuts, az, el, roll = [a[...,:nsamp] for a in [ctime,signal,cuts,az,el,roll]]
 
 	# FFT stuff should definitely be on the gpu. 640 ms
 	with bench.show("fft", tfun=gutils.cutime):
@@ -399,15 +332,12 @@ def calibrate_gpu(data, meta):
 		tol    = 0.1
 		ref    = np.median(rms[rms!=0])
 		good   = (rms > ref*tol)&(rms < ref/tol)
-		signal = signal[good] # 600 ms!
+		signal = cupy.ascontiguousarray(signal[good]) # 600 ms!
 		good   = good.get() # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 
 	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
-
-	#bunch.write("test2.hdf", bunch.Bunch(shape=signal.shape,
-	#	bins=cuts.bins, ranges=cuts.ranges, nsamp=cuts.nsamp))
 
 	with bench.show("cuts reformat"):
 		ocuts = np.array([
@@ -541,6 +471,42 @@ class AcalCache:
 #	for bi, bin in enumerate(bins):
 #		for i in range(bin[0],bin[1]):
 #			bind[i] = bi
+
+def get_ref_subids(subids):
+	"""Return one subid for each :ws:band combination"""
+	subs  = np.char.partition(subids, ":")[:,2]
+	uvals, order, edges = utils.find_equal_groups_fast(subs)
+	uvals = subids[order[edges[:-1]]]
+	return uvals, order, edges
+
+def get_focal_plane(fast_meta, subid):
+	fp_info     = fast_meta.fp_cache.get_by_subid(subid, fast_meta.det_cache)
+	focal_plane = np.array([fp_info["xi"], fp_info["eta"], fp_info["gamma"]]).T # [:,{xi,eta,gamma}]
+	good        = np.all(np.isfinite(focal_plane),1)
+	focal_plane = focal_plane[good]
+	return focal_plane
+
+def get_fplane_extent(focal_plane):
+	mid = np.mean(focal_plane,0)[:2]
+	rad = np.max(utils.angdist(focal_plane[:,:2],mid[:,None]))
+	return mid, rad
+
+def make_sweep(ctime, baz0, waz, bel0, off, npoint=4):
+	from pixell import coordinates
+	# given ctime,baz0,waz,bel [ntod], off[ntod,{xi,eta}], make
+	# make sweeps[ntod,npoint,{ra,dec}]
+	# so3g can't handle per-sample pointing offsets, so it would
+	# force us to loop here. We therefore simply modify the pointing
+	# offsets to we can simply add them to az,el
+	az_off, el = coordinates.euler_rot((0.0, -bel0, 0.0), off.T)
+	az  = (baz0+az_off)[:,None] + np.linspace(-0.5,0.5,npoint)*waz[:,None]
+	el  = el   [:,None] + az*0
+	ts  = ctime[:,None] + az*0
+	sightline = so3g.proj.coords.CelestialSightLine.az_el(
+		ts.reshape(-1), az.reshape(-1), el.reshape(-1), site="so", weather="typical")
+	pos_equ = np.asarray(sightline.coords()) # [ntot,{ra,dec,cos,sin}]
+	sweep   = pos_equ.reshape(len(ctime),npoint,4)[:,:,:2]
+	return sweep
 
 def get_range_dets(bins, ranges):
 	bind  = np.full(len(ranges),-1,np.int32)
@@ -788,10 +754,10 @@ def subtract_hwpss(signal, hwp_angle, coeffs):
 		one       = np.full(1, 1, signal.dtype)
 		minus_one = np.full(1,-1, signal.dtype)
 		cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N,
-			nsamp, ndet, ncoeff, one.ctypes.data, B.data.ptr, nsamp, coeffs.data.ptr, ncoeff,
-			minus_one.ctypes.data, signal.data.ptr, nsamp)
+			nsamp, ndet, ncoeff, minus_one.ctypes.data, B.data.ptr, nsamp, coeffs.data.ptr, ncoeff,
+			one.ctypes.data, signal.data.ptr, nsamp)
 	else:
-		scipy.linalg.blas.sgemm(1, B.T, coeffs.T, beta=-1, c=signal.T, overwrite_c=True)
+		scipy.linalg.blas.sgemm(-1, B.T, coeffs.T, beta=1, c=signal.T, overwrite_c=True)
 	return signal
 
 def polar_2d(x, y):

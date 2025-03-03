@@ -75,8 +75,12 @@ class CuBuffer:
 		return self.full(shape, 0, dtype=dtype)
 	def array(self, arr):
 		"""Like empty(), but based on the data of an existing array, which
-		can be either a numpy or cupy array."""
+		can be either a numpy or cupy array. If makecontig is True, then the
+		array will be made contiguous. Otherwise, a ValueError will be raised
+		if the array is not contiguous."""
 		res = self.empty(arr.shape, arr.dtype)
+		ap  = cupy if isinstance(arr, cupy.ndarray) else np
+		arr = ap.ascontiguousarray(arr)
 		copy(arr, res)
 		return res
 	def as_allocator(self): return BufAllocator(self)
@@ -97,6 +101,7 @@ class CuBuffer:
 		return self
 
 def copy(afrom,ato):
+	assert afrom.flags["C_CONTIGUOUS"] and ato.flags["C_CONTIGUOUS"]
 	cupy.cuda.runtime.memcpy(getptr(ato), getptr(afrom), ato.nbytes, cupy.cuda.runtime.memcpyDefault)
 
 def getptr(arr):
@@ -134,41 +139,3 @@ class BufAllocator:
 		cupy.cuda.set_allocator(self._old_allocator)
 
 def round_up(a,b): return (a+b-1)//b*b
-
-# Old CuBuffer. Can probably be deleted
-
-class OldCuBuffer:
-	def __init__(self, size, align=512, name="[unnamed]"):
-		self.size   = int(size)
-		self.memptr = mempool.malloc(self.size)
-		self.offset = 0
-		self.align  = align
-		self.name   = name
-	def free(self): return self.size - self.offset
-	def view(self, shape, dtype=np.float32):
-		return cupy.ndarray(shape, dtype, memptr=cupy.cuda.MemoryPointer(self.memptr.mem, self.offset))
-	def copy(self, arr):
-		if self.free() < arr.nbytes: raise MemoryError("CuBuffer too small to copy array with size %d" % arr.nbytes)
-		res = self.view(arr.shape, arr.dtype)
-		if isinstance(arr, cupy.ndarray):
-			cupy.cuda.runtime.memcpy(res.data.ptr, arr.data.ptr, arr.nbytes, cupy.cuda.runtime.memcpyDefault)
-		else:
-			cupy.cuda.runtime.memcpy(res.data.ptr, arr.ctypes.data, arr.nbytes, cupy.cuda.runtime.memcpyDefault)
-		return res
-	def alloc(self, size):
-		#print("CuBuffer %s alloc %d offset %d" % (self.name, size, self.offset))
-		if self.free() < size:
-			raise MemoryError("CuBuffer not enough memory to allocate %d bytes" % size)
-		res = cupy.cuda.MemoryPointer(self.memptr.mem, self.offset)
-		self.offset = round_up(self.offset+size, self.align)
-		return res
-	def reset(self):
-		self.offset = 0
-	@contextlib.contextmanager
-	def as_allocator(self):
-		offset = self.offset
-		try:
-			with cupy.cuda.using_allocator(self.alloc):
-				yield
-		finally:
-			self.offset = offset

@@ -203,6 +203,7 @@ class SignalMapGpu(Signal):
 		pcut   = pmat.PmatCutFullGpu(obs.cuts)
 		if pmap is None:
 			pmap = pmat.PmatMapGpu(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=Nd.dtype)
+			#pmap = pmat.PmatMapGpuOnthefly(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dtype=Nd.dtype)
 			gmem.gpu_garbage_collect()
 		# Precompute pointing for the upcoming pmap observations
 		# Accumulate local rhs

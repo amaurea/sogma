@@ -107,6 +107,9 @@ class TileDistribution:
 		# Sub-rectangle we're actually interested in.
 		# Used when reducing the map
 		self.pixbox = pixbox
+		if pixbox is not None:
+			_, self.pwcs = enmap.crop_geometry(shape, wcs, pixbox=pixbox)
+		else: self.pwcs = wcs
 		# Set up the work tiling. Would be nice if the
 		# latter could be part of 
 		lp = local_pixelization
@@ -175,8 +178,14 @@ class TileDistribution:
 			omap[self.ompi.rinds[0],self.ompi.rinds[1]] = rbuf
 			omap = np.moveaxis(omap, (2,3,4), (0,2,4))
 			omap = omap.reshape(omap.shape[0],omap.shape[1]*omap.shape[2],omap.shape[3]*omap.shape[4])
-			omap = enmap.ndmap(omap, self.wcs)
-			omap = omap.extract_pixbox(self.ompi.obox)
+			print(self.ompi.obox)
+			# self.mpi.obox will not have negative values or wrapping issues the way we have
+			# constructed things here
+			print(self.ompi.obox)
+			(y1,x1),(y2,x2) = self.ompi.obox
+			omap = omap[...,y1:y2,x1:x2]
+			omap = enmap.ndmap(omap, self.pwcs)
+			print(omap.box()/utils.degree)
 			return omap
 	@property
 	def oshape(self): return (self.work .ntile,self.ncomp,self.tshape[0],self.tshape[1])

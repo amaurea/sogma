@@ -12,6 +12,7 @@ parser.add_argument("-v", "--verbose", action="count", default=1)
 parser.add_argument("-q", "--quiet",   action="count", default=0)
 parser.add_argument("-n", "--maxfiles",type=int, default=None)
 parser.add_argument("-i", "--startfile",type=int, default=None)
+parser.add_argument("-L", "--loader",  type=str, default="auto")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -21,7 +22,7 @@ import numpy as np, os, time, sys
 from pixell import enmap, utils, mpi, colors
 import cupy
 import gpu_mm
-from sogma import gutils, logging, gmem, mapmaking, files, tiling, nmat
+from sogma import gutils, logging, gmem, mapmaking, loading, tiling, nmat
 from sogma.gmem import scratch
 
 comm   = mpi.COMM_WORLD
@@ -42,7 +43,7 @@ scratch.cut      = gmem.CuBuffer("cut")       # 0.3  GB (up to 30% cut)
 # Disable the cufft cache. It uses too much gpu memory
 cupy.fft.config.get_plan_cache().set_memsize(0)
 # Set up our data loader
-loader  = files.Loader(args.obsinfo)
+loader  = loading.Loader(args.obsinfo, type=args.loader)
 obsinfo = loader.query(args.query, wafers=args.wafers, bands=args.bands)[args.startfile:][:args.maxfiles]
 nfile   = len(obsinfo)
 L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
@@ -58,6 +59,7 @@ signal_map = mapmaking.SignalMapGpu(shape, wcs, comm, dtype=np.float32)
 signal_cut = mapmaking.SignalCutFullGpu(comm)
 # Set up the mapmaker
 mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecsGpu())
+#mapmaker = mapmaking.MLMapmaker(signals=[signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.Nmat())
 # Add our observations
 for ind in range(comm.rank, nfile, comm.size):
 	id    = obsinfo.id[ind]

@@ -73,22 +73,20 @@ class PmatMapGpuOnthefly(PmatMapGpu):
 		self.plan     = None
 	def forward(self, gtod, glmap):
 		"""Argument is a LocalMap or equivalent"""
-		import gpu_mm_test
 		t1 = gutils.cutime()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
 		t2 = gutils.cutime()
-		gpu_mm_test.onthefly_map2tod(gtod, glmap, self.pfit.B, self.pfit.coeffs, plan)
+		gpu_mm.onthefly_map2tod(gtod, glmap, self.pfit.B, self.pfit.coeffs, plan, debug=True)
 		t3 = gutils.cutime()
 		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gtod
 	def backward(self, gtod, glmap):
-		import gpu_mm_test
 		t1 = gutils.cutime()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
 		t2 = gutils.cutime()
-		gpu_mm_test.onthefly_tod2map(glmap, gtod, self.pfit.B, self.pfit.coeffs, plan)
+		gpu_mm.onthefly_tod2map(glmap, gtod, self.pfit.B, self.pfit.coeffs, plan, debug=True)
 		t3 = gutils.cutime()
 		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return glmap

@@ -19,27 +19,27 @@ class SotodlibLoader:
 		# Need base ids to look up rest of the info in obsdb
 		obs_ids, wafs, bands = mapmaking.split_subids(subids)
 		info     = self.context.obsdb.query("type='obs' and az_center is not null")
-		inds     = utils.find(info["obs_id"], obs_ids)
+		iinds, oinds = utils.common_inds([info["obs_id"], obs_ids])
 		# Build obsinfo for these ids
 		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
-		obsinfo = np.zeros(len(subids), dtype).view(np.recarray)
-		obsinfo.id    = subids
+		obsinfo = np.zeros(len(oinds), dtype).view(np.recarray)
+		obsinfo.id    = subids[oinds]
 		obsinfo.ndet  = 1000 # no simple way to get this :(
-		obsinfo.nsamp = info["n_samples"][inds]
-		obsinfo.ctime = info["start_time"][inds]
-		obsinfo.dur   = info["stop_time"][inds]-info["start_time"][inds]
+		obsinfo.nsamp = info["n_samples"][iinds]
+		obsinfo.ctime = info["start_time"][iinds]
+		obsinfo.dur   = info["stop_time"][iinds]-info["start_time"][iinds]
 		# How come the parts that have to do with pointing.
-		baz0  = info["az_center"][inds]
-		waz   = info["az_throw" ][inds]
-		bel0  = info["el_center"][inds]
+		baz0  = info["az_center"][iinds]
+		waz   = info["az_throw" ][iinds]
+		bel0  = info["el_center"][iinds]
 		# Should really have the proper array center, but it's clunky to get this,
 		# and ultimately it doesn't matter
 		#winfo   = get_wafer_info(self.context, info)
 		#wind    = utils.find(winfo.wafers, wafs[inds])
 		#obsinfo.r = winfo.r[wind]
 		#pos     = winfo.pos[wind]
-		obsinfo.r = np.full(len(inds), 1.0*utils.degree)
-		pos       = np.zeros((len(inds),2))
+		obsinfo.r = np.full(len(iinds), 1.0*utils.degree)
+		pos       = np.zeros((len(iinds),2))
 		obsinfo.sweep = make_sweep(obsinfo.ctime, baz0, waz, bel0, pos)
 		return obsinfo
 	def load(self, subid):

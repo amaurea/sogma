@@ -1,12 +1,13 @@
-import numpy as np
+import numpy as np, time
 from numpy.lib import recfunctions
-from pixell import utils, fft
-from ..gmem import scratch
+from pixell import utils, fft, bunch
+from .. import device
 
 class SimpleLoader:
-	def __init__(self, infofile, mul=32):
+	def __init__(self, infofile, dev=None, mul=32):
 		"""context is really just a list of tods and meta here"""
 		self.obsinfo = read_obsinfo(infofile)
+		self.dev     = dev or device.get_device()
 		self.lookup  = {id:i for i,id in enumerate(self.obsinfo.id)}
 		self.mul     = mul
 	def query(self, query=None, wafers=None, bands=None):
@@ -16,8 +17,8 @@ class SimpleLoader:
 		ind = self.lookup[id]
 		# Reads pre-calibrated files
 		obs = read_tod(self.obsinfo[ind].path, mul=self.mul)
-		# Place obs.tod on gpu. Hardcoded to use scratch.tod for now
-		obs.tod = scratch.tod.array(obs.tod)
+		# Place obs.tod on device
+		obs.tod = self.dev.pools.tod.reset().array(obs.tod)
 		return obs
 
 # Helpers below

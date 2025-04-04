@@ -1,11 +1,6 @@
 import numpy as np
-import cupy
-import gpu_mm
-from cupy.cuda import cublas
 from pixell import utils, bunch
-from . import gutils, gmem
-from .gutils import anypy
-from .gmem import scratch
+from . import gutils, device
 from .logging import L
 
 class Nmat:
@@ -33,42 +28,10 @@ class Nmat:
 	@staticmethod
 	def from_bunch(data): return Nmat()
 
-def apply_vecs_gpu(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, handle=None, out=None):
-	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
-	memory as arguments instead.
-
-	ftod: The fourier-transform of the TOD, cast to float32. [ndet,nfreq]
-	iD:   The inverse white noise variance. [nbin,ndet]
-	V:    The eigenvectors. [ndet,nmode]
-	Kh:   The square root of the Woodbury kernel (E"+V'DV)**-0.5. [nbin,nmode,nmode]
-	bins: The frequency ranges for each bin. [nbin,{from,to}]
-	tmp, vtmp, divtmp: Work arrays
-	"""
-	if out    is None: out = dat
-	if handle is None: handle = cupy.cuda.Device().cublas_handle
-	ndet, nmode = V.shape
-	nfreq = ftod.shape[1]
-	zero      = np.full(1, 0, iD.dtype)
-	one       = np.full(1, 1, iD.dtype)
-	minus_one = np.full(1,-1, iD.dtype)
-	for bi, (i1,i2) in enumerate(2*bins):
-		bsize = i2-i1
-		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
-		# 1. divtmp = iD V      [ndet,nmode]
-		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
-		cublas.sdgmm(handle, cublas.CUBLAS_SIDE_RIGHT, nmode, ndet, V.data.ptr, nmode, iD.data.ptr+bi*iD.strides[0], 1, divtmp.data.ptr, nmode)
-		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
-		cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, nmode, ndet, nmode, one.ctypes.data, Kh.data.ptr+bi*Kh.strides[0], nmode, divtmp.data.ptr, nmode, zero.ctypes.data, vtmp.data.ptr, nmode)
-		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
-		cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_T, bsize, nmode, ndet, one.ctypes.data, ftod.data.ptr+i1*ftod.itemsize, nfreq, vtmp.data.ptr, nmode, zero.ctypes.data, tmp.data.ptr, tmp.shape[1])
-		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
-		cublas.sdgmm(handle, cublas.CUBLAS_SIDE_RIGHT, bsize, ndet, ftod.data.ptr+i1*ftod.itemsize, nfreq, iD.data.ptr+bi*iD.strides[0], 1, out.data.ptr+i1*out.itemsize, nfreq)
-		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
-		cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, bsize, ndet, nmode, minus_one.ctypes.data, tmp.data.ptr, tmp.shape[1], vtmp.data.ptr, nmode, one.ctypes.data, out.data.ptr+i1*out.itemsize, nfreq)
-
-class NmatDetvecsGpu(Nmat):
+class NmatDetvecs(Nmat):
 	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
-			downweight=[], window=2, nwin=None, verbose=False, bins=None, iD=None, V=None, Kh=None, ivar=None):
+			downweight=[], window=2, nwin=None, verbose=False, bins=None, iD=None, V=None,
+			Kh=None, ivar=None, dev=None):
 		# Variables used for building the noise model
 		if bin_edges is None: bin_edges = np.array([
 			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
@@ -80,6 +43,7 @@ class NmatDetvecsGpu(Nmat):
 			100., 110., 120., 130., 140., 150., 160., 170.,
 			180., 190.
 		])
+		self.dev       = dev or device.get_device()
 		self.bin_edges = np.array(bin_edges)
 		self.mode_bins = np.array(mode_bins)
 		self.eig_lim   = np.zeros(len(mode_bins))+eig_lim
@@ -93,10 +57,7 @@ class NmatDetvecsGpu(Nmat):
 		self.iD, self.V, self.Kh, self.ivar = iD, V, Kh, ivar
 		self.ready      = all([a is not None for a in [iD, V, Kh, ivar]])
 		if self.ready:
-			self.iD, self.V, self.Kh, self.ivar = [cupy.asarray(a) for a in [iD, V, Kh, ivar]]
-			# Why aren't these on the GPU?
-			self.dev    = cupy.cuda.Device()
-			self.handle = self.dev.cublas_handle
+			self.iD, self.V, self.Kh, self.ivar = [dev.np.asarray(a) for a in [iD, V, Kh, ivar]]
 			self.maxbin = np.max(self.bins[:,1]-self.bins[:,0])
 	def build(self, tod, srate, extra=False, **kwargs):
 		# Apply window before measuring noise model
@@ -104,9 +65,9 @@ class NmatDetvecsGpu(Nmat):
 		nwin  = utils.nint(self.window*srate)
 		ndet, nsamp = tod.shape
 		nfreq = nsamp//2+1
-		tod   = cupy.asarray(tod)
+		tod   = self.dev.np.asarray(tod)
 		gutils.apply_window(tod, nwin)
-		ft    = gpu_mm.cufft.rfft(tod, plan_cache=gmem.plan_cache)
+		ft    = self.dev.lib.rfft(tod)
 		# Unapply window again
 		gutils.apply_window(tod, nwin, -1)
 		del tod
@@ -125,9 +86,9 @@ class NmatDetvecsGpu(Nmat):
 		nbin      = len(bins)
 		# Now measure the power of each basis vector in each bin. The residual
 		# noise will be modeled as uncorrelated
-		E  = cupy.zeros([nbin,nmode],dtype)
-		D  = cupy.zeros([nbin,ndet],dtype)
-		Nd = cupy.zeros([nbin,ndet],dtype)
+		E  = self.dev.np.zeros([nbin,nmode],dtype)
+		D  = self.dev.np.zeros([nbin,ndet],dtype)
+		Nd = self.dev.np.zeros([nbin,ndet],dtype)
 		for bi, b in enumerate(bins):
 			# Skip the DC mode, since it's it's unmeasurable and filtered away
 			b = np.maximum(1,b)
@@ -135,50 +96,48 @@ class NmatDetvecsGpu(Nmat):
 		del Nd, ft
 		# Optionally downweight the lowest frequency bins
 		if self.downweight != None and len(self.downweight) > 0:
-			D[:len(self.downweight)] /= cupy.array(self.downweight)[:,None]
+			D[:len(self.downweight)] /= self.dev.np.array(self.downweight)[:,None]
 		# Also compute a representative white noise level
-		bsize = cupy.array(bins[:,1]-bins[:,0])
-		ivar  = cupy.sum(1/D*bsize[:,None],0)/cupy.sum(bsize)
+		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
+		ivar  = self.dev.np.sum(1/D*bsize[:,None],0)/self.dev.np.sum(bsize)
 		ivar *= nsamp
 		# We need D", not D
 		iD, iE = 1/D, 1/E
 		# Precompute Kh = (E" + V'D"V)**-0.5
-		Kh = cupy.zeros([nbin,nmode,nmode],dtype)
+		Kh = self.dev.np.zeros([nbin,nmode,nmode],dtype)
 		for bi in range(nbin):
-			iK = cupy.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
-			Kh[bi] = np.linalg.cholesky(cupy.linalg.inv(iK))
+			iK = self.dev.np.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
+			Kh[bi] = np.linalg.cholesky(self.dev.np.linalg.inv(iK))
 		# Construct a fully initialized noise matrix
-		nmat = NmatDetvecsGpu(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
+		nmat = NmatDetvecs(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
 				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
-				bins=bins, iD=iD, V=V, Kh=Kh, ivar=ivar)
+				bins=bins, iD=iD, V=V, Kh=Kh, ivar=ivar, dev=self.dev)
 		return nmat
 	def apply(self, gtod, inplace=True):
-		t1 =gutils.cutime()
+		t1 =self.dev.time()
 		if not inplace: god = gtod.copy()
 		gutils.apply_window(gtod, self.nwin)
-		t2 =gutils.cutime()
-		#with scratch.ft.as_allocator():
-		#	ft = cupy.fft.rfft(gtod, axis=1)
-		ft = scratch.ft.empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
-		gpu_mm.cufft.rfft(gtod, ft, plan_cache=gmem.plan_cache)
+		t2 =self.dev.time()
+		ft = self.dev.pools.ft.reset().empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
+		self.dev.lib.rfft(gtod, ft)
 		# If we don't cast to real here, we get the same result but much slower
 		rft = ft.view(gtod.dtype)
-		t3 =gutils.cutime()
+		t3 =self.dev.time()
 		# Work arrays. Safe to overwrite tod array here, since we'll overwrite it with the ifft afterwards anyway
 		ndet, nmode = self.V.shape
 		nbin        = len(self.bins)
-		with scratch.tod.as_allocator():
+		with self.dev.pools.tod.reset().as_allocator():
 			# Tmp must be big enough to hold a full bin's worth of data
-			tmp    = cupy.empty([nmode,2*self.maxbin],dtype=rft.dtype)
-			vtmp   = cupy.empty([ndet,nmode],         dtype=rft.dtype)
-			divtmp = cupy.empty([ndet,nmode],         dtype=rft.dtype)
-			apply_vecs_gpu(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, handle=self.handle, out=rft)
-		cupy.cuda.runtime.deviceSynchronize()
-		t4 =gutils.cutime()
-		gpu_mm.cufft.irfft(ft, gtod, plan_cache=gmem.plan_cache)
-		t5 =gutils.cutime()
+			tmp    = self.dev.np.empty([nmode,2*self.maxbin],dtype=rft.dtype)
+			vtmp   = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
+			divtmp = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
+			apply_vecs(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
+		self.dev.synchronize()
+		t4 =self.dev.time()
+		self.dev.lib.irfft(ft, gtod)
+		t5 =self.dev.time()
 		gutils.apply_window(gtod, self.nwin)
-		t6 =gutils.cutime()
+		t6 =self.dev.time()
 		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
 		return gtod
 	def white(self, gtod, inplace=True):
@@ -188,19 +147,59 @@ class NmatDetvecsGpu(Nmat):
 		gutils.apply_window(gtod, self.nwin)
 		return gtod
 	def write(self, fname):
-		data = bunch.Bunch(type="NmatDetvecsGpu")
+		data = bunch.Bunch(type="NmatDetvecs")
 		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
 				"bins", "D", "V", "E", "ivar"]:
 			data[field] = getattr(self, field)
 		bunch.write(fname, data)
 	@staticmethod
-	def from_bunch(data):
-		return NmatDetvecsGpu(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
+	def from_bunch(data, dev=None):
+		return NmatDetvecs(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
 				window=data.window, nwin=data.nwin, downweight=data.downweight,
-				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar)
+				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar, dev=dev)
+
+def apply_vecs(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
+	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
+	memory as arguments instead.
+
+	ftod: The fourier-transform of the TOD, cast to float32. [ndet,nfreq]
+	iD:   The inverse white noise variance. [nbin,ndet]
+	V:    The eigenvectors. [ndet,nmode]
+	Kh:   The square root of the Woodbury kernel (E"+V'DV)**-0.5. [nbin,nmode,nmode]
+	bins: The frequency ranges for each bin. [nbin,{from,to}]
+	tmp, vtmp, divtmp: Work arrays
+	"""
+	if out    is None: out = dat
+	if dev    is None: dev = device.get_device()
+	ndet, nmode = V.shape
+	nfreq = ftod.shape[1]
+	for bi, (i1,i2) in enumerate(2*bins):
+		bsize = i2-i1
+		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
+		# 1. divtmp = iD V      [ndet,nmode]
+		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
+		dev.lib.sdgmm("R", nmode, ndet, V, nmode, iD[bi:], 1, divtmp, nmode)
+		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
+		dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi:], nmode, divtmp, nmode, 0, vtmp, nmode)
+		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
+		dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:], nfreq, vtmp, nmode, 0, tmp, tmp.shape[1])
+		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
+		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:], nfreq, iD[bi:], 1, out[:,i1:], nfreq)
+		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
+		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp, tmp.shape[1], vtmp, nmode, 1, out[:,i1:], nfreq)
+
+		#cublas.sdgmm(handle, cublas.CUBLAS_SIDE_RIGHT, nmode, ndet, V.data.ptr, nmode, iD.data.ptr+bi*iD.strides[0], 1, divtmp.data.ptr, nmode)
+		## 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
+		#cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, nmode, ndet, nmode, one.ctypes.data, Kh.data.ptr+bi*Kh.strides[0], nmode, divtmp.data.ptr, nmode, zero.ctypes.data, vtmp.data.ptr, nmode)
+		## 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
+		#cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_T, bsize, nmode, ndet, one.ctypes.data, ftod.data.ptr+i1*ftod.itemsize, nfreq, vtmp.data.ptr, nmode, zero.ctypes.data, tmp.data.ptr, tmp.shape[1])
+		## 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
+		#cublas.sdgmm(handle, cublas.CUBLAS_SIDE_RIGHT, bsize, ndet, ftod.data.ptr+i1*ftod.itemsize, nfreq, iD.data.ptr+bi*iD.strides[0], 1, out.data.ptr+i1*out.itemsize, nfreq)
+		## 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
+		#cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, bsize, ndet, nmode, minus_one.ctypes.data, tmp.data.ptr, tmp.shape[1], vtmp.data.ptr, nmode, one.ctypes.data, out.data.ptr+i1*out.itemsize, nfreq)
 
 def measure_cov(d, nmax=10000):
-	ap    = anypy(d)
+	ap    = device.anypy(d)
 	d = d[:,::max(1,d.shape[1]//nmax)]
 	n,m   = d.shape
 	step  = 10000
@@ -250,7 +249,7 @@ def mycontiguous(a):
 	return b
 
 def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, skip_mean=False, verbose=False, dtype=np.float32):
-	ap   = anypy(ft)
+	ap   = device.anypy(ft)
 	ndet = ft.shape[0]
 	vecs = ap.zeros([ndet,0],dtype=dtype)
 	if not skip_mean:
@@ -286,7 +285,7 @@ def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, skip_mean=False, verbos
 
 def measure_detvecs(ft, vecs):
 	# Measure amps when we have non-orthogonal vecs
-	ap   = anypy(ft)
+	ap   = device.anypy(ft)
 	rhs  = vecs.T.dot(ft)
 	div  = vecs.T.dot(vecs)
 	amps = ap.linalg.solve(div,rhs)

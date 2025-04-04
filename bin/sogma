@@ -13,6 +13,7 @@ parser.add_argument("-q", "--quiet",   action="count", default=0)
 parser.add_argument("-n", "--maxfiles",type=int, default=None)
 parser.add_argument("-i", "--startfile",type=int, default=None)
 parser.add_argument("-L", "--loader",  type=str, default="auto")
+parser.add_argument("-D", "--device",  type=str, default="auto")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -21,9 +22,7 @@ args = parser.parse_args()
 import numpy as np, os, time, sys
 from pixell import enmap, utils, mpi, colors
 import cupy
-import gpu_mm
-from sogma import gutils, logging, gmem, mapmaking, loading, tiling, nmat
-from sogma.gmem import scratch
+from sogma import logging, mapmaking, loading, tiling, nmat, device
 
 comm   = mpi.COMM_WORLD
 dtype_tod  = np.float32
@@ -31,19 +30,16 @@ dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
 L = logging.Logger(id=comm.rank, level=args.verbose-args.quiet).setdefault()
 L.print("Init", level=0, id=0, color=colors.lgreen)
-# Set up our gpu scratch memory. These will be used for intermediate calculations.
-# Comments give estimated memory requirements. May not need to declear all these
-# here any more. Only the ones that will be shared across multiple objects need to be
-scratch.tod      = gmem.CuBuffer("tod")       # 1 GB
-scratch.ft       = gmem.CuBuffer("ft")        # 1 GB
-scratch.pointing = gmem.CuBuffer("pointing")  # 3 GB
-scratch.plan     = gmem.CuBuffer("plan")      # 0.1  GB
-scratch.nmat_work= gmem.CuBuffer("nmat_work") # 0.15 GB
-scratch.cut      = gmem.CuBuffer("cut")       # 0.3  GB (up to 30% cut)
+# Set up our device
+dev = device.get_device(args.device)
+# Set up our memory pools. This shouldn't be necessary if I make
+# the interface a bit nicer
+dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
 # Disable the cufft cache. It uses too much gpu memory
+# TODO: This must be moved to device somehow
 cupy.fft.config.get_plan_cache().set_memsize(0)
 # Set up our data loader
-loader  = loading.Loader(args.obsinfo, type=args.loader)
+loader  = loading.Loader(args.obsinfo, type=args.loader, dev=dev)
 obsinfo = loader.query(args.query, wafers=args.wafers, bands=args.bands)[args.startfile:][:args.maxfiles]
 nfile   = len(obsinfo)
 L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
@@ -51,14 +47,14 @@ prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
 utils.mkdir(args.odir)
 # Set up the signals we will solve for
-signal_map = mapmaking.SignalMapGpu(shape, wcs, comm, dtype=np.float32)
+signal_map = mapmaking.SignalMap(shape, wcs, comm, dev=dev, dtype=np.float32)
 # FIXME: poly cuts need a better preconditioner or better basis.
 # The problem is probably that the legendre polynomials lose their orthogonality
 # with the truncated block approach used here
 #signal_cut = mapmaking.SignalCutPolyGpu(comm, precon="var")
-signal_cut = mapmaking.SignalCutFullGpu(comm)
+signal_cut = mapmaking.SignalCutFull(comm, dev=dev)
 # Set up the mapmaker
-mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecsGpu())
+mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecs(dev=dev), dev=dev)
 #mapmaker = mapmaking.MLMapmaker(signals=[signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.Nmat())
 # Add our observations
 for ind in range(comm.rank, nfile, comm.size):
@@ -71,7 +67,7 @@ for ind in range(comm.rank, nfile, comm.size):
 		continue
 	t2    = time.time()
 	mapmaker.add_obs(id, data, deslope=False)
-	gmem.gpu_garbage_collect()
+	dev.garbage_collect()
 	del data
 	t3    = time.time()
 	L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2), level=2)

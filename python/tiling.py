@@ -1,8 +1,7 @@
 import numpy as np
 from pixell import wcsutils, enmap, utils, bunch
 from scipy import spatial, optimize
-import gpu_mm
-from . import gmem
+from . import device
 
 # Tiled map support. With this all the maps will be tiled, even
 # when not using distributed maps, since that's what the GPU wants.
@@ -96,11 +95,12 @@ from . import gmem
 # make sure we still work with DynamicMap
 
 class TileDistribution:
-	def __init__(self, shape, wcs, local_pixelization, comm, pixbox=None):
+	def __init__(self, shape, wcs, local_pixelization, comm, pixbox=None, dev=None):
 		# hardcoded constants
 		self.tshape = (64,64)
 		self.ncomp  = 3
 		self.tsize  = self.ncomp*np.prod(self.tshape)
+		self.dev    = dev or device.get_device()
 		# Our geometry
 		shape = shape[-2:]
 		self.shape, self.wcs = shape, wcs
@@ -124,12 +124,11 @@ class TileDistribution:
 		# Set up the mpi communication info
 		self.mpi  = build_mpi_info(self.dist.cell_inds, self.work.cell_inds, comm)
 		self.ompi = build_omap_mpi(shape, wcs, self.tshape, self.dist.cell_inds, comm, pixbox=pixbox)
-
 	def dmap2gwmap(self, dmap, gwmap=None, buf=None):
 		wmap = self.dmap2wmap(dmap)
 		if gwmap is None:
 			gwmap = self.gwmap(buf=buf, dtype=wmap.dtype)
-		gmem.copy(wmap, gwmap.arr)
+		self.dev.copy(wmap, gwmap.arr)
 		return gwmap
 	def gwmap2dmap(self, gwmap, dmap=None):
 		return self.wmap2dmap(gwmap.arr.get(), dmap=dmap)
@@ -194,9 +193,9 @@ class TileDistribution:
 	def dmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.dshape, dtype)
 	def wmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.oshape, dtype)
 	def gwmap(self, buf=None, dtype=np.float32):
-		if buf: arr = buf .zeros(self.work.size, dtype)
-		else:   arr = cupy.zeros(self.work.size, dtype)
-		return gpu_mm.LocalMap(self.work.lp, arr)
+		if buf: arr = buf.reset().zeros(self.work.size, dtype)
+		else:   arr = self.dev.np.zeros(self.work.size, dtype)
+		return self.dev.lib.LocalMap(self.work.lp, arr)
 
 def build_dist_tiling(dist_owner, comm, tsize=1):
 	dist = bunch.Bunch(owner=dist_owner)

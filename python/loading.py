@@ -1,6 +1,6 @@
 from pixell import utils
 import numpy as np
-import cupy
+from . import device
 
 # Loading of obs lists, metadata and data. The interface needs at least these:
 # 1. get a list of observations
@@ -18,19 +18,19 @@ import cupy
 # database, so having them as independent functions is wasteful. Let's make a
 # class that can be queried.
 
-def Loader(dbfile, type="auto", mul=32):
+def Loader(dbfile, type="auto", dev=None, mul=32):
 	if type == "auto":
 		if dbfile.endswith(".yaml"): type = "sofast"
 		else: type = "simple"
 	if type == "simple":
 		from .loaders.simple import SimpleLoader
-		return SimpleLoader(dbfile, mul=mul)
+		return SimpleLoader(dbfile, dev=dev, mul=mul)
 	elif type == "sofast":
 		from .loaders.sofast import SoFastLoader
-		return SoFastLoader(dbfile, mul=mul)
+		return SoFastLoader(dbfile, dev=dev, mul=mul)
 	elif type == "soslow":
 		from .loaders.soslow import SotodlibLoader
-		return SotodlibLoader(dbfile, mul=mul)
+		return SotodlibLoader(dbfile, dev=dev, mul=mul)
 	else: raise ValueError("Unrecognized loader type '%s'" % str(type))
 
 def get_filelist(ifiles):
@@ -45,10 +45,11 @@ def get_filelist(ifiles):
 				fnames.append(ifile)
 	return fnames
 
-def check_data_requirements(data):
+def check_data_requirements(data, dev=None):
 	# The fields that have strict type/contig requirements
+	if dev is None: dev = device.get_device()
 	fields = [
-		["tod", cupy.ndarray, 2, np.float32],
+		["tod", dev.np.ndarray, 2, np.float32],
 	]
 	for fname, typ, ndim, dtype in fields:
 		d = data[fname]

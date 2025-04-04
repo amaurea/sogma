@@ -30,7 +30,7 @@ dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
 dev = device.get_device(args.device)
 #L = logging.Logger(id=comm.rank, level=args.verbose-args.quiet).setdefault()
-L = logging.Logger(dev, id=comm.rank, level=args.verbose-args.quiet, fmt="{id:3d} {t:10.6f} {mem:10.6f} {gmem_pools:10.6f} {gmem_rest:10.6f} {gmem_unknown:10.6f} {msg:s}").setdefault()
+L = logging.Logger(dev, id=comm.rank, level=args.verbose-args.quiet, fmt="{id:3d} {t:10.6f} {mem:10.6f} {dmem_pools:10.6f} {dmem_rest:10.6f} {dmem_unknown:10.6f} {msg:s}").setdefault()
 L.print("Init", level=0, id=0, color=colors.lgreen)
 # Set up our device
 # Set up our memory pools. This shouldn't be necessary if I make

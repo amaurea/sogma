@@ -18,7 +18,7 @@ class SimpleLoader:
 		# Reads pre-calibrated files
 		obs = read_tod(self.obsinfo[ind].path, mul=self.mul)
 		# Place obs.tod on device
-		obs.tod = self.dev.pools.tod.reset().array(obs.tod)
+		obs.tod = self.dev.pools["tod"].array(obs.tod)
 		return obs
 
 # Helpers below

@@ -1,5 +1,5 @@
 import numpy as np
-from pixell import device, bunch
+from pixell import device, bunch, fft
 from pixell.device import anypy
 
 def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu"]):
@@ -97,7 +97,6 @@ try:
 				plan = fun(shape[0], shape[1], alloc=False)
 			# Make sure scratch is big enough
 			size = self.lib.get_plan_size(plan)
-			self.pool.reset()
 			scratch = self.pool.zeros(size, dtype=np.uint8)
 			self.lib.set_plan_scratch(plan, scratch)
 			# Update cache. We do this even if we had it cached
@@ -115,7 +114,33 @@ if False:
 	class MMDeviceCpu(device.DeviceCpu):
 		def __init__(self, align=None, alloc_factory=None):
 			super().__init__(align=align, alloc_factory=alloc_factory)
-			# TODO: Add cpu versions of these functions here
+			# ffts. No plan caching for now
+			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
+				return fft.rfft(dat, ft=out, axis=axis)
+			self.lib.rfft = rfft
+			def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
+				return fft.irfft(dat, tod=out, axis=axis, normalize=False)
+			self.lib.irfft = irfft
+			# BLAS. May need to find a way to make this more compact if we need
+			# more of these functions
+			def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
+				assert A.dtype == np.float32, "sgemm needs single precision"
+				assert B.dtype == np.float32, "sgemm needs single precision"
+				assert C.dtype == np.float32, "sgemm needs single precision"
+				# Hack: We ignore m, n, k, ldA, ldB, ldC here and assume that
+				# these match the array objects passed! This wouldn't be necessary
+				# if scipy made the underlying blas interface directly available.
+				# Alternatively one could construct proxy arrays using ldA etc,
+				# and pass those in
+				scipy.linalg.blas.sgemm(alpha, A.T, B.T, beta=beta, c=C.T, overwrite_c=True,
+					trans_a = opA.lower()=="t", trans_b=opB.lower()=="t")
+			self.lib.sgemm = sgemm
+			def sdgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
+				assert A.dtype == np.float32, "sdgmm needs single precision"
+				assert X.dtype == np.float32, "sdgmm needs single precision"
+				assert C.dtype == np.float32, "sdgmm needs single precision"
+				raise NotImplementedError
+			self.lib.sdgmm = sdgmm
 			raise NotImplementedError
 
 	Devices.cpu = MMDeviceCpu()

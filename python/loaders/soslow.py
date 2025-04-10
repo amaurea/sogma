@@ -1,17 +1,15 @@
 import numpy as np, time
-from numpy.lib import recfunctions
 from pixell import utils, fft, bunch
-import gpu_mm
 import so3g
-import cupy
 from sotodlib import core, mapmaking, preprocess
-from ..gmem import scratch
+from .. import device
 
 # Standard Sotodlib slow load
 class SotodlibLoader:
-	def __init__(self, configfile, mul=32):
+	def __init__(self, configfile, dev=None, mul=32):
 		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
 		self.mul     = mul
+		self.dev     = dev or device.get_device()
 	def query(self, query=None, wafers=None, bands=None):
 		# wafers and bands should ideally be a part of the query!
 		subids = mapmaking.get_subids(query, context=self.context)
@@ -48,29 +46,29 @@ class SotodlibLoader:
 		#obs = self.context.get_obs(subid)
 		#bunch.write("test_ptraw_soslow.hdf", bunch.Bunch(az=obs.boresight.az, el=obs.boresight.el, roll=obs.boresight.roll))
 		#1/0
-
-
-		obs = preprocess.load_and_preprocess(subid, self.config)
-		n   = fft.fft_len(obs.samps.count//self.mul, factors=[2,3,5,7])*self.mul
-		obs.restrict("samps", [0,n])
-		# Merge all the cuts into a single cuts object
-		cuts = merge_cuts([
-			obs.preprocess.glitches.glitch_flags,
-			obs.preprocess.jumps_2pi.jump_flag,
-			obs.preprocess.jumps_slow.jump_flag,
-		])
-		cuts = rangesmatrix_to_simplecuts(cuts)
-
+		try:
+			obs = preprocess.load_and_preprocess(subid, self.config)
+			n   = fft.fft_len(obs.samps.count//self.mul, factors=[2,3,5,7])*self.mul
+			obs.restrict("samps", [0,n])
+			# Merge all the cuts into a single cuts object
+			cuts = merge_cuts([
+				obs.preprocess.glitches.glitch_flags,
+				obs.preprocess.jumps_2pi.jump_flag,
+				obs.preprocess.jumps_slow.jump_flag,
+			])
+			cuts = rangesmatrix_to_simplecuts(cuts)
+		except core.metadata.loader.LoaderError as e:
+			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Transform it to our current work format
 		res  = bunch.Bunch()
 		res.dets         = obs.dets.vals
 		res.point_offset = np.array([obs.focal_plane.eta,obs.focal_plane.xi]).T
 		res.polangle     = obs.focal_plane.gamma
-		res.ctime        = obs.timestamps
+		res.ctime        = o:s.timestamps
 		res.boresight    = np.array([obs.boresight.el,obs.boresight.az]) # FIXME: roll
 		res.cuts         = cuts
-		res.tod          = scratch.tod.array(obs.signal)
-		res.tod         *= 1e6 * cupy.array(obs.abscal.abscal_cmb[:,None])
+		res.tod          = self.dev.pools["tod"].array(obs.signal)
+		res.tod         *= 1e6 * self.dev.np.array(obs.abscal.abscal_cmb[:,None])
 		return res
 
 # Helpers below

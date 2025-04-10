@@ -48,7 +48,7 @@ class PmatMap:
 		self.pointing = None
 		self.plan     = None
 	def _make_plan(self, pointing):
-		with self.dev.pools.plan.reset().as_allocator():
+		with self.dev.pools["plan"].as_allocator():
 			return self.dev.lib.PointingPlan(self.preplan, pointing)
 
 # Cuts
@@ -123,7 +123,7 @@ class PmatCutPoly:
 			bsize = basis.shape[1]
 			self.basis = self.dev.np.asarray(basis, dtype=np.float32)
 		# Subdivide ranges that are longer than our block size
-		dets, starts, lens = split_ranges(dets, starts, lens, bsize)
+		dets, starts, lens = gutils.split_ranges(dets, starts, lens, bsize)
 		self.dets   = self.dev.np.asarray(dets,   np.int32)
 		self.starts = self.dev.np.asarray(starts, np.int32)
 		self.lens   = self.dev.np.asarray(lens,   np.int32)
@@ -137,11 +137,11 @@ class PmatCutPoly:
 	def forward(self, tod, junk):
 		# B[nb,bsize], bjunk[nrange,nb], blocks[nrange,bsize] = bjunk.dot(B.T)
 		bjunk  = junk.reshape(self.nrange,self.basis.shape[0])
-		with self.dev.pools.cut.reset().as_allocator():
+		with self.dev.pools["cut"].as_allocator():
 			blocks = bjunk.dot(self.basis)
 			self.dev.lib.insert_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
 	def backward(self, tod, junk):
-		with self.dev.pools.cut.reset().as_allocator():
+		with self.dev.pools["cut"].as_allocator():
 			blocks = self.dev.np.zeros((self.nrange, self.basis.shape[1]), np.float32)
 			self.dev.lib.extract_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
 			self.clear(tod)
@@ -259,11 +259,11 @@ class PointingFit:
 			B = self.B if self.store_basis else self.basis(self.ref_pixs)
 		if coeffs is None:
 			coeffs = self.coeffs
-		pointing = self.dev.pools.pointing.reset().empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
+		pointing = self.dev.pools["pointing"].empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
 		coeffs.dot(B, out=pointing)
 		return pointing
 
 def normalize(x):
-    x1 = np.min(x)
-    x2 = np.max(x)
-    return (x-x1)/(x2-x1) if x2!=x1 else x
+	x1 = np.min(x)
+	x2 = np.max(x)
+	return (x-x1)/(x2-x1) if x2!=x1 else x

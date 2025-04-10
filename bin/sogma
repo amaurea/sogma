@@ -28,11 +28,11 @@ comm   = mpi.COMM_WORLD
 dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
+# Set up our device
 dev = device.get_device(args.device)
 #L = logging.Logger(id=comm.rank, level=args.verbose-args.quiet).setdefault()
 L = logging.Logger(dev, id=comm.rank, level=args.verbose-args.quiet, fmt="{id:3d} {t:10.6f} {mem:10.6f} {dmem_pools:10.6f} {dmem_rest:10.6f} {dmem_unknown:10.6f} {msg:s}").setdefault()
 L.print("Init", level=0, id=0, color=colors.lgreen)
-# Set up our device
 # Set up our memory pools. This shouldn't be necessary if I make
 # the interface a bit nicer
 dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
@@ -49,14 +49,9 @@ if args.prefix: prefix += args.prefix + "_"
 utils.mkdir(args.odir)
 # Set up the signals we will solve for
 signal_map = mapmaking.SignalMap(shape, wcs, comm, dev=dev, dtype=np.float32)
-# FIXME: poly cuts need a better preconditioner or better basis.
-# The problem is probably that the legendre polynomials lose their orthogonality
-# with the truncated block approach used here
-#signal_cut = mapmaking.SignalCutPolyGpu(comm, precon="var")
-signal_cut = mapmaking.SignalCutFull(comm, dev=dev)
+signal_cut = mapmaking.SignalCutPoly(comm, dev=dev)
 # Set up the mapmaker
 mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecs(dev=dev), dev=dev)
-#mapmaker = mapmaking.MLMapmaker(signals=[signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.Nmat())
 # Add our observations
 for ind in range(comm.rank, nfile, comm.size):
 	id    = obsinfo.id[ind]
@@ -78,6 +73,10 @@ if nobs == 0:
 	L.print("No tods survived!", id=0, level=0, color=colors.red)
 	mpi.Finalize()
 	sys.exit(1)
+
+mapmaker.prepare()
+signal_map.write(prefix, "rhs",  signal_map.rhs)
+signal_map.write(prefix, "ivar", signal_map.div[:,0])
 
 # Solve the equation system
 for step in mapmaker.solve():

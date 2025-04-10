@@ -1,6 +1,6 @@
 import numpy as np
 import time
-from pixell import utils, bunch, enmap
+from pixell import utils, bunch, enmap, colors
 from . import nmat, pmat, tiling, gutils, device
 from .logging import L
 
@@ -34,7 +34,7 @@ class MLMapmaker:
 		if deslope:
 			utils.deslope(tod, w=5, inplace=True)
 		t3 = time.time()
-		gtod = self.dev.pools.tod.reset().array(tod)
+		gtod = self.dev.pools["tod"].array(tod)
 		del tod
 		# Allow the user to override the noise model on a per-obs level
 		if noise_model is None: noise_model = self.noise_model
@@ -77,7 +77,7 @@ class MLMapmaker:
 		for di, data in enumerate(self.data):
 			# This is the main place that needs to change for the GPU implementation
 			ta1  = self.dev.time()
-			gtod = self.dev.pools.tod.reset().empty([data.ndet, data.nsamp], self.dtype)
+			gtod = self.dev.pools["tod"].empty([data.ndet, data.nsamp], self.dtype)
 			ta2  = self.dev.time()
 			for si, signal in reversed(list(enumerate(self.signals))):
 				signal.precalc_setup(data.id)
@@ -186,7 +186,8 @@ class SignalMap(Signal):
 		# Dynamic RHS map which we will accumulate into
 		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, dtype)
 		# Buffers to use
-		self.ibuf, self.obuf = self.dev.pools.want(name+"_iwork",name+"_owork")
+		self.ibuf = self.dev.pools[name+"_iwork"]
+		self.obuf = self.dev.pools[name+"_owork"]
 	def add_obs(self, id, obs, nmat, Nd, pmap=None):
 		"""Add and process an observation, building the pointing matrix
 		and our part of the RHS. "obs" should be an Observation axis manager,
@@ -224,7 +225,7 @@ class SignalMap(Signal):
 		for i, id in enumerate(self.ids):
 			d   = self.data[id]
 			t1  = time.time()
-			tod = self.dev.pools.tod.reset().full(d.tod_shape, 1, d.tod_dtype)
+			tod = self.dev.pools["tod"].full(d.tod_shape, 1, d.tod_dtype)
 			if weight: d.nmat.white(tod)
 			d.pmap.backward(tod, glhits)
 			t2  = time.time()
@@ -367,6 +368,8 @@ class SignalCutPoly(SignalCutFull):
 		self.bsize  = bsize
 		self.basis  = gutils.legbasis(order, bsize)
 		self.prec   = precon
+		if precon != "none":
+			raise NotImplementedError("SignalCutPoly precons other than 'none' currently don't work")
 		if precon == "leginv":
 			self.ibases = gutils.leginverses(self.basis)
 	def add_obs(self, id, obs, nmat, Nd):

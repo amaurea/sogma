@@ -118,7 +118,7 @@ class NmatDetvecs(Nmat):
 		if not inplace: god = gtod.copy()
 		gutils.apply_window(gtod, self.nwin)
 		t2 =self.dev.time()
-		ft = self.dev.pools.ft.reset().empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
+		ft = self.dev.pools["ft"].empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
 		self.dev.lib.rfft(gtod, ft)
 		# If we don't cast to real here, we get the same result but much slower
 		rft = ft.view(gtod.dtype)
@@ -126,7 +126,7 @@ class NmatDetvecs(Nmat):
 		# Work arrays. Safe to overwrite tod array here, since we'll overwrite it with the ifft afterwards anyway
 		ndet, nmode = self.V.shape
 		nbin        = len(self.bins)
-		with self.dev.pools.tod.reset().as_allocator():
+		with self.dev.pools["tod"].as_allocator():
 			# Tmp must be big enough to hold a full bin's worth of data
 			tmp    = self.dev.np.empty([nmode,2*self.maxbin],dtype=rft.dtype)
 			vtmp   = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
@@ -187,16 +187,6 @@ def apply_vecs(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:], nfreq, iD[bi:], 1, out[:,i1:], nfreq)
 		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
 		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp, tmp.shape[1], vtmp, nmode, 1, out[:,i1:], nfreq)
-
-		#cublas.sdgmm(handle, cublas.CUBLAS_SIDE_RIGHT, nmode, ndet, V.data.ptr, nmode, iD.data.ptr+bi*iD.strides[0], 1, divtmp.data.ptr, nmode)
-		## 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
-		#cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, nmode, ndet, nmode, one.ctypes.data, Kh.data.ptr+bi*Kh.strides[0], nmode, divtmp.data.ptr, nmode, zero.ctypes.data, vtmp.data.ptr, nmode)
-		## 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
-		#cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_T, bsize, nmode, ndet, one.ctypes.data, ftod.data.ptr+i1*ftod.itemsize, nfreq, vtmp.data.ptr, nmode, zero.ctypes.data, tmp.data.ptr, tmp.shape[1])
-		## 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
-		#cublas.sdgmm(handle, cublas.CUBLAS_SIDE_RIGHT, bsize, ndet, ftod.data.ptr+i1*ftod.itemsize, nfreq, iD.data.ptr+bi*iD.strides[0], 1, out.data.ptr+i1*out.itemsize, nfreq)
-		## 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
-		#cublas.sgemm(handle, cublas.CUBLAS_OP_N, cublas.CUBLAS_OP_N, bsize, ndet, nmode, minus_one.ctypes.data, tmp.data.ptr, tmp.shape[1], vtmp.data.ptr, nmode, one.ctypes.data, out.data.ptr+i1*out.itemsize, nfreq)
 
 def measure_cov(d, nmax=10000):
 	ap    = device.anypy(d)

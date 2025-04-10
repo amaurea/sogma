@@ -1,150 +1,146 @@
 import numpy as np
+from pixell import device, bunch, fft
+from pixell.device import anypy
 
-class Device:
-	def __init__(self):
-		self.pools = None # Memory pools
-		self.np    = None # numpy or equivalent
-		self.lib   = bunch.Bunch() # place to store library functions
-	def get(self, arr): raise NotImplementedError # copy device array to cpu
+def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu"]):
+	if type == "auto":
+		for name in priority:
+			if name in Devices:
+				type = name
+				break
+	cname  = Devices[type]
+	device = Devices[type](align=align, alloc_factory=alloc_factory)
+	return device
 
-class DeviceCpu(Device):
-	def __init__(self, align=16, alloc_factory=None):
-		super().__init__()
-		if alloc_factory is None:
-			def alloc_factory(name):
-				return AllcAligned(AllocCpu(), align=align)
-		self.pools = ArrayMultipool(alloc_factory)
-		self.np    = np
-	def get(self, arr): return arr.copy()
+Devices = bunch.Bunch()
 
-class DeviceGpu:
-	def __init__(self, align=512, alloc_factory=None):
-		import cupy
-		if alloc_factory is None:
-			def alloc_factory(name):
-				return AllcAligned(AllocGpu(), align=align)
-		self.pools = ArrayMultipool(alloc_factory)
-		self.np    = cupy
-	def get(self, arr): return arr.get()
+try:
+	import cupy, gpu_mm
+	from cupy.cuda import cublas
 
-class AllocCpu:
-	def alloc(self, n): return np.empty(n, dtype=np.uint8)
+	class MMDeviceGpu(device.DeviceGpu):
+		def __init__(self, align=None, alloc_factory=None):
+			super().__init__(align=align, alloc_factory=alloc_factory)
+			# pointing
+			self.lib.PointingPrePlan = gpu_mm.PointingPrePlan
+			self.lib.PointingPlan    = gpu_mm.PointingPlan
+			self.lib.tod2map         = gpu_mm.tod2map
+			self.lib.map2tod         = gpu_mm.map2tod
+			# Cuts
+			self.lib.insert_ranges   = gpu_mm.insert_ranges
+			self.lib.extract_ranges  = gpu_mm.extract_ranges
+			self.lib.clear_ranges    = gpu_mm.clear_ranges
+			# Low-level fft plans
+			self.lib.get_plan_size   = gpu_mm.cufft.get_plan_size
+			self.lib.get_plan_r2c    = gpu_mm.cufft.get_plan_r2c
+			self.lib.get_plan_c2r    = gpu_mm.cufft.get_plan_c2r
+			self.lib.set_plan_scratch= gpu_mm.cufft.set_plan_scratch
+			# Plan caching, including a reusable scratch array
+			self.pools.want("fft_scratch")
+			self.plan_cache          = PlanCacheGpu(self.pools.fft_scratch, self.lib)
+			# The actual ffts, using this plan cache
+			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
+				if plan_cache is None: plan_cache = self.plan_cache
+				return gpu_mm.cufft.rfft(dat, out=out, axis=axis, plan=plan, plan_cache=plan_cache)
+			self.lib.rfft = rfft
+			def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
+				if plan_cache is None: plan_cache = self.plan_cache
+				return gpu_mm.cufft.irfft(dat, out=out, axis=axis, plan=plan, plan_cache=plan_cache)
+			self.lib.irfft = irfft
+			# Tiling
+			self.lib.DynamicMap     = gpu_mm.DynamicMap
+			self.lib.LocalMap       = gpu_mm.LocalMap
+			# BLAS. May need to find a way to make this more compact if we need
+			# more of these functions
+			self.cublas_handle = cupy.cuda.Device().cublas_handle
+			def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
+				assert A.dtype == np.float32, "sgemm needs single precision"
+				assert B.dtype == np.float32, "sgemm needs single precision"
+				assert C.dtype == np.float32, "sgemm needs single precision"
+				arr_alpha, arr_beta = [np.array(x, np.float32) for x in [alpha, beta]]
+				if handle is None: handle = self.cublas_handle
+				cublas.sgemm(handle, get_cublas_op(opA), get_cublas_op(opB),
+					m, n, k, self.ptr(arr_alpha), self.ptr(A), ldA, self.ptr(B), ldB,
+					self.ptr(arr_beta), self.ptr(C), ldC)
+			self.lib.sgemm = sgemm
+			def sdgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
+				assert A.dtype == np.float32, "sdgmm needs single precision"
+				assert X.dtype == np.float32, "sdgmm needs single precision"
+				assert C.dtype == np.float32, "sdgmm needs single precision"
+				if handle is None: handle = self.cublas_handle
+				cublas.sdgmm(handle, get_cublas_side(side),
+					m, n, self.ptr(A), ldA, self.ptr(X), incX, self.ptr(C), ldC)
+			self.lib.sdgmm = sdgmm
 
-class AllocGpu:
-	def __init__(self):
-		self.allocator = cupy.cuda.get_allocator()
-	def alloc(self, n):
-		import cupy
-		memptr = self.allocator(n)
-		return cupy.ndarray(n, np.uint8, memptr=self.allocator(n))
+	def get_cublas_op(op):
+		# TODO add more
+		return {"n": cublas.CUBLAS_OP_N, "t": cublas.CUBLAS_OP_T}[op.lower()]
+	def get_cublas_side(side):
+		return {"l": cublas.CUBLAS_SIDE_LEFT, "r": cublas.CUBLAS_SIDE_RIGHT}[side.lower()]
 
-class AllocAligned:
-	"""Wraps an allocator to make it aligned. Should work for both cpu and gpu.
-	A bit inefficient if the underlying allocator is already aligned, which it
-	probably already is."""
-	def __init__(self, allocator, align=16):
-		self.allocator = allocator
-		self.align     = align
-	def alloc(self, n):
-		buf = self.allocator.alloc(n+self.align-1)
-		off = (-buf.__array_interface__["data"][0])%self.align
-		return buff[off:off+n]
+	# Adapted from gpu_mm's version, to use our memory pools
+	class PlanCacheGpu:
+		def __init__(self, pool, lib):
+			self.plans = {}
+			self.pool  = pool
+			self.lib   = lib
+		def get(self, kind, shape, axis=1):
+			# Get a plan from the cache, or set it up if not present.
+			# Reallocates the scratch space if necessary. We assume that
+			# get_plan_size and set_plan_scratch are very fast compared to an fft
+			tag = "%s_%s_ax%d" % (str(kind), str(shape), axis)
+			if tag in self.plans:
+				plan = self.plans[tag]
+			else:
+				if kind == "r2c": fun = self.lib.get_plan_r2c
+				else:             fun = self.lib.get_plan_c2r
+				plan = fun(shape[0], shape[1], alloc=False)
+			# Make sure scratch is big enough
+			size = self.lib.get_plan_size(plan)
+			scratch = self.pool.zeros(size, dtype=np.uint8)
+			self.lib.set_plan_scratch(plan, scratch)
+			# Update cache. We do this even if we had it cached
+			# because the scratch buffer may have changed
+			self.plans[tag] = plan
+			return plan
 
-class Mempool:
-	def __init__(self, aligned_alloc, name="[unnamed]"]):
-		self.allocator = aligned_alloc
-		self.name      = name
-		self.free()
-	def alloc(self, n):
-		effsize = round_up(n, self.allocator.align)
-		if len(self.arenas) == 0 or self.arenas[-1].size < self.pos + n:
-			# We don't have room. Make more
-			self.arenas.append(self.allocator.alloc(n))
-			buf        = self.arenas[-1][0:n]
-			self.pos   = 0
-			self.size += effsize
-		else:
-			# We have room. Parsel out some more
-			buf        = self.arenas[-1][0:n]
-			self.pos  += effsize
-			self.size += effsize
-		return buf
-	def free(self):
-		self.arenas    = []
-		self.pos       = 0
-		self.size      = 0
-	def reset(self):
-		"""Invalidate the memory we point to, potentially cleaning it up to a single
-		fixed area we can allocate from. New allocations will reuse this memory
-		as long as they don't exceed its capacity. If the capacity is exceeded, then
-		it will start requesting new memory again."""
-		self.pos = 0
-		if   self.size == 0: self.arenas = []
-		elif len(self.arenas) != 1 or self.arenas[0].size != self.size:
-			# Free up our old arenas, and make our hopefully final one
-			self.arenas = [self.allocator(self.size)]
-	def __repr__(self): return "%s(name='%s', size=%d, align=%d)" % (self.__class__.__name__, self.size, self.allocator.align)
+	Devices.gpu = MMDeviceGpu
 
-class ArrayPoolCpu(Mempool):
-	def array(self, arr):
-		arr  = np.asarray(arr)
-		oarr = self.empty(arr.shape, dtype=arr.dtype)
-		oarr[:] = arr
-		return oarr
-	def empty(self, shape, dtype=np.float32):
-		return self.allocator(np.prod(shape)*np.dtype(dtype).itemize).view(dtype)
-	def full(self, shape, val, dtype=np.float32):
-		arr = self.empty(shape, dtype=dtype)
-		arr[:] = val
-		return arr
-	def zeros(self, shape, dtype=np.float32):
-		return self.full(shape, 0, dtype=dtype)
+except ImportError:
+	pass
 
-class ArrayPoolGpu(Mempool):
-	def array(self, arr):
-		# Make sure the array is contiguous, which our memcpy needs
-		import cupy
-		ap   = cupy if isinstance(arr, cupy.ndarray) else np
-		arr  = ap.ascontiguousarray(arr)
-		oarr = self.empty(arr.shape, dtype=arr.dtype)
-		cuda_memcpy(arr, oarr)
-		return oarr
-	def empty(self, shape, dtype=np.float32):
-		return self.allocator(np.prod(shape)*np.dtype(dtype).itemize).view(dtype)
-	def full(self, shape, val, dtype=np.float32):
-		arr = self.empty(shape, dtype=dtype)
-		arr[:] = val
-		return arr
-	def zeros(self, shape, dtype=np.float32):
-		return self.full(shape, 0, dtype=dtype)
+if False:
 
-class ArrayMultipool:
-	def __init__(self, factory):
-		self.factory = factory
-		self.pools   = {}
-	def __getattr__(self, name):
-		if name not in self.pools:
-			self.pools[name] = self.factory(name=name)
-		return self.pools[name]
-	def __delattr__(self, name):
-		del self.pools[name]
-	def __repr__(self):
-		msg = "ArrayMultipool("
-		names = sorted(list(self.pools.keys()))
-		for name in names:
-			msg += "\n  %s" % repr(self.pools[name])
-		if len(names) > 0:
-			msg += "\n"
-		msg += ")"
-		return msg
+	class MMDeviceCpu(device.DeviceCpu):
+		def __init__(self, align=None, alloc_factory=None):
+			super().__init__(align=align, alloc_factory=alloc_factory)
+			# ffts. No plan caching for now
+			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
+				return fft.rfft(dat, ft=out, axis=axis)
+			self.lib.rfft = rfft
+			def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
+				return fft.irfft(dat, tod=out, axis=axis, normalize=False)
+			self.lib.irfft = irfft
+			# BLAS. May need to find a way to make this more compact if we need
+			# more of these functions
+			def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
+				assert A.dtype == np.float32, "sgemm needs single precision"
+				assert B.dtype == np.float32, "sgemm needs single precision"
+				assert C.dtype == np.float32, "sgemm needs single precision"
+				# Hack: We ignore m, n, k, ldA, ldB, ldC here and assume that
+				# these match the array objects passed! This wouldn't be necessary
+				# if scipy made the underlying blas interface directly available.
+				# Alternatively one could construct proxy arrays using ldA etc,
+				# and pass those in
+				scipy.linalg.blas.sgemm(alpha, A.T, B.T, beta=beta, c=C.T, overwrite_c=True,
+					trans_a = opA.lower()=="t", trans_b=opB.lower()=="t")
+			self.lib.sgemm = sgemm
+			def sdgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
+				assert A.dtype == np.float32, "sdgmm needs single precision"
+				assert X.dtype == np.float32, "sdgmm needs single precision"
+				assert C.dtype == np.float32, "sdgmm needs single precision"
+				raise NotImplementedError
+			self.lib.sdgmm = sdgmm
+			raise NotImplementedError
 
-def round_up(a,b): return (a+b-1)//b*b
-
-def cuda_memcpy(afrom,ato):
-	import cupy
-	assert afrom.flags["C_CONTIGUOUS"] and ato.flags["C_CONTIGUOUS"]
-	cupy.cuda.runtime.memcpy(getptr(ato), getptr(afrom), ato.nbytes, cupy.cuda.runtime.memcpyDefault)
-
-def getptr(arr):
-	try: return arr.data.ptr
-	except AttributeError: return arr.ctypes.data
+	Devices.cpu = MMDeviceCpu()

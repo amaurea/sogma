@@ -1,8 +1,7 @@
 import numpy as np
 from pixell import wcsutils, enmap, utils, bunch
 from scipy import spatial, optimize
-import gpu_mm
-from . import gmem
+from . import device
 
 # Tiled map support. With this all the maps will be tiled, even
 # when not using distributed maps, since that's what the GPU wants.
@@ -95,12 +94,20 @@ from . import gmem
 # Could consider encapsulating them, but would have to
 # make sure we still work with DynamicMap
 
+# FIXME: This currently hardcodes ncomp, which breaks output
+# for hits and div, and in general makes these hacky to deal with.
+# In theory this would just involve replacing self.tsize with the actual
+# tsize, but a complication is that local_pixelization and LocalMap
+# assume ncomp = 3, so some functions will still not be general.
+# Should make it explicit which functions work
+
 class TileDistribution:
-	def __init__(self, shape, wcs, local_pixelization, comm, pixbox=None):
+	def __init__(self, shape, wcs, local_pixelization, comm, pixbox=None, dev=None):
 		# hardcoded constants
 		self.tshape = (64,64)
 		self.ncomp  = 3
 		self.tsize  = self.ncomp*np.prod(self.tshape)
+		self.dev    = dev or device.get_device()
 		# Our geometry
 		shape = shape[-2:]
 		self.shape, self.wcs = shape, wcs
@@ -124,29 +131,32 @@ class TileDistribution:
 		# Set up the mpi communication info
 		self.mpi  = build_mpi_info(self.dist.cell_inds, self.work.cell_inds, comm)
 		self.ompi = build_omap_mpi(shape, wcs, self.tshape, self.dist.cell_inds, comm, pixbox=pixbox)
-
 	def dmap2gwmap(self, dmap, gwmap=None, buf=None):
 		wmap = self.dmap2wmap(dmap)
 		if gwmap is None:
 			gwmap = self.gwmap(buf=buf, dtype=wmap.dtype)
-		gmem.copy(wmap, gwmap.arr)
+		self.dev.copy(wmap, gwmap.arr)
 		return gwmap
 	def gwmap2dmap(self, gwmap, dmap=None):
-		return self.wmap2dmap(gwmap.arr.get(), dmap=dmap)
+		return self.wmap2dmap(self.dev.get(gwmap.arr), dmap=dmap)
 	def dmap2wmap(self, dmap, wmap=None):
-		"""Distributed to observational tile transfer on the CPU."""
-		# dmap and wmap should be numpy arrays with shape [ntile,:,tshape[0],tshape[1]]
-		if wmap is None: wmap = np.zeros(self.oshape, dmap.dtype)
-		wmap  = wmap.reshape(self.oshape) # to 4d in case 1d form is passed
+		"""Distributed to observational tile transfer on the CPU.
+		Does not assume pre = (3,)."""
+		# dmap and wmap should be numpy arrays with shape [ntile,...,tshape[0],tshape[1]]
+		oshape = (self.work.ntile,)+dmap.shape[1:-2]+(self.tshape[0],self.tshape[1])
+		tsize  = np.prod(oshape[1:])
+		if wmap is None: wmap = np.zeros(oshape, dmap.dtype)
+		wmap  = wmap.reshape(oshape) # to 4d in case 1d form is passed
 		sbuf  = dmap[self.mpi.d2w_sinds]
 		rbuf  = np.zeros(wmap.shape, wmap.dtype)
-		sinfo = (self.mpi.d2w_scount*self.tsize, self.mpi.d2w_soffs*self.tsize)
-		rinfo = (self.mpi.d2w_rcount*self.tsize, self.mpi.d2w_roffs*self.tsize)
+		sinfo = (self.mpi.d2w_scount*tsize, self.mpi.d2w_soffs*tsize)
+		rinfo = (self.mpi.d2w_rcount*tsize, self.mpi.d2w_roffs*tsize)
 		self.mpi.comm.Alltoallv((sbuf.reshape(-1),sinfo), (rbuf.reshape(-1),rinfo))
 		wmap[self.mpi.d2w_rinds] = rbuf
 		return wmap
 	def wmap2dmap(self, wmap, dmap=None):
-		"""Observational to distributed transfer and reduction on the CPU"""
+		"""Observational to distributed transfer and reduction on the CPU.
+		Assumes pre = (3,)."""
 		wmap= wmap.reshape(self.oshape) # to 4D in case 1D form is passed
 		if dmap is None: dmap = self.dmap(dtype=wmap.dtype)
 		tshape= dmap.shape[1:]
@@ -167,36 +177,40 @@ class TileDistribution:
 		"""Turn the distributed tile map dmap into a full enmap
 		on the mpi rank root (defaults to 0). If the pixbox
 		argument was passed to the constructor, then this subset
-		of the full map will be output."""
+		of the full map will be output.
+		Does not assume pre = (3,)."""
+		tsize = np.prod(dmap.shape[1:])
 		sbuf = np.ascontiguousarray(dmap[self.ompi.sinds].reshape(-1))
-		rbuf = np.zeros(self.ompi.rtot*self.tsize, dmap.dtype) if self.ompi.comm.rank == 0 else None
-		rinfo= (self.ompi.rcount*self.tsize, self.ompi.roffs*self.tsize)
-		self.ompi.comm.Gatherv(sbuf, (rbuf, rinfo))
+		rbuf = np.zeros(self.ompi.rtot*tsize, dmap.dtype) if self.ompi.comm.rank == 0 else None
+		rinfo= (self.ompi.rcount*tsize, self.ompi.roffs*tsize)
+		self.ompi.comm.Gatherv(sbuf, (rbuf, rinfo), root=root)
 		if self.ompi.comm.rank == 0:
-			rbuf = rbuf.reshape(-1,self.ncomp,self.tshape[0],self.tshape[1])
-			omap = np.zeros((self.ompi.onty,self.ompi.ontx,self.ncomp,self.tshape[0],self.tshape[1]),dmap.dtype)
+			rbuf = rbuf.reshape((-1,)+dmap.shape[1:])
+			omap = np.zeros((self.ompi.onty,self.ompi.ontx)+dmap.shape[1:],dmap.dtype)
 			omap[self.ompi.rinds[0],self.ompi.rinds[1]] = rbuf
-			omap = np.moveaxis(omap, (2,3,4), (0,2,4))
-			omap = omap.reshape(omap.shape[0],omap.shape[1]*omap.shape[2],omap.shape[3]*omap.shape[4])
-			print(self.ompi.obox)
+			# Before this we had [nty,ntx,ncomp,y,x].
+			# This moves it to   [ncomp,nty,x,nty,y]
+			#omap = np.moveaxis(omap, (2,3,4), (0,2,4))
+			#omap = omap.reshape(omap.shape[0],omap.shape[1]*omap.shape[2],omap.shape[3]*omap.shape[4])
+			# We have [nty,ntx,...,y,x] and want [...,nty,y,ntx,x]
+			omap = np.moveaxis(omap, (0,1), (-4,-2))
+			omap = omap.reshape(omap.shape[:-4]+(omap.shape[-4]*omap.shape[-3],omap.shape[-2]*omap.shape[-1]))
 			# self.mpi.obox will not have negative values or wrapping issues the way we have
 			# constructed things here
-			print(self.ompi.obox)
 			(y1,x1),(y2,x2) = self.ompi.obox
 			omap = omap[...,y1:y2,x1:x2]
 			omap = enmap.ndmap(omap, self.pwcs)
-			print(omap.box()/utils.degree)
 			return omap
 	@property
-	def oshape(self): return (self.work .ntile,self.ncomp,self.tshape[0],self.tshape[1])
+	def oshape(self): return (self.work.ntile,self.ncomp,self.tshape[0],self.tshape[1])
 	@property
 	def dshape(self): return (self.dist.ntile,self.ncomp,self.tshape[0],self.tshape[1])
 	def dmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.dshape, dtype)
 	def wmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.oshape, dtype)
 	def gwmap(self, buf=None, dtype=np.float32):
-		if buf: arr = buf .zeros(self.work.size, dtype)
-		else:   arr = cupy.zeros(self.work.size, dtype)
-		return gpu_mm.LocalMap(self.work.lp, arr)
+		if buf: arr = buf.zeros(self.work.size, dtype)
+		else:   arr = self.dev.np.zeros(self.work.size, dtype)
+		return self.dev.lib.LocalMap(self.work.lp, arr)
 
 def build_dist_tiling(dist_owner, comm, tsize=1):
 	dist = bunch.Bunch(owner=dist_owner)

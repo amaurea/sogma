@@ -1,19 +1,16 @@
-import time
+import time, contextlib
 import numpy as np
-import cupy
 from pixell import utils
+from . import device
+from .logging import L
 
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 
-def cutime():
-	cupy.cuda.runtime.deviceSynchronize()
-	return time.time()
-
 def apply_window(tod, nsamp, exp=1):
 	"""Apply a cosine taper to each end of the TOD."""
 	if nsamp <= 0: return
-	ap = anypy(tod)
+	ap = device.anypy(tod)
 	taper   = 0.5*(1-ap.cos(ap.arange(1,nsamp+1)*ap.pi/nsamp))
 	taper **= exp
 	tod[...,:nsamp]  *= taper
@@ -49,13 +46,18 @@ def split_ranges(dets, starts, lens, maxlen):
 	oends   = offs2-offs
 	return odets, ostarts, oends
 
-# GPU-CPU agnostic functions
-
-def anypy(arr):
-	"""Return numpy or cupy depending on what type of array we have.
-	Useful for writing code that works both on cpu and gpu"""
-	if   isinstance(arr, cupy.ndarray): return cupy
-	else: return np
+@contextlib.contextmanager
+def leakcheck(dev, msg):
+	try:
+		dev.garbage_collect()
+		t1 = dev.time()
+		m1 = dev.memuse()
+		yield
+	finally:
+		dev.garbage_collect()
+		t2 = dev.time()
+		m2 = dev.memuse()
+		L.print("leak %8.4f MB %s" % ((m2-m1)/1024**2, msg), level=2)
 
 def legbasis(order, n, ap=np):
 	x   = ap.linspace(-1, 1, n, dtype=np.float32)
@@ -71,7 +73,7 @@ def leginverses(basis):
 	"""Given a lebasis B[nmode,nsamp], compute all the nsamp truncated
 	inverses of BB'. The result will have shape [nsamp,nmode,nmode]"""
 	# This function is 20x faster on the cpu
-	ap   = anypy(basis)
+	ap   = device.anypy(basis)
 	nmode, nsamp = basis.shape
 	mask = ap.tril(ap.ones((nsamp,nsamp), basis.dtype))
 	BBs  = ap.einsum("ai,bi,ji->jab", basis, basis, mask)
@@ -98,25 +100,3 @@ def safe_invert_ivar(ivar, tol=1e-3):
 	good = ivar>ref*tol
 	iivar[good] = 1/ivar[good]
 	return iivar
-
-# Not done
-#def gemm(alpha, A, B, beta, C, Aop="N", Bop="N", Cop="N", handle=None):
-#	iscup = [isinstance(a, cupy.ndarray) for a in [A,B,C]]
-#	if iscup[1] != iscup[0] or iscup[2] != iscup[0]: raise ValueError("All arrays must agree on cpu/gpu-ness")
-#	if B.dtype  != A.dtype  or C.dtype  != A.dtype: raise ValueError("All arrays must have the same dtype")
-#	dtype = A.dtype
-#	if isinstance(A, cupy.ndarray):
-#		# We're on the gpu
-#		if handle is None: handle = cupy.cuda.Device().cublas_handle
-#		if   dtype == np.float32: fun = cublas.sgemm
-#		elif dtype == np.float64: fun = cublas.dgemm
-#		else: raise ValueError("Only float32 and float64 supported")
-#		opmap = {"N": cublas.CUBLAS_OP_N, "T": cublas.CUBLAS_OP_T, "L": cublas.CUBLAS_SIDE_RIGHT}
-#		fun(handle, opmap[Aop], 
-
-
-
-
-
-
-

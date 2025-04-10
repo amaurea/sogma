@@ -1,14 +1,11 @@
 import numpy as np
-import cupy
-import gpu_mm
 import so3g
 from pixell import utils, enmap
-from . import gutils
-from .gmem import scratch
+from . import device, gutils
 from .logging import L
 
-class PmatMapGpu:
-	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
+class PmatMap:
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dev=None, dtype=np.float32):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels"""
 		self.ctime = ctime
@@ -17,95 +14,42 @@ class PmatMapGpu:
 		self.polang= polang
 		self.dtype = dtype
 		self.ncomp = ncomp
-		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype)
-		self.preplan  = gpu_mm.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
+		self.dev   = dev or device.get_device()
+		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype, dev=self.dev)
+		self.preplan  = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
 		self.pointing = None
 		self.plan     = None
 	def forward(self, gtod, glmap):
 		"""Argument is a LocalMap or equivalent"""
-		t1 = gutils.cutime()
+		t1 = self.dev.time()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
-		t2 = gutils.cutime()
-		gpu_mm.map2tod(gtod, glmap, pointing, plan)
-		t3 = gutils.cutime()
+		t2 = self.dev.time()
+		self.dev.lib.map2tod(gtod, glmap, pointing, plan)
+		t3 = self.dev.time()
 		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gtod
 	def backward(self, gtod, glmap):
-		t1 = gutils.cutime()
+		t1 = self.dev.time()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
-		t2 = gutils.cutime()
-		gpu_mm.tod2map(glmap, gtod, pointing, plan)
-		t3 = gutils.cutime()
+		t2 = self.dev.time()
+		self.dev.lib.tod2map(glmap, gtod, pointing, plan)
+		t3 = self.dev.time()
 		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return glmap
 	def precalc_setup(self):
-		t1 = gutils.cutime()
+		t1 = self.dev.time()
 		self.pointing = self.pfit.eval()
 		self.plan     = self._make_plan(self.pointing)
-		t2 = gutils.cutime()
+		t2 = self.dev.time()
 		L.print("Pprep %6.4f" % (t2-t1), level=3)
 	def precalc_free (self):
 		self.pointing = None
 		self.plan     = None
 	def _make_plan(self, pointing):
-		# Here it would have been convenient if BufAllocator could grow.
-		# Instead we have to calculate and reserve the size needed
-		size = scratch.plan.aligned_size(self.preplan.plan_nbytes, self.preplan.plan_constructor_tmp_nbytes)
-		scratch.plan.reserve(size)
-		with scratch.plan.as_allocator():
-			return gpu_mm.PointingPlan(self.preplan, pointing)
-
-class PmatMapGpuOnthefly(PmatMapGpu):
-	def __init__(self, shape, wcs, ctime, bore, offs, polang, ncomp=3, dtype=np.float32):
-		"""shape, wcs should be for a fullsky geometry, since we assume
-		x wrapping and no negative y pixels"""
-		self.ctime = ctime
-		self.bore  = bore
-		self.offs  = offs
-		self.polang= polang
-		self.dtype = dtype
-		self.ncomp = ncomp
-		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype, store_basis=True)
-		self.preplan  = gpu_mm.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
-		self.pointing = None
-		self.plan     = None
-	def forward(self, gtod, glmap):
-		"""Argument is a LocalMap or equivalent"""
-		t1 = gutils.cutime()
-		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
-		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
-		t2 = gutils.cutime()
-		gpu_mm.onthefly_map2tod(gtod, glmap, self.pfit.B, self.pfit.coeffs, plan, debug=True)
-		t3 = gutils.cutime()
-		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
-		return gtod
-	def backward(self, gtod, glmap):
-		t1 = gutils.cutime()
-		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
-		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
-		t2 = gutils.cutime()
-		gpu_mm.onthefly_tod2map(glmap, gtod, self.pfit.B, self.pfit.coeffs, plan, debug=True)
-		t3 = gutils.cutime()
-		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
-		return glmap
-	def precalc_setup(self):
-		t1 = gutils.cutime()
-		self.pointing = self.pfit.eval()
-		self.plan     = self._make_plan(self.pointing)
-		t2 = gutils.cutime()
-		L.print("Pprep %6.4f" % (t2-t1), level=3)
-	def precalc_free (self):
-		self.pointing = None
-		self.plan     = None
-	def _make_plan(self, pointing):
-		# Here it would have been convenient if BufAllocator could grow.
-		# Instead we have to calculate and reserve the size needed
-		size = scratch.plan.aligned_size(self.preplan.plan_nbytes, self.preplan.plan_constructor_tmp_nbytes)
-		scratch.plan.reserve(size)
-		with scratch.plan.as_allocator():
-			return gpu_mm.PointingPlan(self.preplan, pointing)
+		with self.dev.pools["plan"].as_allocator():
+			return self.dev.lib.PointingPlan(self.preplan, pointing)
 
 # Cuts
 
@@ -117,24 +61,25 @@ class PmatCutNull:
 	def backward(self, tod, junk): pass
 	def clear(self, tod): pass
 
-class PmatCutFullGpu:
-	def __init__(self, cuts):
+class PmatCutFull:
+	def __init__(self, cuts, dev=None):
 		dets, starts, lens = cuts
-		self.dets   = cupy.asarray(dets,   np.int32)
-		self.starts = cupy.asarray(starts, np.int32)
-		self.lens   = cupy.asarray(lens,   np.int32)
+		self.dev    = dev or device.get_device()
+		self.dets   = self.dev.np.asarray(dets,   np.int32)
+		self.starts = self.dev.np.asarray(starts, np.int32)
+		self.lens   = self.dev.np.asarray(lens,   np.int32)
 		self.ndof   = np.sum(lens)  # number of values to solve for
 		self.nsamp  = self.ndof     # number of samples covered
-		self.offs   = cupy.asarray(gutils.cumsum0(lens), np.int32)
+		self.offs   = self.dev.np.asarray(gutils.cumsum0(lens), np.int32)
 	def forward(self, tod, junk):
-		gpu_mm.insert_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
+		self.dev.lib.insert_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
 	def backward(self, tod, junk):
-		gpu_mm.extract_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
+		self.dev.lib.extract_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
 		# Zero-out the samples we used, so the other signals (e.g. the map)
 		# don't need to care about them
 		self.clear(tod)
 	def clear(self, tod):
-		gpu_mm.clear_ranges(tod, self.dets, self.starts, self.lens)
+		self.dev.lib.clear_ranges(tod, self.dets, self.starts, self.lens)
 
 # PmatCutPolyGpu does not have orthogonal basis functions due to
 # the truncated ranges, so it needs a better preconditioner. Since there
@@ -163,9 +108,10 @@ class PmatCutFullGpu:
 # TODO: Build P'P once, then invert the 400 different truncations
 # of it. The ivar scaling will be handled with a separate product.
 
-class PmatCutPolyGpu:
-	def __init__(self, cuts, basis=None, order=None, bsize=None):
+class PmatCutPoly:
+	def __init__(self, cuts, dev=None, basis=None, order=None, bsize=None):
 		dets, starts, lens = cuts
+		self.dev = dev or device.get_device()
 		# Either construct or use an existing basis
 		if basis is None:
 			if bsize is None: bsize = 400
@@ -175,34 +121,34 @@ class PmatCutPolyGpu:
 			assert order is None and bsize is None, "Specify either basis or order,bsize, not both"
 			order = basis.shape[0]-1
 			bsize = basis.shape[1]
-			self.basis = cupy.asarray(basis, dtype=np.float32)
+			self.basis = self.dev.np.asarray(basis, dtype=np.float32)
 		# Subdivide ranges that are longer than our block size
-		dets, starts, lens = split_ranges(dets, starts, lens, bsize)
-		self.dets   = cupy.asarray(dets,   np.int32)
-		self.starts = cupy.asarray(starts, np.int32)
-		self.lens   = cupy.asarray(lens,   np.int32)
+		dets, starts, lens = gutils.split_ranges(dets, starts, lens, bsize)
+		self.dets   = self.dev.np.asarray(dets,   np.int32)
+		self.starts = self.dev.np.asarray(starts, np.int32)
+		self.lens   = self.dev.np.asarray(lens,   np.int32)
 		# total number of samples covered
 		self.nsamp  = np.sum(lens)
 		# output buffer information. Offsets
 		padlens     = (lens+bsize-1)//bsize*bsize
 		self.nrange = len(lens)
 		self.ndof   = self.nrange*(order+1)
-		self.offs   = cupy.asarray(gutils.cumsum0(padlens), np.int32)
+		self.offs   = self.dev.np.asarray(gutils.cumsum0(padlens), np.int32)
 	def forward(self, tod, junk):
 		# B[nb,bsize], bjunk[nrange,nb], blocks[nrange,bsize] = bjunk.dot(B.T)
 		bjunk  = junk.reshape(self.nrange,self.basis.shape[0])
-		with scratch.cut.as_allocator():
+		with self.dev.pools["cut"].as_allocator():
 			blocks = bjunk.dot(self.basis)
-			gpu_mm.insert_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
+			self.dev.lib.insert_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
 	def backward(self, tod, junk):
-		with scratch.cut.as_allocator():
-			blocks = cupy.zeros((self.nrange, self.basis.shape[1]), np.float32)
-			gpu_mm.extract_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
+		with self.dev.pools["cut"].as_allocator():
+			blocks = self.dev.np.zeros((self.nrange, self.basis.shape[1]), np.float32)
+			self.dev.lib.extract_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
 			self.clear(tod)
 			bjunk   = blocks.dot(self.basis.T)
 			junk[:] = bjunk.reshape(-1)
 	def clear(self, tod):
-		gpu_mm.clear_ranges(tod, self.dets, self.starts, self.lens)
+		self.dev.lib.clear_ranges(tod, self.dets, self.starts, self.lens)
 
 
 # Misc
@@ -219,7 +165,7 @@ def calc_pointing(ctime, bore, offs, polang, site="so", weather="typical", dtype
 class PointingFit:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang,
 			subsamp=200, site="so", weather="typical", dtype=np.float64,
-			nt=1, nx=3, ny=3, store_basis=False, positive_x=False):
+			nt=1, nx=3, ny=3, store_basis=False, positive_x=False, dev=None):
 		"""Jon's polynomial pointing fit. This predicts each detector's celestial
 		coordinates based on the array center's celestial coordinates. The model
 		fit is
@@ -236,6 +182,7 @@ class PointingFit:
 		For now I'll stick with the simple #1"""
 		self.shape, self.wcs = shape, wcs
 		self.nt, self.nx, self.ny = nt, nx, ny
+		self.dev   = dev or device.get_device()
 		self.dtype = dtype
 		self.store_basis = store_basis
 		self.subsamp     = subsamp
@@ -256,16 +203,16 @@ class PointingFit:
 			pixs[2]   = utils.unwind(np.arctan2(pos_equ[3],pos_equ[2]))
 			return pixs
 		# 3. Calculate the full pointing for the reference pixel
-		ref_pixs = cupy.array(calc_pixs(ctime, bore, off0[None], [0])[:,0])
+		ref_pixs = self.dev.np.array(calc_pixs(ctime, bore, off0[None], [0])[:,0])
 		# 4. Calculate a sparse pointing for the individual detectors
-		det_pixs = cupy.array(calc_pixs(ctime[::subsamp], bore[:,::subsamp], offs, polang))
+		det_pixs = self.dev.np.array(calc_pixs(ctime[::subsamp], bore[:,::subsamp], offs, polang))
 		# 4b. Add multiples of the sky wrapping so all x pixels are positive.
 		# This is useful if we do map-space wrapping instead of per-sample wrapping
 		if positive_x:
 			# Assume we move at most 1 pixel per sample when accounting for worst
 			# case underestimate of minimum x position. The tiling must be wide enough
 			# to accomodate this of course
-			offset = (subsamp-cupy.min(det_pixs[1])+self.nphi)//self.nphi*self.nphi
+			offset = (subsamp-self.dev.np.min(det_pixs[1])+self.nphi)//self.nphi*self.nphi
 			ref_pixs[1] += offset
 			det_pixs[1] += offset
 		# 4b. This is where we would add a multiple of nphi to ref_pixs and det_pixs if we wanted
@@ -280,10 +227,10 @@ class PointingFit:
 	def basis(self, ref_pixs):
 		"""Calculate the interpolation basis"""
 		nsamp = ref_pixs.shape[-1]
-		B     = cupy.empty((1+self.nt+self.nx+self.ny+3,nsamp),self.dtype)
-		mins  = cupy.min(ref_pixs[:2],1)
-		maxs  = cupy.max(ref_pixs[:2],1)
-		t     = cupy.linspace(-1,1,nsamp,self.dtype)
+		B     = self.dev.np.empty((1+self.nt+self.nx+self.ny+3,nsamp),self.dtype)
+		mins  = self.dev.np.min(ref_pixs[:2],1)
+		maxs  = self.dev.np.max(ref_pixs[:2],1)
+		t     = self.dev.np.linspace(-1,1,nsamp,self.dtype)
 		# Must normalze these to avoid numerical problems. Pixel numbers can be
 		# quite high compared to the t values
 		y     = normalize(ref_pixs[0])
@@ -303,7 +250,7 @@ class PointingFit:
 		# The fit needs to be done in double precision. The rest is fine in single precision
 		B64 = B.astype(np.float64)
 		v64 = det_pixs.astype(np.float64)
-		idiv= cupy.linalg.inv(B64.dot(B64.T))
+		idiv= self.dev.np.linalg.inv(B64.dot(B64.T))
 		coeffs = v64.dot(B64.T).dot(idiv)
 		coeffs = coeffs.astype(self.dtype)
 		return coeffs
@@ -312,11 +259,11 @@ class PointingFit:
 			B = self.B if self.store_basis else self.basis(self.ref_pixs)
 		if coeffs is None:
 			coeffs = self.coeffs
-		pointing = scratch.pointing.empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
+		pointing = self.dev.pools["pointing"].empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
 		coeffs.dot(B, out=pointing)
 		return pointing
 
 def normalize(x):
-    x1 = np.min(x)
-    x2 = np.max(x)
-    return (x-x1)/(x2-x1) if x2!=x1 else x
+	x1 = np.min(x)
+	x2 = np.max(x)
+	return (x-x1)/(x2-x1) if x2!=x1 else x

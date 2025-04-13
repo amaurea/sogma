@@ -356,6 +356,11 @@ def calibrate(data, meta, dev=None):
 	res.boresight    = np.array([el,az]) # FIXME: roll
 	res.tod          = signal
 	res.cuts         = ocuts
+	res.response     = None
+	# Test per-detector response
+	#res.response     = dev.np.zeros((2,len(res.tod)),res.tod.dtype)
+	#res.response[0]  = 2
+	#res.response[1]  = -1
 	return res
 
 #################

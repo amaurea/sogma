@@ -50,6 +50,7 @@ def read_tod(fname, mul=32):
 		res.boresight    = bore[[2,1],:n]               # [{el,az},nsamp]
 		res.tod          = f["tod"][:,:n]               # [ndet,nsamp]
 		res.cuts         = mask2cuts(f["cuts"][:,:n])
+		res.response     = None
 	for key in res:
 		res[key] = np.ascontiguousarray(res[key])
 	#print("ndet %d nsamp %d primes %s" % (res.tod.shape[0], res.tod.shape[1], utils.primes(res.tod.shape[1])))

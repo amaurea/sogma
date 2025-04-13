@@ -202,7 +202,7 @@ class SignalMap(Signal):
 		# of them anyway
 		pcut   = pmat.PmatCutFull(obs.cuts, dev=self.dev)
 		if pmap is None:
-			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dev=self.dev, dtype=Nd.dtype)
+			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, response=obs.response, dev=self.dev, dtype=Nd.dtype)
 			self.dev.garbage_collect()
 		# Precompute pointing for the upcoming pmap observations
 		# Accumulate local rhs

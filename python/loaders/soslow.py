@@ -67,6 +67,7 @@ class SotodlibLoader:
 		res.ctime        = o:s.timestamps
 		res.boresight    = np.array([obs.boresight.el,obs.boresight.az]) # FIXME: roll
 		res.cuts         = cuts
+		res.response     = None
 		res.tod          = self.dev.pools["tod"].array(obs.signal)
 		res.tod         *= 1e6 * self.dev.np.array(obs.abscal.abscal_cmb[:,None])
 		return res

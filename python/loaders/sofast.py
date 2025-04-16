@@ -368,17 +368,9 @@ def calibrate(data, meta, dev=None):
 # Helpers below #
 #################
 
-# FIXME: DetCache needs the wafer slot <-> detset mapping from smurf detset info
-# (labeled "smurf" in context). This is a two-step thing, with an sqlite file
-# mapping to one or more hdf files that contain the actual information. Can cache
-# the file, since it's relatively small and there shouldn't be many of them
-# Do I even need obsfiledb with this? It looks like smurf detset info already gives
-# me the detector lists. Or is it the channel lists?
-#
 # smurf: detset → channels, detset → wafer slot
 # assignment: channels → detectors
 # obsfiledb: obsid → detset
-
 class SmurfInfo:
 	"""Provides mapping from detset to wafer slot and channels (readout_ids)"""
 	def __init__(self, smurf_index):
@@ -454,7 +446,7 @@ def split_bands(dets):
 		if band not in bdets:
 			bdets[band] = []
 		bdets[band].append(di)
-	return [band, np.array(bdets[band]) for band in bdets]
+	return [(band, np.array(bdets[band])) for band in bdets]
 
 class FplaneCache:
 	def __init__(self, fname):

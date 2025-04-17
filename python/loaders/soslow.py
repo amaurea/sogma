@@ -64,8 +64,9 @@ class SotodlibLoader:
 		res.dets         = obs.dets.vals
 		res.point_offset = np.array([obs.focal_plane.eta,obs.focal_plane.xi]).T
 		res.polangle     = obs.focal_plane.gamma
-		res.ctime        = o:s.timestamps
-		res.boresight    = np.array([obs.boresight.el,obs.boresight.az]) # FIXME: roll
+		res.ctime        = obs.timestamps
+		res.boresight    = np.array([obs.boresight.el,obs.boresight.az,obs.boresight.roll])
+		res.hwp          = obs.postprocess.hwp_angle
 		res.cuts         = cuts
 		res.response     = None
 		res.tod          = self.dev.pools["tod"].array(obs.signal)

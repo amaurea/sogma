@@ -47,7 +47,11 @@ def read_tod(fname, mul=32):
 		bore = f["boresight"]
 		n    = fft.fft_len(bore.shape[1]//mul, factors=[2,3,5,7])*mul
 		res.ctime        = bore[0,:n]                   # [nsamp]
-		res.boresight    = bore[[2,1],:n]               # [{el,az},nsamp]
+		res.boresight    = np.empty((3,n),bore.dtype)
+		res.boresight[0] = bore[2,:n] # el
+		res.boresight[1] = bore[1,:n] # az
+		res.boresight[2] = 0 # no roll in simple format currently
+		res.hwp          = np.zeros_like(res.boresight[0]) # no hwp in simple format currently
 		res.tod          = f["tod"][:,:n]               # [ndet,nsamp]
 		res.cuts         = mask2cuts(f["cuts"][:,:n])
 		res.response     = None

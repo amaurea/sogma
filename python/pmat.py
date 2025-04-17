@@ -157,7 +157,7 @@ class PmatCutPoly:
 def calc_pointing(ctime, bore, offs, polang, site="so", weather="typical", dtype=np.float32):
 	offs, polang = np.asarray(offs), np.asarray(polang)
 	ndet, nsamp = len(offs), bore.shape[1]
-	sightline = so3g.proj.coords.CelestialSightLine.az_el(ctime, bore[1], bore[0], site="so", weather="typical")
+	sightline = so3g.proj.coords.CelestialSightLine.az_el(ctime, bore[1], bore[0], roll=bore[2], site="so", weather="typical")
 	fplane    = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], np.pi/2-polang)
 	pos_equ   = np.moveaxis(sightline.coords(fplane),2,0) # [{ra,dec,c1,s1},ndet,nsamp]
 	pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]

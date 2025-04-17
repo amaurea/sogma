@@ -109,21 +109,22 @@ try:
 except ImportError:
 	pass
 
-if False:
+if True:
 
 	class MMDeviceCpu(device.DeviceCpu):
 		def __init__(self, align=None, alloc_factory=None):
 			super().__init__(align=align, alloc_factory=alloc_factory)
 			# ffts. No plan caching for now
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
-				return fft.rfft(dat, ft=out, axis=axis)
+				return fft.rfft(dat, ft=out, axes=axis)
 			self.lib.rfft = rfft
 			def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
-				return fft.irfft(dat, tod=out, axis=axis, normalize=False)
+				return fft.irfft(dat, tod=out, axes=axis, normalize=False)
 			self.lib.irfft = irfft
 			# BLAS. May need to find a way to make this more compact if we need
 			# more of these functions
 			def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
+				import scipy
 				assert A.dtype == np.float32, "sgemm needs single precision"
 				assert B.dtype == np.float32, "sgemm needs single precision"
 				assert C.dtype == np.float32, "sgemm needs single precision"
@@ -141,6 +142,48 @@ if False:
 				assert C.dtype == np.float32, "sdgmm needs single precision"
 				raise NotImplementedError
 			self.lib.sdgmm = sdgmm
-			raise NotImplementedError
+			# The rest aren't done for now
 
-	Devices.cpu = MMDeviceCpu()
+	Devices.cpu = MMDeviceCpu
+
+	# What do we need to make a sotodlib device?
+	# 1. LocalMap
+	#    Must contain .arr, a device array reshapable to (ntile,ncomp,tyshape,txshape)
+	#    Must contain .pixelization, a LocalPixelization
+	#    Must be constructable from (pixelization, arr)
+	#    Must be passable to map2tod, tod2map
+	#    (tyshape,txshape) must be (64,64)
+	# 2. LocalPixelization
+	#    Must contain .cell_offsets_cpu. These are offsets from the start of .arr
+	#    of each tile for a (3,64,64) tile.
+	# 3. DynamicMap
+	#    Must be passable to tod2map
+	#    Must be constructable from (shape, dtype)
+	#    Must contain .finalize(), which returns a LocalMap
+	# 4. map2tod
+	#    Must accept (LocalMap, tod, pointing, plan, [response])
+	#    pointing is [{y,x,psi},ndet,nsamp]
+	#    plan is PointingPlan
+	#    If implemented with sotodlib, we have a mismatch. sotodlib wants
+	#     (ncomp,tyshape,txshape,ntile), but we have (ntile,ncomp,tyshape,txshape).
+	#     Will moveaxis be enough, or must we make it contiguous too?
+	#    sotodlib expects to compute the pointing on the fly. Is there an
+	#     interface for passing in precomputed pointing? Yes, but it doesn't
+	#     support bilinear interpolation, which we use in sogma. It also doesn't
+	#     support response. Must either generalize it, or add a new CoordSys
+	#     that represents precomputed pointing. The latter is probably simplest.
+	#    PointingFit calculates the pointing using .dot(), which will hopefully
+	#     use threads, otherwise it will be very slow.
+	#    How does sotodlib handle sky wrapping?
+	# 5. tod2map
+	#    Must accept (tod, LocalMap/DyamicMap, pointing, plan, [response])
+	#    sotodlib needs thread_intervals, which must be precomputed using
+	#    _get_proj_threads. Store a whole P in DynamicMap/LocalMap/PointingPrePlan/PointingPlan?
+	# 6. PointingPlan
+	#    Must be constructable from (preplan, pointing)
+	# 7. PointingPrePlan
+	#    Must be constructable from (pointing, ny, nx, periodic_xcoord=True)
+	#    For sotodlib this and PointingPlan can be dummies
+
+
+

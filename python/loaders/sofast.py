@@ -44,6 +44,7 @@ class SoFastLoader:
 		wafer_rads    = np.zeros((len(subids)))
 		for ri, ref_id in enumerate(ref_ids):
 			# 2. Get the focal plane offsets for this subid
+			print("ref_id", ref_id)
 			focal_plane = get_focal_plane(self.fast_meta, ref_id)
 			mid, rad    = get_fplane_extent(focal_plane)
 			wafer_centers[order[edges[ri]:edges[ri+1]]] = mid
@@ -54,13 +55,13 @@ class SoFastLoader:
 		return obsinfo
 	def load(self, subid):
 		try:
-			with bench.show("read meta (total)"):
+			with bench.mark("read meta (total)"):
 				meta = self.fast_meta.read(subid)
 			# Load the raw data
-			with bench.show("read data (total)"):
+			with bench.mark("read data (total)"):
 				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 			# Calibrate the data
-			with bench.show("calibrate (total)"):
+			with bench.mark("calibrate (total)"):
 				obs = calibrate(data, meta, dev=self.dev)
 		except Exception as e:
 			# FIXME: Make this less broad
@@ -94,38 +95,38 @@ class FastMeta:
 		obsid, wslot, band = subid.split(":")
 		# Find which hdf files are relevant for this observation
 		try:
-			with bench.show("get precfile dcalfile"):
+			with bench.mark("get precfile dcalfile"):
 				precfile,  precgroup  = get_precfile (self.prep_index,  subid)
 				dcalfile,  dcalgroup  = get_dcalfile (self.dcal_index,  subid)
 		except KeyError as e: raise utils.DataMissing(str(e))
 		# 1. Get our starting set of detectors
-		with bench.show("get_available_dets"):
+		with bench.mark("get_available_dets"):
 			try: readout_ids, det_ids = self.det_cache.get_dets(subid)
 			except sqlite.sqlite3.OperationalError as e: raise errors.DataMissing(str(e))
 			aman = core.AxisManager(core.LabelAxis("dets", readout_ids))
 			aman.wrap("det_ids", det_ids, [(0,"dets")])
 		# 2. Load the necessary info from det_cal
-		with bench.show("det_cal"):
+		with bench.mark("det_cal"):
 			with h5py.File(dcalfile, "r") as hfile:
 				det_cal = hfile[dcalgroup][()]
 			daman = core.AxisManager(core.LabelAxis("dets",np.char.decode(det_cal["dets:readout_id"])))
 			good  = np.full(daman.dets.count, True)
-		with bench.show("phase_to_pW"):
+		with bench.mark("phase_to_pW"):
 			daman.wrap("phase_to_pW", det_cal["phase_to_pW"], [(0,"dets")])
 			good &= np.isfinite(daman.phase_to_pW)
-		with bench.show("tau_eff"):
+		with bench.mark("tau_eff"):
 			daman.wrap("tau_eff", det_cal["tau_eff"], [(0,"dets")])
 			good &= np.isfinite(daman.tau_eff)
-		with bench.show("merge"):
+		with bench.mark("merge"):
 			daman.restrict("dets", daman.dets.vals[good])
 			aman.merge(daman)
 		# 3. Load the focal plane information
-		with bench.show("fp_lookup"):
+		with bench.mark("fp_lookup"):
 			fp_info = self.fp_cache.get_by_subid(subid, self.det_cache)
-		with bench.show("match dets"):
+		with bench.mark("match dets"):
 			det_ids = np.char.decode(fp_info["dets:det_id"])
 			ainds, finds = utils.common_inds([aman.det_ids, det_ids])
-		with bench.show("fp_setup"):
+		with bench.mark("fp_setup"):
 			fp_info = fp_info[finds]
 			focal_plane = np.array([fp_info["xi"], fp_info["eta"], fp_info["gamma"]]).T
 			good    = np.all(np.isfinite(focal_plane),1)
@@ -141,33 +142,33 @@ class FastMeta:
 					core.OffsetAxis("samps", count=pl.samps[0], offset=pl.samps[1]))
 			# A bit awkward to time the time taken in the initialization
 			bench.add("prep_loader", time.time()-t1)
-			bench.print("prep_loader")
-			with bench.show("relcal"):
+			#bench.print("prep_loader")
+			with bench.mark("relcal"):
 				paman.wrap("relcal", pl.read("lpf_sig_run1/relcal","d"), [(0,"dets")])
-			with bench.show("hwp_angle"):
+			with bench.mark("hwp_angle"):
 				paman.wrap("hwp_angle", pl.read("hwp_angle/hwp_angle","s"), [(0,"samps")])
-			with bench.show("hwpss_coeffs"):
+			with bench.mark("hwpss_coeffs"):
 				# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
 				paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
-			with bench.show("glitches"):
+			with bench.mark("glitches"):
 				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags"), [(0,"dets"),(1,"samps")])
-			with bench.show("cuts_2pi"):
+			with bench.mark("cuts_2pi"):
 				paman.wrap("cuts_2pi", read_cuts(pl, "jumps_2pi/jump_flag"),[(0,"dets"),(1,"samps")])
-			with bench.show("cuts_slow"):
+			with bench.mark("cuts_slow"):
 				paman.wrap("cuts_slow", read_cuts(pl, "jumps_slow/jump_flag"),[(0,"dets"),(1,"samps")])
 
-		with bench.show("merge"):
+		with bench.mark("merge"):
 			aman.merge(paman)
 
 		# 4. Get stuff from the data file header
-		with bench.show("get_detset (should be cached)"):
+		with bench.mark("get_detset (should be cached)"):
 			detset = self.det_cache.get_detset(subid)
-		with bench.show("get_files"):
+		with bench.mark("get_files"):
 			finfos = self.context.obsfiledb.get_files(obsid)[detset]
 		# Get the filter params
-		with bench.show("status"):
+		with bench.mark("status"):
 			status = read_wiring_status(finfos[0][0])
-		with bench.show("iir_params"):
+		with bench.mark("iir_params"):
 			iir_params = bunch.Bunch()
 			pre = "AMCc.SmurfProcessor.Filter."
 			iir_params["a"]       = np.array(ast.literal_eval(status[pre+"A"]))
@@ -180,7 +181,7 @@ class FastMeta:
 			flux_ramp_rate        = digitizer_freq/2/(ramp_max_count+1)
 			iir_params["fscale"]  = 1/flux_ramp_rate
 		# Get our absolute calibration
-		with bench.show("get_abscal"):
+		with bench.mark("get_abscal"):
 			abscal_cmb = self.acal_cache.get(wslot, band).abscal_cmb
 		# Return our results. We don't put everything in an axismanager
 		# because that has significant overhead, and we don't need an
@@ -224,7 +225,7 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 def calibrate(data, meta, dev=None):
 	if dev is None: dev = device.get_device()
 	# Merge the cuts. Easier to deal with just a single cuts object
-	with bench.show("merge_cuts"):
+	with bench.mark("merge_cuts"):
 		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_slow"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 	# Go to a fourier-friendly length
@@ -232,28 +233,28 @@ def calibrate(data, meta, dev=None):
 	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=[2,3,5,7])*mul
 	timestamps, signal, cuts, az, el, roll, hwp_angle = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el,data.roll,meta.aman.hwp_angle]]
 
-	with bench.show("ctime"):
+	with bench.mark("ctime"):
 		ctime   = timestamps * meta.timestamp_to_ctime
 	# Calibrate the pointing
-	with bench.show("boresight"):
+	with bench.mark("boresight"):
 		az      = az   * utils.degree
 		el      = el   * utils.degree
 		roll    =-roll * utils.degree
-	with bench.show("pointing correction"):
+	with bench.mark("pointing correction"):
 		az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
 	# Do we need to deslope at float64 before it is safe to drop to float32?
-	with bench.show("signal → gpu", tfun=dev.time):
+	with bench.mark("signal → gpu", tfun=dev.time):
 		signal_ = dev.pools["ft"].array(signal)
-	with bench.show("signal → float32", tfun=dev.time):
+	with bench.mark("signal → float32", tfun=dev.time):
 		signal  = dev.pools["tod"].empty(signal.shape, np.float32)
 		signal[:] = signal_
-	with bench.show("calibrate", tfun=dev.time):
+	with bench.mark("calibrate", tfun=dev.time):
 		# Calibrate to CMB µK
 		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] * meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
-	with bench.show("subtract_hwpss", tfun=dev.time):
+	with bench.mark("subtract_hwpss", tfun=dev.time):
 		nmode = 16
 		signal = subtract_hwpss(signal, hwp_angle, meta.aman.hwpss_coeffs[:,:nmode]*phase_to_cmb, dev=dev)
 	# Deglitching. Measure the values v1,v2 at the edge of
@@ -262,12 +263,12 @@ def calibrate(data, meta, dev=None):
 	# For each cut region we want a region up to n samples wide on its borders, but not
 	# inside other cuts
 	w = 10
-	with bench.show("get_cut_borders"):
+	with bench.mark("get_cut_borders"):
 		borders = get_cut_borders(cuts,w)
 	# Hm, need to read out mean in each of these border regions. No easy way to do this
 	# Let's see how expensive it is to loop. 28 ms. Probably worth implementing in
 	# low-level code
-	with bench.show("border vals", tfun=dev.time):
+	with bench.mark("border vals", tfun=dev.time):
 		bvals = dev.np.zeros((len(borders),2), signal.dtype)
 		for di, (b1,b2) in enumerate(cuts.bins):
 			for ri in range(b1,b2):
@@ -282,7 +283,7 @@ def calibrate(data, meta, dev=None):
 				bvals[ri,1] = v2
 	# 45 ms for this one. Not as slow as I feared, but should still be
 	# optimized. Unless it's faster on a gpu
-	with bench.show("deglich", tfun=dev.time):
+	with bench.mark("deglich", tfun=dev.time):
 		# Will subtract v2-v1 from entire region after that cut.
 		jumps = bvals[:,1]-bvals[:,0]
 		cumj  = dev.np.cumsum(jumps)
@@ -299,16 +300,16 @@ def calibrate(data, meta, dev=None):
 				signal[di,r2:r3] -= dcumj[i]
 
 	# 100 ms for this :(
-	with bench.show("deslope", tfun=dev.time):
+	with bench.mark("deslope", tfun=dev.time):
 		deslope(signal, w=w, dev=dev, inplace=True)
 
 	# FFT stuff should definitely be on the gpu. 640 ms
-	with bench.show("fft", tfun=dev.time):
+	with bench.mark("fft", tfun=dev.time):
 		ftod = dev.pools["ft"].empty((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
 		dev.lib.rfft(signal, ftod)
 		norm = 1/signal.shape[1]
 	# Deconvolve iir and time constants
-	with bench.show("iir_filter", tfun=dev.time):
+	with bench.mark("iir_filter", tfun=dev.time):
 		dt    = (ctime[-1]-ctime[0])/(ctime.size-1)
 		freqs = dev.np.fft.rfftfreq(nsamp, dt).astype(signal.dtype)
 		z     = dev.np.exp(-2j*np.pi*meta.iir_params.fscale*freqs)
@@ -317,31 +318,31 @@ def calibrate(data, meta, dev=None):
 		iir_filter = A/B # will multiply by this
 		iir_filter *= norm # Hack: cheap to handle normalization here
 		ftod *= iir_filter
-	with bench.show("time consts", tfun=dev.time):
+	with bench.mark("time consts", tfun=dev.time):
 		# I can't find an efficient way to do this. BLAS can't
 		# do it since it's a triple multiplication. Hopefully the
 		# gpu won't have trouble with it
 		ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
 	# Back to real space
-	with bench.show("ifft", tfun=dev.time):
+	with bench.mark("ifft", tfun=dev.time):
 		dev.lib.irfft(ftod, signal)
 
-	with bench.show("measure noise", tfun=dev.time):
+	with bench.mark("measure noise", tfun=dev.time):
 		rms  = measure_rms(signal)
 
 	# Restrict to these detectors
-	with bench.show("final detector prune", tfun=dev.time):
+	with bench.mark("final detector prune", tfun=dev.time):
 		tol    = 0.1
 		ref    = np.median(rms[rms!=0])
 		good   = (rms > ref*tol)&(rms < ref/tol)
 		signal = dev.np.ascontiguousarray(signal[good]) # 600 ms!
-		good   = good.get() # cuts, dets, fplane etc. need this on the cpu
+		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 
 	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
 
-	with bench.show("cuts reformat"):
+	with bench.mark("cuts reformat"):
 		ocuts = np.array([
 			get_range_dets(cuts.bins, cuts.ranges),
 			cuts.ranges[:,0], cuts.ranges[:,1]-cuts.ranges[:,0]], dtype=np.int32)
@@ -353,7 +354,8 @@ def calibrate(data, meta, dev=None):
 	res.point_offset = meta.aman.focal_plane[good,1::-1]
 	res.polangle     = meta.aman.focal_plane[good,2]
 	res.ctime        = ctime
-	res.boresight    = np.array([el,az]) # FIXME: roll
+	res.boresight    = np.array([el,az,roll])
+	res.hwp          = hwp_angle
 	res.tod          = signal
 	res.cuts         = ocuts
 	res.response     = None
@@ -378,12 +380,25 @@ class DetCache:
 		self.dset_cache= {}
 	def get_detsets(self, obsid):
 		if obsid not in self.dset_cache:
-			with bench.show("get_detsets"):
+			with bench.mark("get_detsets"):
+				# BUG! This returns an alphabetically sorted list of detsets,
+				# not a full-length, wafer-slot-sorted list, like
+				# get_detset(self,subid) assumes
+				# imprinter.yaml in site-pipeline-configs contains a hard-coded
+				# mapping. Could just implement that for now, if I don't find
+				# anything better.
 				self.dset_cache[obsid] = self.obsfiledb.get_detsets(obsid)
 		return self.dset_cache[obsid]
 	def get_detset(self, subid):
 		obsid, wslot, band = subid.split(":")
 		ind = int(wslot[2:])
+		print("subid", subid)
+		print("obsid", obsid)
+		print("wslot", wslot)
+		print("band", band)
+		print("ind", ind)
+		print("dset_cache")
+		print(self.dset_cache)
 		return self.get_detsets(obsid)[ind]
 	def get_dets(self, subid):
 		obsid, wslot, band = subid.split(":")
@@ -609,7 +624,7 @@ class Sampcut:
 		if bins   is None: bins   = np.zeros((0,2),np.int32)
 		if ranges is None: ranges = np.zeros((0,2),np.int32)
 		if simplify:
-			with bench.show("simplify cuts"):
+			with bench.mark("simplify cuts"):
 				bins, ranges = simplify_cuts(bins, ranges)
 		self.bins   = np.asarray(bins,   dtype=np.int32) # (ndet,  {from,to})
 		self.ranges = np.asarray(ranges, dtype=np.int32) # (nrange,{from,to})
@@ -757,7 +772,7 @@ def subtract_hwpss(signal, hwp_angle, coeffs, dev=None):
 	# This can be done with recursion formulas, but
 	# the gains are only few ms on the cpu. Let's keep this
 	# for the time being
-	with bench.show("build basis"):
+	with bench.mark("build basis"):
 		for i in range(ncoeff):
 			mode = i//2+1
 			fun  = [dev.np.sin, dev.np.cos][i&1]

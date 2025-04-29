@@ -1,4 +1,4 @@
-import numpy as np, contextlib, json, time, os, scipy
+import numpy as np, contextlib, json, time, os, scipy, re
 from pixell import utils, fft, bunch, bench, sqlite
 from sotodlib import preprocess, core
 import fast_g3, h5py, yaml, ast
@@ -10,6 +10,7 @@ class SoFastLoader:
 	def __init__(self, configfile, dev=None, mul=32):
 		# Set up our metadata loader
 		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
+		self.info    = self.context.obsdb.query()
 		self.fast_meta = FastMeta(self.config, self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
@@ -20,21 +21,20 @@ class SoFastLoader:
 		subids = mapmaking.filter_subids(subids, wafers=wafers, bands=bands)
 		# Need base ids to look up rest of the info in obsdb
 		obs_ids, wafs, bands = mapmaking.split_subids(subids)
-		info     = self.context.obsdb.query()
-		inds     = utils.find(info["obs_id"], obs_ids)
+		inds     = utils.find(self.info["obs_id"], obs_ids)
 		# Build obsinfo for these ids
 		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
 		obsinfo       = np.zeros(len(inds), dtype).view(np.recarray)
 		obsinfo.id    = subids
 		obsinfo.ndet  = 1000 # no simple way to get this :(
-		obsinfo.nsamp = info["n_samples"][inds]
-		obsinfo.ctime = info["start_time"][inds]
-		obsinfo.dur   = info["stop_time"][inds]-info["start_time"][inds]
+		obsinfo.nsamp = self.info["n_samples"][inds]
+		obsinfo.ctime = self.info["start_time"][inds]
+		obsinfo.dur   = self.info["stop_time"][inds]-self.info["start_time"][inds]
 		# How come the parts that have to do with pointing.
 		# These arrays have a nasty habit of being object dtype
-		baz0  = info["az_center"][inds].astype(np.float64)
-		waz   = info["az_throw" ][inds].astype(np.float64)
-		bel0  = info["el_center"][inds].astype(np.float64)
+		baz0  = self.info["az_center"][inds].astype(np.float64)
+		waz   = self.info["az_throw" ][inds].astype(np.float64)
+		bel0  = self.info["el_center"][inds].astype(np.float64)
 		# Need the rough pointing for each observation. This isn't
 		# directly available in the obsid. We will assume that each wafer-slot
 		# has approximately constant pointing offsets.
@@ -44,7 +44,6 @@ class SoFastLoader:
 		wafer_rads    = np.zeros((len(subids)))
 		for ri, ref_id in enumerate(ref_ids):
 			# 2. Get the focal plane offsets for this subid
-			print("ref_id", ref_id)
 			focal_plane = get_focal_plane(self.fast_meta, ref_id)
 			mid, rad    = get_fplane_extent(focal_plane)
 			wafer_centers[order[edges[ri]:edges[ri+1]]] = mid
@@ -55,18 +54,19 @@ class SoFastLoader:
 		return obsinfo
 	def load(self, subid):
 		try:
-			with bench.mark("read meta (total)"):
+			with bench.mark("load_meta"):
 				meta = self.fast_meta.read(subid)
 			# Load the raw data
-			with bench.mark("read data (total)"):
+			with bench.mark("load_data"):
 				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 			# Calibrate the data
-			with bench.mark("calibrate (total)"):
+			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, dev=self.dev)
 		except Exception as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
-		# Place obs.tod on gpu. Hardcoded to use scratch.tod for now
+		# Add timing info
+		obs.timing = [("meta",bench.t.load_meta),("data",bench.t.load_data),("calib",bench.t.load_calib)]
 		return obs
 
 class FastMeta:
@@ -81,8 +81,9 @@ class FastMeta:
 		# /global/cfs/cdirs/sobs/metadata/satp1/manifests/det_cal/satp1_det_cal_240312m/det_cal_local.sqlite
 		self.dcal_index = sqlite.open(cmeta_lookup(context["metadata"], "det_cal"))
 		# 3. The detector info
-		self.match_index= sqlite.open(cmeta_lookup(context["metadata"], "assignment"))
-		self.det_cache  = DetCache(context.obsfiledb, self.match_index)
+		smurf_info = SmurfInfo(sqlite.open(cmeta_lookup(context["metadata"], "smurf")))
+		match_info = AssignmentInfo(sqlite.open(cmeta_lookup(context["metadata"], "assignment")))
+		self.det_cache  = DetCache(context.obsfiledb, smurf_info, match_info)
 		# 4. Absolute calibration
 		with sqlite.open(cmeta_lookup(context["metadata"], "abscal")) as index:
 			acalfile = get_acalfile(index)
@@ -95,38 +96,38 @@ class FastMeta:
 		obsid, wslot, band = subid.split(":")
 		# Find which hdf files are relevant for this observation
 		try:
-			with bench.mark("get precfile dcalfile"):
+			with bench.mark("fm_precfile"):
 				precfile,  precgroup  = get_precfile (self.prep_index,  subid)
 				dcalfile,  dcalgroup  = get_dcalfile (self.dcal_index,  subid)
 		except KeyError as e: raise utils.DataMissing(str(e))
 		# 1. Get our starting set of detectors
-		with bench.mark("get_available_dets"):
-			try: readout_ids, det_ids = self.det_cache.get_dets(subid)
+		with bench.mark("fm_dets"):
+			try: detinfo = self.det_cache.get(subid)
 			except sqlite.sqlite3.OperationalError as e: raise errors.DataMissing(str(e))
-			aman = core.AxisManager(core.LabelAxis("dets", readout_ids))
-			aman.wrap("det_ids", det_ids, [(0,"dets")])
+			aman = core.AxisManager(core.LabelAxis("dets", detinfo.channels))
+			aman.wrap("det_ids", detinfo.dets, [(0,"dets")])
 		# 2. Load the necessary info from det_cal
-		with bench.mark("det_cal"):
+		with bench.mark("fm_detcal"):
 			with h5py.File(dcalfile, "r") as hfile:
 				det_cal = hfile[dcalgroup][()]
 			daman = core.AxisManager(core.LabelAxis("dets",np.char.decode(det_cal["dets:readout_id"])))
 			good  = np.full(daman.dets.count, True)
-		with bench.mark("phase_to_pW"):
+		with bench.mark("fm_pW"):
 			daman.wrap("phase_to_pW", det_cal["phase_to_pW"], [(0,"dets")])
 			good &= np.isfinite(daman.phase_to_pW)
-		with bench.mark("tau_eff"):
+		with bench.mark("fm_tau"):
 			daman.wrap("tau_eff", det_cal["tau_eff"], [(0,"dets")])
 			good &= np.isfinite(daman.tau_eff)
-		with bench.mark("merge"):
+		with bench.mark("fm_merge"):
 			daman.restrict("dets", daman.dets.vals[good])
 			aman.merge(daman)
 		# 3. Load the focal plane information
-		with bench.mark("fp_lookup"):
+		with bench.mark("fm_fplane"):
 			fp_info = self.fp_cache.get_by_subid(subid, self.det_cache)
-		with bench.mark("match dets"):
+			# Match detectors
 			det_ids = np.char.decode(fp_info["dets:det_id"])
 			ainds, finds = utils.common_inds([aman.det_ids, det_ids])
-		with bench.mark("fp_setup"):
+			# Set up the focal plane
 			fp_info = fp_info[finds]
 			focal_plane = np.array([fp_info["xi"], fp_info["eta"], fp_info["gamma"]]).T
 			good    = np.all(np.isfinite(focal_plane),1)
@@ -141,34 +142,32 @@ class FastMeta:
 					core.LabelAxis("dets", pl.dets),
 					core.OffsetAxis("samps", count=pl.samps[0], offset=pl.samps[1]))
 			# A bit awkward to time the time taken in the initialization
-			bench.add("prep_loader", time.time()-t1)
+			bench.add("fm_prep_loader", time.time()-t1)
 			#bench.print("prep_loader")
-			with bench.mark("relcal"):
+			with bench.mark("fm_relcal"):
 				paman.wrap("relcal", pl.read("lpf_sig_run1/relcal","d"), [(0,"dets")])
-			with bench.mark("hwp_angle"):
+			with bench.mark("fm_hwp_angle"):
 				paman.wrap("hwp_angle", pl.read("hwp_angle/hwp_angle","s"), [(0,"samps")])
-			with bench.mark("hwpss_coeffs"):
+			with bench.mark("fm_hwpss"):
 				# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
 				paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
-			with bench.mark("glitches"):
+			with bench.mark("fm_cuts"):
 				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags"), [(0,"dets"),(1,"samps")])
-			with bench.mark("cuts_2pi"):
 				paman.wrap("cuts_2pi", read_cuts(pl, "jumps_2pi/jump_flag"),[(0,"dets"),(1,"samps")])
-			with bench.mark("cuts_slow"):
 				paman.wrap("cuts_slow", read_cuts(pl, "jumps_slow/jump_flag"),[(0,"dets"),(1,"samps")])
 
-		with bench.mark("merge"):
+		with bench.mark("fm_merge2"):
 			aman.merge(paman)
 
 		# 4. Get stuff from the data file header
-		with bench.mark("get_detset (should be cached)"):
-			detset = self.det_cache.get_detset(subid)
-		with bench.mark("get_files"):
+		with bench.mark("fm_detsets"):
+			detset = self.det_cache.get(subid).detset
+		with bench.mark("fm_getfiles"):
 			finfos = self.context.obsfiledb.get_files(obsid)[detset]
 		# Get the filter params
-		with bench.mark("status"):
+		with bench.mark("fm_status"):
 			status = read_wiring_status(finfos[0][0])
-		with bench.mark("iir_params"):
+		with bench.mark("fm_iir"):
 			iir_params = bunch.Bunch()
 			pre = "AMCc.SmurfProcessor.Filter."
 			iir_params["a"]       = np.array(ast.literal_eval(status[pre+"A"]))
@@ -181,7 +180,7 @@ class FastMeta:
 			flux_ramp_rate        = digitizer_freq/2/(ramp_max_count+1)
 			iir_params["fscale"]  = 1/flux_ramp_rate
 		# Get our absolute calibration
-		with bench.mark("get_abscal"):
+		with bench.mark("fm_abscal"):
 			abscal_cmb = self.acal_cache.get(wslot, band).abscal_cmb
 		# Return our results. We don't put everything in an axismanager
 		# because that has significant overhead, and we don't need an
@@ -369,58 +368,89 @@ def calibrate(data, meta, dev=None):
 # Helpers below #
 #################
 
+# smurf: detset → channels, detset → wafer slot
+# assignment: channels → detectors
+# obsfiledb: obsid → detset
+class SmurfInfo:
+	"""Provides mapping from detset to wafer slot and channels (readout_ids)"""
+	def __init__(self, smurf_index):
+		self.smurf_index = smurf_index
+		self.wslot    = {}
+		self.channels = {}
+	def get(self, detset):
+		self._prepare(detset)
+		return bunch.Bunch(
+			wslot    = self.wslot[detset],
+			channels = self.channels[detset],
+		)
+	def _prepare(self, detset, force=False):
+		if detset in self.wslot and not force: return
+		hfname, group = get_smurffile(self.smurf_index, detset)
+		# Consider reading all the groups at once here
+		with h5py.File(hfname, "r") as hfile:
+			data = hfile[group][()]
+			self.channels[detset] = np.char.decode(data["dets:readout_id"])
+			self.wslot   [detset] = data["dets:wafer_slot"][0].decode()
+		return self
+
+class AssignmentInfo:
+	"""Provides mapping from channel to detector for each detset"""
+	def __init__(self, match_index):
+		self.match_index = match_index
+		self.channels    = {}
+		self.dets        = {}
+	def get(self, detset):
+		self._prepare(detset)
+		return bunch.Bunch(
+			channels = self.channels[detset],
+			dets     = self.dets[detset],
+		)
+	def _prepare(self, detset, force=False):
+		if detset in self.dets and not force: return
+		hfname, group = get_matchfile(self.match_index, detset)
+		with h5py.File(hfname, "r") as hfile:
+			data = hfile[group][()]
+			self.channels[detset] = np.char.decode(data["dets:readout_id"])
+			self.dets    [detset] = np.char.decode(data["dets:det_id"])
+		return self
+
 class DetCache:
-	def __init__(self, obsfiledb, match_index):
+	def __init__(self, obsfiledb, smurf_info, ass_info):
 		self.obsfiledb = obsfiledb
-		self.match_index= match_index
-		# There won't be many unique ones here, and they're
-		# quite small, so we just cache them all
-		self.hfile_cache= {}
-		self.det_cache = {}
-		self.dset_cache= {}
-	def get_detsets(self, obsid):
-		if obsid not in self.dset_cache:
-			with bench.mark("get_detsets"):
-				# BUG! This returns an alphabetically sorted list of detsets,
-				# not a full-length, wafer-slot-sorted list, like
-				# get_detset(self,subid) assumes
-				# imprinter.yaml in site-pipeline-configs contains a hard-coded
-				# mapping. Could just implement that for now, if I don't find
-				# anything better.
-				self.dset_cache[obsid] = self.obsfiledb.get_detsets(obsid)
-		return self.dset_cache[obsid]
-	def get_detset(self, subid):
+		self.smurf_info= smurf_info
+		self.ass_info  = ass_info
+		self.cache     = {}
+		self.done      = set()
+	def get(self, subid):
 		obsid, wslot, band = subid.split(":")
-		ind = int(wslot[2:])
-		print("subid", subid)
-		print("obsid", obsid)
-		print("wslot", wslot)
-		print("band", band)
-		print("ind", ind)
-		print("dset_cache")
-		print(self.dset_cache)
-		return self.get_detsets(obsid)[ind]
-	def get_dets(self, subid):
-		obsid, wslot, band = subid.split(":")
-		if subid not in self.det_cache:
-			detset = self.get_detset(subid)
-			# Get the hdf file for this detset
-			hfname, group = get_matchfile(self.match_index, detset)
-			if hfname not in self.hfile_cache:
-				self.hfile_cache[hfname] = h5py.File(hfname, "r")
-			detinfo= self.hfile_cache[hfname][group][()]
-			good   = np.char.find(detinfo["dets:det_id"],band.encode())>=0
-			definfo = detinfo[good]
-			dets   = np.char.decode(detinfo["dets:readout_id"])
-			names  = np.char.decode(detinfo["dets:det_id"])
-			self.det_cache[subid] = (dets, names)
-		return self.det_cache[subid] # returns (readout_ids, det_ids)
-	def close(self):
-		for key in self.hfile_cache:
-			self.hfile_cache[key].close()
-	def __enter__(self): return self
-	def __exit__(self, *args, **kwargs):
-		self.close()
+		self._prepare(obsid)
+		return self.cache[subid]
+	def _prepare(self, obsid, force=False):
+		"""Read in the det lists for obsid, if necessary."""
+		if obsid in self.done and not force: return
+		for dset in self.obsfiledb.get_detsets(obsid):
+			sinfo = self.smurf_info.get(dset)
+			ainfo = self.ass_info  .get(dset)
+			# split dets into bands
+			for band, inds in split_bands(ainfo.dets):
+				subid = "%s:%s:%s" % (obsid, sinfo.wslot, band)
+				self.cache[subid] = bunch.Bunch(
+						channels=ainfo.channels[inds],
+						dets=ainfo.dets[inds],
+						detset=dset,
+				)
+		self.done.add(obsid)
+
+def split_bands(dets):
+	bdets = {}
+	for di, det in enumerate(dets):
+		m = re.match(r"^\w+_(f\d\d\d|DARK)_.*$", det)
+		if not m: continue
+		band = m.group(1)
+		if band not in bdets:
+			bdets[band] = []
+		bdets[band].append(di)
+	return [(band, np.array(bdets[band])) for band in bdets]
 
 class FplaneCache:
 	def __init__(self, fname):
@@ -457,7 +487,7 @@ class FplaneCache:
 		"""returns array with [('dets:det_id', 'S18'), ('xi', '<f4'), ('eta', '<f4'), ('gamma', '<f4')]"""
 		obs_id, wafer_slot, band = subid.split(":")
 		ctime      = float(obs_id.split("_")[1])
-		wafer_name = "_".join(det_cache.get_detset(subid).split("_")[:2])
+		wafer_name = "_".join(det_cache.get(subid).detset.split("_")[:2])
 		return self.get_by_wafer(wafer_name, ctime)
 
 class AcalCache:
@@ -732,6 +762,12 @@ def get_matchfile(indexdb, detset):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:detset] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:detset] = '%s' LIMIT 1;" % (detset)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in det match index" % subid)
+	return os.path.dirname(indexdb.fname) + "/" + fname, gname
+
+def get_smurffile(indexdb, detset):
+	query  = "SELECT files.name, dataset, file_id, files.id, [dets:detset] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:detset] = '%s' LIMIT 1;" % (detset)
+	try: fname, gname = next(indexdb.execute(query))[:2]
+	except StopIteration: raise KeyError("%s not found in smurf index" % subid)
 	return os.path.dirname(indexdb.fname) + "/" + fname, gname
 
 def get_acalfile(indexdb):

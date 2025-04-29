@@ -254,7 +254,7 @@ class PointingFit:
 		idiv= self.dev.np.linalg.inv(B64.dot(B64.T))
 		coeffs = v64.dot(B64.T).dot(idiv)
 		coeffs = coeffs.astype(self.dtype)
-		return coeffs
+		return coeffs # [{y,x,psi},ndet,ndof]
 	def eval(self, coeffs=None, B=None):
 		if B is None:
 			B = self.B if self.store_basis else self.basis(self.ref_pixs)
@@ -262,7 +262,7 @@ class PointingFit:
 			coeffs = self.coeffs
 		pointing = self.dev.pools["pointing"].empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
 		coeffs.dot(B, out=pointing)
-		return pointing
+		return pointing # [{y,x,psi},ndet,nsamp]
 
 def normalize(x):
 	x1 = np.min(x)

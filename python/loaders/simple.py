@@ -16,9 +16,13 @@ class SimpleLoader:
 	def load(self, id):
 		ind = self.lookup[id]
 		# Reads pre-calibrated files
-		obs = read_tod(self.obsinfo[ind].path, mul=self.mul)
+		with bench.mark("read"):
+			obs = read_tod(self.obsinfo[ind].path, mul=self.mul)
 		# Place obs.tod on device
-		obs.tod = self.dev.pools["tod"].array(obs.tod)
+		with bench.mark("tod2dev"):
+			obs.tod = self.dev.pools["tod"].array(obs.tod)
+		# Add timing info
+		obs.timing = [("read",bench.t.read),("tod2dev",bench.t.tod2dev)]
 		return obs
 
 # Helpers below

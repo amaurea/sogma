@@ -1,5 +1,5 @@
 import numpy as np, time
-from pixell import utils, fft, bunch
+from pixell import utils, fft, bunch, bench
 import so3g
 from sotodlib import core, mapmaking, preprocess
 from .. import device
@@ -47,30 +47,35 @@ class SotodlibLoader:
 		#bunch.write("test_ptraw_soslow.hdf", bunch.Bunch(az=obs.boresight.az, el=obs.boresight.el, roll=obs.boresight.roll))
 		#1/0
 		try:
-			obs = preprocess.load_and_preprocess(subid, self.config)
-			n   = fft.fft_len(obs.samps.count//self.mul, factors=[2,3,5,7])*self.mul
-			obs.restrict("samps", [0,n])
-			# Merge all the cuts into a single cuts object
-			cuts = merge_cuts([
-				obs.preprocess.glitches.glitch_flags,
-				obs.preprocess.jumps_2pi.jump_flag,
-				obs.preprocess.jumps_slow.jump_flag,
-			])
-			cuts = rangesmatrix_to_simplecuts(cuts)
+			with bench.mark("load_and_preprocess"):
+				obs = preprocess.load_and_preprocess(subid, self.config)
+			with bench.mark("merge_cuts"):
+				n   = fft.fft_len(obs.samps.count//self.mul, factors=[2,3,5,7])*self.mul
+				obs.restrict("samps", [0,n])
+				# Merge all the cuts into a single cuts object
+				cuts = merge_cuts([
+					obs.preprocess.glitches.glitch_flags,
+					obs.preprocess.jumps_2pi.jump_flag,
+					obs.preprocess.jumps_slow.jump_flag,
+				])
+				cuts = rangesmatrix_to_simplecuts(cuts)
 		except core.metadata.loader.LoaderError as e:
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Transform it to our current work format
-		res  = bunch.Bunch()
-		res.dets         = obs.dets.vals
-		res.point_offset = np.array([obs.focal_plane.eta,obs.focal_plane.xi]).T
-		res.polangle     = obs.focal_plane.gamma
-		res.ctime        = obs.timestamps
-		res.boresight    = np.array([obs.boresight.el,obs.boresight.az,obs.boresight.roll])
-		res.hwp          = obs.postprocess.hwp_angle
-		res.cuts         = cuts
-		res.response     = None
-		res.tod          = self.dev.pools["tod"].array(obs.signal)
-		res.tod         *= 1e6 * self.dev.np.array(obs.abscal.abscal_cmb[:,None])
+		with bench.mark("reformat"):
+			res  = bunch.Bunch()
+			res.dets         = obs.dets.vals
+			res.point_offset = np.array([obs.focal_plane.eta,obs.focal_plane.xi]).T
+			res.polangle     = obs.focal_plane.gamma
+			res.ctime        = obs.timestamps
+			res.boresight    = np.array([obs.boresight.el,obs.boresight.az,obs.boresight.roll])
+			res.hwp          = obs.preprocess.hwp_angle.hwp_angle
+			res.cuts         = cuts
+			res.response     = None
+			res.tod          = self.dev.pools["tod"].array(obs.signal)
+			res.tod         *= 1e6 * self.dev.np.array(obs.abscal.abscal_cmb[:,None])
+		# Add timing info
+		res.timing = [("load",bench.t.load_and_preprocess),("reformat",bench.t.merge_cuts+bench.t.reformat)]
 		return res
 
 # Helpers below

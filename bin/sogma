@@ -10,10 +10,13 @@ parser.add_argument(      "--bands",   type=str, default=None)
 parser.add_argument("-p", "--prefix",  type=str, default=None)
 parser.add_argument("-v", "--verbose", action="count", default=1)
 parser.add_argument("-q", "--quiet",   action="count", default=0)
-parser.add_argument("-n", "--maxfiles",type=int, default=None)
-parser.add_argument("-i", "--startfile",type=int, default=None)
+parser.add_argument(      "--tods",    type=str, default=None)
 parser.add_argument("-L", "--loader",  type=str, default="auto")
 parser.add_argument("-D", "--device",  type=str, default="auto")
+parser.add_argument("-I", "--maxiter", type=int, default=500)
+parser.add_argument("-@", "--center-at",type=str, default=None)
+parser.add_argument("-i", "--individual", action="store_true")
+parser.add_argument("-a", "--autocrop",   action="store_true")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -22,16 +25,17 @@ args = parser.parse_args()
 import numpy as np, os, time, sys
 from pixell import enmap, utils, mpi, colors
 import cupy
-from sogma import logging, mapmaking, loading, tiling, nmat, device
+from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
 
-comm   = mpi.COMM_WORLD
+comm_all   = mpi.COMM_WORLD
+comm_per   = mpi.COMM_SELF if args.individual else mpi.COMM_WORLD
 dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
 # Set up our device
 dev = device.get_device(args.device)
 #L = logging.Logger(id=comm.rank, level=args.verbose-args.quiet).setdefault()
-L = logging.Logger(dev, id=comm.rank, level=args.verbose-args.quiet, fmt="{id:3d} {t:10.6f} {mem:10.6f} {dmem_pools:10.6f} {dmem_rest:10.6f} {dmem_unknown:10.6f} {msg:s}").setdefault()
+L = logging.Logger(dev, id=comm_all.rank, level=args.verbose-args.quiet, fmt="{id:3d} {t:10.6f} {mem:10.6f} {dmem_pools:10.6f} {dmem_rest:10.6f} {dmem_unknown:10.6f} {msg:s}").setdefault()
 L.print("Init", level=0, id=0, color=colors.lgreen)
 # Set up our memory pools. This shouldn't be necessary if I make
 # the interface a bit nicer
@@ -41,47 +45,24 @@ dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
 cupy.fft.config.get_plan_cache().set_memsize(0)
 # Set up our data loader
 loader  = loading.Loader(args.obsinfo, type=args.loader, dev=dev)
-obsinfo = loader.query(args.query, wafers=args.wafers, bands=args.bands)[args.startfile:][:args.maxfiles]
+obsinfo = loader.query(args.query, wafers=args.wafers, bands=args.bands)
+if args.tods: obsinfo = eval("obsinfo["+args.tods+"]").reshape(-1).view(np.recarray)
 nfile   = len(obsinfo)
-L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm.size), level=0, id=0, color=colors.lgreen)
+L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm_all.size), level=0, id=0, color=colors.lgreen)
 prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
 utils.mkdir(args.odir)
 # Set up the signals we will solve for
-signal_map = mapmaking.SignalMap(shape, wcs, comm, dev=dev, dtype=np.float32)
-signal_cut = mapmaking.SignalCutPoly(comm, dev=dev)
+recenter = gutils.parse_recentering(args.center_at) if args.center_at else None
+signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=np.float32, recenter=recenter, autocrop=args.autocrop)
+signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev)
 # Set up the mapmaker
-mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecs(dev=dev), dev=dev)
-# Add our observations
-for ind in range(comm.rank, nfile, comm.size):
-	id    = obsinfo.id[ind]
-	t1    = time.time()
-	try:
-		data  = loader.load(id)
-	except utils.DataMissing as e:
-		L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
-		continue
-	t2    = time.time()
-	mapmaker.add_obs(id, data, deslope=False)
-	dev.garbage_collect()
-	del data
-	t3    = time.time()
-	L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2), level=2)
+#mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDetvecs(dev=dev), dev=dev)
+#mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatUncorr(dev=dev), dev=dev)
+mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDebug(dev=dev), dev=dev)
 
-nobs = comm.allreduce(len(mapmaker.data))
-if nobs == 0:
-	L.print("No tods survived!", id=0, level=0, color=colors.red)
-	mpi.Finalize()
-	sys.exit(1)
-
-mapmaker.prepare()
-signal_map.write(prefix, "rhs",  signal_map.rhs)
-signal_map.write(prefix, "ivar", signal_map.div[:,0])
-
-# Solve the equation system
-for step in mapmaker.solve():
-	L.print("CG %4d %15.7e (%6.3f s)" % (step.i, step.err, step.t), id=0, level=1, color=colors.lgreen)
-	if step.i % 10 == 0:
-		for signal, val in zip(mapmaker.signals, step.x):
-			if signal.output:
-				signal.write(prefix, "map%04d" % step.i, val)
+if args.individual:
+	mapmaking.make_map_perobs(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=10, maxiter=args.maxiter)
+else:
+	# Map them all together
+	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=10, maxiter=args.maxiter)

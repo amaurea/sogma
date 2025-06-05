@@ -4,10 +4,11 @@ from . import gutils, device
 from .logging import L
 
 class Nmat:
-	def __init__(self):
+	def __init__(self, dev=None):
 		"""Initialize the noise model. In subclasses this will typically set up parameters, but not
 		build the details that depend on the actual time-ordered data"""
-		self.ivar  = np.ones(1, dtype=np.float32)
+		self.dev   = dev or device.get_device()
+		self.ivar  = dev.np.ones(1, dtype=np.float32)
 		self.ready = True
 	def build(self, tod, **kwargs):
 		"""Measure the noise properties of the given time-ordered data tod[ndet,nsamp], and
@@ -27,6 +28,9 @@ class Nmat:
 		bunch.write(fname, bunch.Bunch(type="Nmat"))
 	@staticmethod
 	def from_bunch(data): return Nmat()
+	def check_ready(self):
+		if not self.ready:
+			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
 
 class NmatDetvecs(Nmat):
 	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
@@ -114,6 +118,7 @@ class NmatDetvecs(Nmat):
 				bins=bins, iD=iD, V=V, Kh=Kh, ivar=ivar, dev=self.dev)
 		return nmat
 	def apply(self, gtod, inplace=True):
+		self.check_ready()
 		t1 =self.dev.time()
 		if not inplace: god = gtod.copy()
 		gutils.apply_window(gtod, self.nwin)
@@ -141,6 +146,7 @@ class NmatDetvecs(Nmat):
 		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
 		return gtod
 	def white(self, gtod, inplace=True):
+		self.check_ready()
 		if not inplace: gtod.copy()
 		gutils.apply_window(gtod, self.nwin)
 		gtod *= self.ivar[:,None]
@@ -187,6 +193,131 @@ def apply_vecs(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:], nfreq, iD[bi:], 1, out[:,i1:], nfreq)
 		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
 		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp, tmp.shape[1], vtmp, nmode, 1, out[:,i1:], nfreq)
+
+class NmatUncorr(Nmat):
+	def __init__(self, spacing="exp", nbin=100, nmin=10, window=2, bins=None, ips_binned=None, ivar=None, nwin=None, dev=None):
+		self.dev        = dev or device.get_device()
+		self.spacing    = spacing
+		self.nbin       = nbin
+		self.nmin       = nmin
+		self.bins       = bins
+		self.ips_binned = ips_binned
+		self.ivar       = ivar
+		self.window     = window
+		self.nwin       = nwin
+		self.ready      = bins is not None and ips_binned is not None and ivar is not None
+	def build(self, tod, srate, **kwargs):
+		# Apply window while taking fft
+		nwin  = utils.nint(self.window*srate)
+		gutils.apply_window(tod, nwin)
+		ft    = self.dev.lib.rfft(tod)
+		# Unapply window again
+		gutils.apply_window(tod, nwin, -1)
+		return self.build_fourier(ft, tod.shape[1], srate, nwin=nwin)
+	def build_fourier(self, ftod, nsamp, srate, nwin=0):
+		ps = self.dev.np.abs(ftod)**2
+		del ftod
+		if   self.spacing == "exp": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
+		elif self.spacing == "lin": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
+		else: raise ValueError("Unrecognized spacing '%s'" % str(self.spacing))
+		ps_binned = self.dev.np.array([self.dev.np.mean(ps[:,b[0]:b[1]],1) for b in bins]).T
+		ips_binned = 1/ps_binned
+		# Compute the representative inverse variance per sample
+		ivar = self.dev.np.zeros(len(ps),ps.dtype)
+		for bi, b in enumerate(bins):
+			ivar += ips_binned[:,bi]*(b[1]-b[0])
+		ivar /= bins[-1,1]-bins[0,0]
+		return NmatUncorr(spacing=self.spacing, nbin=len(bins), nmin=self.nmin, bins=bins, ips_binned=ips_binned, ivar=ivar, window=self.window, nwin=nwin, dev=self.dev)
+	def apply(self, tod, inplace=False, exp=1):
+		self.check_ready()
+		if not inplace: tod = tod.copy()
+		if self.nwin > 0: gutils.apply_window(tod, self.nwin)
+		ftod = self.dev.lib.rfft(tod)
+		self.apply_fourier(ftod, tod.shape[1], exp=exp)
+		self.dev.lib.irfft(ftod, tod)
+		gutils.apply_window(tod, self.nwin)
+		return tod
+	def apply_fourier(self, ftod, nsamp, exp=1):
+		self.check_ready()
+		# Candidate for speedup in C
+		for bi, b in enumerate(self.bins):
+			ftod[:,b[0]:b[1]] *= (self.ips_binned[:,None,bi])**exp/nsamp
+		# I divided by the normalization above instead of passing normalize=True
+		# here to reduce the number of operations needed
+	def white(self, tod, inplace=True):
+		self.check_ready()
+		if not inplace: tod = tod.copy()
+		gutils.apply_window(tod, self.nwin)
+		tod *= self.ivar[:,None]
+		gutils.apply_window(tod, self.nwin)
+		return tod
+	def write(self, fname):
+		self.check_ready()
+		data = bunch.Bunch(type="NmatUncorr")
+		for field in ["spacing", "nbin", "nmin", "bins", "ips_binned", "ivar", "window", "nwin"]:
+			data[field] = getattr(self, field)
+		bunch.write(fname, data)
+	@staticmethod
+	def from_bunch(data, dev=None):
+		return NmatUncorr(spacing=data.spacing, nbin=data.nbin, nmin=data.nmin, bins=data.bins, ips_binned=data.ips_binned, ivar=data.ivar, window=window, nwin=nwin, dev=dev)
+
+class NmatWhite(Nmat):
+	def __init__(self, ivar=None, bsize=256, dev=None):
+		self.dev   = dev or device.get_device()
+		self.bsize = bsize
+		self.ivar  = ivar
+		self.ready = ivar is not None
+	def build(self, tod, **kwargs):
+		nsamp  = tod.shape[1]
+		nblock = nsamp//self.bsize
+		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
+		with utils.nowarn():
+			ivar = utils.without_nan(1/var)
+		return NmatWhite(ivar=ivar, bsize=self.bsize, dev=self.dev)
+	def apply(self, tod, inplace=False):
+		if not inplace: tod = tod.copy()
+		tod *= self.ivar[:,None]
+		return tod
+	def white(self, tod, inplace=False): return self.apply(tod, inplace=inplace)
+	def write(self, fname):
+		bunch.write(fname, bunch.Bunch(type="NmatWhite"))
+	@staticmethod
+	def from_bunch(data, dev=None): return NmatWhite(ivar=data.ivar, dev=dev)
+	def check_ready(self):
+		if not self.ready:
+			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
+
+class NmatDebug(Nmat):
+	def __init__(self, ivar=None, alpha=-3, fknee=0.25, profile=None, bsize=256, dev=None):
+		self.dev   = dev or device.get_device()
+		self.bsize = bsize
+		self.ivar  = ivar
+		self.alpha = alpha
+		self.fknee = fknee
+		self.profile = profile
+		self.ready = ivar is not None
+	def build(self, tod, srate, **kwargs):
+		nsamp  = tod.shape[1]
+		nblock = nsamp//self.bsize
+		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
+		with utils.nowarn():
+			ivar = utils.without_nan(1/var)
+		f = self.dev.np.fft.rfftfreq(nsamp, 1/srate)
+		with utils.nowarn():
+			profile = 1/(1+(f/self.fknee)**self.alpha)
+		profile /= nsamp # normalization
+		return NmatDebug(ivar=ivar, alpha=self.alpha, fknee=self.fknee, bsize=self.bsize, profile=profile, dev=self.dev)
+	def apply(self, tod, inplace=False):
+		tod = self.white(tod, inplace=inplace)
+		ft  = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))
+		self.dev.lib.rfft(tod, ft)
+		ft *= self.profile
+		self.dev.lib.irfft(ft, tod)
+		return tod
+	def white(self, tod, inplace=False):
+		if not inplace: tod = tod.copy()
+		tod *= self.ivar[:,None]
+		return tod
 
 def measure_cov(d, nmax=10000):
 	ap    = device.anypy(d)

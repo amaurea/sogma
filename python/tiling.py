@@ -108,18 +108,21 @@ class TileDistribution:
 		self.ncomp  = 3
 		self.tsize  = self.ncomp*np.prod(self.tshape)
 		self.dev    = dev or device.get_device()
+		# Shortcut, since we'll be referring to it a lot
+		lp = local_pixelization
 		# Our geometry
 		shape = shape[-2:]
 		self.shape, self.wcs = shape, wcs
 		# Sub-rectangle we're actually interested in.
 		# Used when reducing the map
+		if pixbox is not None and pixbox == "auto":
+			pixbox = get_pixbounds(lp)
 		self.pixbox = pixbox
 		if pixbox is not None:
 			_, self.pwcs = enmap.crop_geometry(shape, wcs, pixbox=pixbox)
 		else: self.pwcs = wcs
 		# Set up the work tiling. Would be nice if the
 		# latter could be part of 
-		lp = local_pixelization
 		self.work  = bunch.Bunch(lp=lp)
 		self.work.ntile = np.sum(lp.cell_offsets_cpu>=0)
 		self.work.size  = self.work.ntile*self.tsize
@@ -224,6 +227,7 @@ def build_dist_tiling(dist_owner, comm, tsize=1):
 	return dist
 
 def distoff_owners(dmine, comm):
+	"""dmine: boolean mask of tiles owned by us. Returns who owns each cell (-1 for unowned)"""
 	nhit = utils.allreduce(dmine.astype(int), comm)
 	assert np.max(nhit) <= 1, "Invalid distributed cell ownership: Cell owned by more than one task"
 	owners = utils.allreduce(comm.rank*dmine, comm)
@@ -370,7 +374,7 @@ def distribute_global_tiles_exposed_simple(loc_cells, comm):
 	owner[mask] = np.arange(nhit)*comm.size//nhit
 	return owner
 
-def distribute_tods_semibrute(shape, wcs, obsinfo, nsplit, npass=2, niter=10, verbose=False):
+def distribute_tods_semibrute(obsinfo, nsplit, npass=2, niter=10, verbose=False):
 	"""Split into nsplit groups such that the groups are
 	are approximately maximally-separated in state-space,
 	and each group has approximately the same weight.
@@ -380,11 +384,14 @@ def distribute_tods_semibrute(shape, wcs, obsinfo, nsplit, npass=2, niter=10, ve
 	optimizing both the sample volume and compactness per mpi task."""
 	ntod  = len(obsinfo)
 	# Handle special cases
-	if nsplit == 1: return [np.arange(ntod)]
-	if ntod <= nsplit: return [[i] for i in range(ntod)]+[[] for i in range(ntod,nsplit)]
+	if nsplit == 1: return bunch.Bunch(owner=np.zeros(ntod,int), weight=np.ones(ntod))
+	if ntod <= nsplit: return bunch.Bunch(owner=np.arange(ntod), weight=np.ones(ntod))
 	# Then the main case
-	pix   = enmap.sky2pix(shape, wcs, [obsinfo.sweep[:,:,1],obsinfo.sweep[:,:,0]]) # [{y,x},ntod,npoint]
-	state = np.moveaxis(pix,1,0).reshape(ntod,-1) # [ntod,ncoord]
+	# This used to use pixels, but the geometry dependency was annoying, and I don't
+	# see why raw coordinates wouldn't work
+	#pix   = enmap.sky2pix(shape, wcs, [obsinfo.sweep[:,:,1],obsinfo.sweep[:,:,0]]) # [{y,x},ntod,npoint]
+	pos   = np.array([obsinfo.sweep[:,:,1],obsinfo.sweep[:,:,0]]) # [{y,x},ntod,npoint]
+	state = np.moveaxis(pos,1,0).reshape(ntod,-1) # [ntod,ncoord]
 	# TODO: Do I need to unwind state here?
 	weight= obsinfo.ndet*obsinfo.nsamp
 	# Start from the point with the lowest state-sub
@@ -399,6 +406,13 @@ def distribute_tods_semibrute(shape, wcs, obsinfo, nsplit, npass=2, niter=10, ve
 	return bunch.Bunch(owner=gid, weights=gweight)
 
 def owners2rtiles(owners, tys, txs):
+	"""owners: 2d grid of who owns each cell (-1 for unowned)
+	tys: y tile index of the cells we want
+	txs: x tile index of the cells we want
+	Returns
+	  rty: concatenated list of tile y indices to receive from each task
+	  rtx: concatenated list of tile x indices to receive from each task
+	"""
 	# Mapping from our work inds to the buffer
 	# Need to know which tiles everybody will send to us
 	#  [y,x for rank in size for y,x in zip(my_oty,my_otx) if owners[y,x]==rank]
@@ -406,13 +420,65 @@ def owners2rtiles(owners, tys, txs):
 	#  [yx for rank in size for yx in yxs if owners[yx]==rank]
 	#  for yx in yxs: subs[owners[yx]].append(yx)
 	# Could be done with an alltoallv, but that's overkill
+	# 1. Infer how many mpi tasks we have. Should really get it from comm,
+	#    since some tasks could in theory not own anything. In practice,
+	#    those tasks won't contribute to the send offset either, so it should work
 	n = max(np.max(owners)+1,1)
+	# 2. Build a list of which tiles to receive from each
 	yxlist = [[] for i in range(n)]
 	for ty,tx in zip(tys,txs):
 		if owners[ty,tx] >= 0:
 			yxlist[owners[ty,tx]].append((ty,tx))
-	rty, rtx = np.concatenate(yxlist, 0).T
+	# 3. Flatten. The reshape ensures that things
+	#    work even if the list is empty
+	rty, rtx = np.concatenate(yxlist, 0).reshape(-1,2).astype(np.int32).T
 	return rty, rtx
+
+def get_pixbounds(lp):
+	"""Return a pixbox bounding the active cells in a LocalPixelization"""
+	hit  = lp.cell_offsets_cpu >= 0
+	# The y bounds are simple, since there's no wrapping there
+	ycells = np.where(np.sum(hit,1)>0)[0]
+	# Nothing hit?!
+	if len(ycells) == 0: return np.array([[0,0],[1,1]])
+	y1 = ycells[ 0]*64
+	y2 = np.minimum(ycells[-1]*64+1, lp.nypix_global)
+	# The x bounds are harder. We don't want a huge stripe across the
+	# sky just because our exposed area straddles the wrapping point.
+	# Start by getting the x-range each x-cell covers
+	xcells  = np.where(np.sum(hit,0)>0)[0]
+	xranges = np.array([xcells*64,(xcells+1)*64]).T
+	xranges = np.minimum(xranges, lp.nxpix_global)
+	# Find the biggest jump between cell starts
+	gaps    = xranges[1:,0]-xranges[:-1,1]
+	ijump   = np.argmax(gaps)
+	# If this jump is bigger than half the sky, then
+	# it will be more efficient to rewrap
+	if gaps[ijump] >= lp.nxpix_global//2:
+		xranges[:ijump+1] += lp.nxpix_global
+	# Ok, it should be safe now
+	x1 = np.min(xranges[:,0])
+	x2 = np.max(xranges[:,1])
+	return np.array([[y1,x1],[y2,x2]])
+
+#    This class contains the following members, which describe the global
+#    pixelization (see "global maps" in the gpu_mm docstring):
+#
+#       nypix_global (int)
+#       nxpix_global (int)
+#       periodic_xcoord (bool)
+#
+#    and the following members, which describe a local pixelization (i.e.
+#    subset of 64-by-64 cells in the global pixelization, see "local maps"
+#    in the gpu_mm docstring):
+#
+#      cell_offsets   2-d integer-valued array indexed by (iycell, ixcell)
+#      ystride        (int)
+#      polstride      (int)
+#      nycells        (int)
+#      nxcells        (int)
+#      npix           (int)
+
 
 ###########
 # Helpers #

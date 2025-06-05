@@ -21,9 +21,15 @@ class MLMapmaker:
 		self.dtype    = dtype
 		self.verbose  = verbose
 		self.noise_model = noise_model or nmat.NmatDetvecs(dev=dev)
+		self.reset()
+	def reset(self):
+		"""Reset the mapmaker, as if it had just been constructed. Also
+		resets its signals, so it's ready to make new maps."""
 		self.data     = []
 		self.dof      = MultiZipper()
 		self.ready    = False
+		for signal in self.signals:
+			signal.reset()
 	def add_obs(self, id, obs, deslope=True, noise_model=None):
 		# Prepare our tod
 		t1 = time.time()
@@ -133,6 +139,9 @@ class Signal:
 		self.ext    = ext
 		self.dof    = None
 		self.ready  = False
+	def reset(self):
+		self.dof   = None
+		self.ready = False
 	def add_obs(self, id, obs, nmat, Nd): pass
 	def prepare(self): self.ready = True
 	def forward (self, id, tod, x): pass
@@ -143,6 +152,7 @@ class Signal:
 	def to_work  (self, x): return x.copy()
 	def from_work(self, x): return x
 	def write   (self, prefix, tag, x): pass
+	def write_misc(self, prefix): pass
 
 # This will be updated to take a tiling instead of a shape, wcs, comm.
 # Or could build the tiling internally, hiding that detail from the user.
@@ -163,31 +173,41 @@ class Signal:
 class SignalMap(Signal):
 	"""Signal describing a non-distributed sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}", output=True,
-			ext="fits", dtype=np.float32, ibuf=None, obuf=None,
-			sys=None, interpol=None):
+			ext="fits", dtype=np.float32, ibuf=None, obuf=None, recenter=None,
+			sys=None, interpol=None, autocrop=False):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
-		to equatorial coordinates. If tiled==True, then this will be a distributed map with
-		the given tile_shape, otherwise it will be a plain enmap. interpol controls the
-		pointing matrix interpolation mode. See so3g's Projectionist docstring for details."""
+		to equatorial coordinates."""
 		Signal.__init__(self, name, ofmt, output, ext)
 		self.sys   = sys
+		if sys is not None and sys not in ["cel","equ"]:
+			raise NotImplementedError("Coordinate system rotation not implemented yet")
+		self.recenter = recenter
 		self.dtype = dtype
 		self.interpol = interpol
 		self.data  = {}
 		self.comps = "TQU"
 		self.ncomp = 3
 		self.comm  = comm
+		self.autocrop = autocrop
 		self.dev   = dev or device.get_device()
-		self.ids   = []
 		# Set up our internal tiling
 		self.shape,  self.wcs = shape, wcs
 		self.fshape, self.fwcs, self.pixbox = tiling.infer_fullsky_geometry(shape, wcs)
-		self.tiledist = None # Will be built later
-		# Dynamic RHS map which we will accumulate into
-		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, dtype)
+		if autocrop: self.pixbox = "auto"
 		# Buffers to use
 		self.ibuf = self.dev.pools[name+"_iwork"]
 		self.obuf = self.dev.pools[name+"_owork"]
+		# Not sure how to avoid code duplication with reset here,
+		# in light of the inheritance
+		self.ids      = []
+		self.tiledist = None
+		# Dynamic RHS map which we will accumulate into
+		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, self.dtype)
+	def reset(self):
+		Signal.reset(self)
+		self.ids      = []
+		self.tiledist = None
+		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, self.dtype)
 	def add_obs(self, id, obs, nmat, Nd, pmap=None):
 		"""Add and process an observation, building the pointing matrix
 		and our part of the RHS. "obs" should be an Observation axis manager,
@@ -202,7 +222,7 @@ class SignalMap(Signal):
 		# of them anyway
 		pcut   = pmat.PmatCutFull(obs.cuts, dev=self.dev)
 		if pmap is None:
-			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, response=obs.response, dev=self.dev, dtype=Nd.dtype)
+			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=Nd.dtype)
 			self.dev.garbage_collect()
 		# Precompute pointing for the upcoming pmap observations
 		# Accumulate local rhs
@@ -282,13 +302,15 @@ class SignalMap(Signal):
 	def from_work(self, glmap): return self.tiledist.gwmap2dmap(glmap)
 	def owork(self): return self.tiledist.gwmap(self.obuf, dtype=self.dtype)
 	def write(self, prefix, tag, m):
-		if not self.output: return
 		oname = self.ofmt.format(name=self.name)
 		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
 		omap  = self.tiledist.dmap2omap(m)
 		if self.comm.rank == 0:
 			enmap.write_map(oname, omap)
 		return oname
+	def write_misc(self, prefix):
+		self.write(prefix, "rhs", self.rhs)
+		self.write(prefix, "ivar", self.div[:,0])
 
 class SignalCutFull(Signal):
 	# Placeholder for when we have a gpu implementation
@@ -298,11 +320,17 @@ class SignalCutFull(Signal):
 		Signal.__init__(self, name, ofmt, output, ext="hdf")
 		self.comm  = comm
 		self.dev   = dev or device.get_device()
-		self.data  = {}
 		self.dtype = dtype
 		self.off   = 0
 		self.rhs   = []
 		self.idiv  = []
+		self.data  = {}
+	def reset(self):
+		Signal.reset(self)
+		self.off   = 0
+		self.rhs   = []
+		self.idiv  = []
+		self.data  = {}
 	def add_obs(self, id, obs, nmat, Nd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
 		nmat a noise model, representing the inverse noise covariance matrix,
@@ -348,7 +376,6 @@ class SignalCutFull(Signal):
 	def from_work(self, x): return self.dev.get(x)
 	def owork(self): return self.dev.np.zeros(self.rhs.shape, self.rhs.dtype)
 	def write(self, prefix, tag, m):
-		if not self.output: return
 		if self.comm is None:
 			rank = 0
 		else:
@@ -414,6 +441,122 @@ class SignalCutPoly(SignalCutFull):
 		elif self.prec == "none":
 			return junk.copy()
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
+
+# Mapmaking function
+def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, prealloc=True):
+	if prefix is None: prefix = ""
+	if inds is None:
+		dist = tiling.distribute_tods_semibrute(obsinfo, comm.size)
+		inds = np.where(dist.owner == comm.rank)[0]
+	# Accept either a list of integers or a single integer
+	try: dump = list(dump)
+	except TypeError: dump = [dump]
+	dev = mapmaker.dev
+	# Set up memory pools. Setting these up before-hand is
+	# actually more memory-efficient, as long as our estimate is
+	# good.
+	if prealloc:
+		ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
+		print("ntot_max", ntot_max)
+		print("ndet_max", np.max(obsinfo.ndet[inds]))
+		print("nsamp_max", np.max(obsinfo.nsamp[inds]))
+		setup_buffers(dev, ntot_max)
+	# Start map from scartch
+	with gutils.leakcheck(dev, "mapmaker.reset"):
+		mapmaker.reset()
+	# Add our observations
+	for i, ind in enumerate(inds):
+		id    = obsinfo.id[ind]
+		t1    = time.time()
+		try:
+			with gutils.leakcheck(dev, "load"):
+				data  = loader.load(id)
+		except utils.DataMissing as e:
+		#except () as e:
+			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
+			continue
+		t2    = time.time()
+
+		print("FIXME")
+		if data.cuts.size == 0: data.cuts = np.array([[0],[10],[1]],np.int32)
+
+		with gutils.leakcheck(dev, "add_obs"):
+			mapmaker.add_obs(id, data, deslope=False)
+			dev.garbage_collect()
+		del data
+		t3    = time.time()
+		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2), level=2)
+
+	nobs = comm.allreduce(len(mapmaker.data))
+	if nobs == 0:
+		L.print("No tods survived!", id=0, level=0, color=colors.red)
+		return None
+
+	with gutils.leakcheck(dev, "prepare"):
+		mapmaker.prepare()
+	# Write rhs and ivar
+	with gutils.leakcheck(dev, "write_misc"):
+		for signal in mapmaker.signals:
+			if signal.output:
+				signal.write_misc(prefix)
+
+	# Solve the equation system
+	with gutils.leakcheck(dev, "solve"):
+		for step in mapmaker.solve(maxiter=maxiter):
+			L.print("CG %4d %15.7e (%6.3f s)" % (step.i, step.err, step.t), id=0, level=1, color=colors.lgreen)
+			if len(dump) > 0 and (step.i in dump or step.i % dump[-1] == 0):
+				for signal, val in zip(mapmaker.signals, step.x):
+					if signal.output:
+						signal.write(prefix, "map%04d" % step.i, val)
+			print(dev.pools)
+	# Write the final result
+	with gutils.leakcheck(dev, "write final"):
+		for signal, val in zip(mapmaker.signals, step.x):
+			if signal.output:
+				signal.write(prefix, "map", val)
+
+def make_map_perobs(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, prealloc=True):
+	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
+	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
+	if inds is None:
+		inds = list(range(comm_all.rank, len(obsinfo), comm_all.size))
+	if prefix is None:
+		prefix = ""
+	ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
+	if prealloc:
+		mapmaking.setup_buffers(dev, ntot_max)
+	# Map indivdual tods
+	for ind in inds:
+		subinfo = obsinfo[ind:ind+1]
+		id      = subinfo.id[0]
+		subpre  = prefix + id.replace(":","_") + "_"
+		L.print("Mapping %4d/%d %s" % (ind+1,nfile,id))
+		make_map(mapmaker, loader, subinfo, mpi.COMM_SELF, prefix=subpre, dump=dump, maxiter=args.maxiter, prealloc=False)
+
+def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
+	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case
+	ntot = ndet*nsamp.
+
+	Pre-allocation isn't really necessary,
+	but automatically growing the buffers has some overhead, and I've unexpectedly
+	run out of memory when not doing this. This should be investigated futher.
+
+	This function will need to be updated if which memory pools are used is changed."""
+	# These are the big ones
+	ctype = utils.complex_dtype(dtype)
+	ftot = ntot//2 + ndet_guess
+	dev.pools["pointing"]   .empty((3, ntot), dtype=dtype)
+	dev.pools["tod"]        .empty(ntot, dtype=dtype)
+	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
+	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
+	# The remaining are:
+	# * plan
+	# * cut
+	# * sky_iwork
+	# * sky_owork
+	# * nmat_work
+	# We don't have good estimates for these, so we don't pre-allocate them.
+	# But they should be small
 
 # Zippers
 # These package our degrees of freedomf or the CG solver

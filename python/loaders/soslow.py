@@ -19,17 +19,18 @@ class SotodlibLoader:
 		info     = self.context.obsdb.query("type='obs' and az_center is not null")
 		iinds, oinds = utils.common_inds([info["obs_id"], obs_ids])
 		# Build obsinfo for these ids
-		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
+		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(4,2))]
 		obsinfo = np.zeros(len(oinds), dtype).view(np.recarray)
 		obsinfo.id    = subids[oinds]
-		obsinfo.ndet  = 1000 # no simple way to get this :(
+		obsinfo.ndet  = utils.dict_lookup(flavor_ndets_per_band, info["tube_flavor"][iinds])
 		obsinfo.nsamp = info["n_samples"][iinds]
 		obsinfo.ctime = info["start_time"][iinds]
 		obsinfo.dur   = info["stop_time"][iinds]-info["start_time"][iinds]
-		# How come the parts that have to do with pointing.
-		baz0  = info["az_center"][iinds]
-		waz   = info["az_throw" ][iinds]
-		bel0  = info["el_center"][iinds]
+		# Here come the parts that have to do with pointing.
+		# These arrays have a nasty habit of being object dtype
+		obsinfo.baz   = self.info["az_center"][inds].astype(np.float64) * utils.degree
+		obsinfo.bel   = self.info["el_center"][inds].astype(np.float64) * utils.degree
+		obsinfo.waz   = self.info["az_throw" ][inds].astype(np.float64) * utils.degree
 		# Should really have the proper array center, but it's clunky to get this,
 		# and ultimately it doesn't matter
 		#winfo   = get_wafer_info(self.context, info)
@@ -38,7 +39,7 @@ class SotodlibLoader:
 		#pos     = winfo.pos[wind]
 		obsinfo.r = np.full(len(iinds), 1.0*utils.degree)
 		pos       = np.zeros((len(iinds),2))
-		obsinfo.sweep = make_sweep(obsinfo.ctime, baz0, waz, bel0, pos)
+		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
 		return obsinfo
 	def load(self, subid):
 		# Read in and calibrate all our data. This will depend on the
@@ -79,6 +80,10 @@ class SotodlibLoader:
 		return res
 
 # Helpers below
+
+# Hard-coded raw wafer detector counts per band. Independent of
+# telescope type, etc.
+flavor_ndets_per_band = {"lf":118, "mf": 864, "uhf": 864}
 
 def get_wafer_info(context, obs_info):
 	ref_obs = find_ref_obs(obs_info["obs_id"])

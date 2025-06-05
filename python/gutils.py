@@ -1,6 +1,6 @@
 import time, contextlib
 import numpy as np
-from pixell import utils
+from pixell import utils, colors
 from . import device
 from .logging import L
 
@@ -57,7 +57,7 @@ def leakcheck(dev, msg):
 		dev.garbage_collect()
 		t2 = dev.time()
 		m2 = dev.memuse()
-		L.print("leak %8.4f MB %s" % ((m2-m1)/1024**2, msg), level=2)
+		L.print("%sleak %8.4f MB %s%s" % (colors.lbrown, (m2-m1)/1024**2, msg, colors.reset), level=2)
 
 def legbasis(order, n, ap=np):
 	x   = ap.linspace(-1, 1, n, dtype=np.float32)
@@ -252,3 +252,126 @@ def detdup_cuts(cuts, ndet, ndup):
 	for i in range(ndup):
 		ocut[i*ncut:(i+1)*ncut,0] += i*ndet
 	return ocuts
+
+# I originally wrote this for sotodlib
+def parse_recentering(desc):
+	"""Parse an object centering description, as provided by the --center-at argument.
+	The format is [from=](ra:dec|name),[to=(ra:dec|name)],[up=(ra:dec|name|system)]
+	from: specifies which point is to be centered. Given as either
+	  * a ra:dec pair in degrees
+	  * the name of a pre-defined celestial object (e.g. Saturn), which should not move
+	    appreciably in celestial coordinates during a TOD
+	to: the point at which to recenter. Optional. Given as either
+	  * a ra:dec pair in degrees
+	  * the name of a pre-defined celestial object
+	  Defaults to ra=0,dec=0 or ra=0,dec=90, depending on the projection
+	up: which direction should point up after recentering. Optional. Given as either
+	  * the name of a coordinate system (e.g. hor, cel, gal), in which case
+	    up will point towards the north pole of that system
+	  * a ra:dec pair in degrees
+	  * the name of a pre-defined celestial object
+	  Defualts to the celestial north pole
+	
+	Returns "info", a bunch representing the recentering specification in more python-friendly
+	terms. This can later be passed to evaluate_recentering to get the actual euler angles that perform
+	the recentering.
+	
+	Examples:
+	  * 120.2:-13.8
+	    Centers on ra = 120.2°, dec = -13.8°, with up being celestial north
+	  * Saturn
+	    Centers on Saturn, with up being celestial north
+	  * Uranus,up=hor
+	    Centers on Uranus, but up is up in horizontal coordinates. Appropriate for beam mapping
+	  * Uranus,up=hor,to=0:90
+	    As above, but explicitly recenters on the north pole
+	"""
+	# If necessary the syntax above could be extended with from_sys, to_sys and up-sys, which
+	# so one could specify galactic coordiantes for example. Or one could generalize
+	# from ra:dec to phi:theta[:sys], where sys would default to cel. But for how I think
+	# this is enough.
+	args = desc.split(",")
+	info  = {"to":"auto", "up":"cel", "from_sys":"cel", "to_sys":"cel", "up_sys":"cel"}
+	for ai, arg in enumerate(args):
+		# Split into key,value
+		toks = arg.split("=")
+		if ai == 0 and len(toks) == 1:
+			key, val = "from", toks[0]
+		elif len(toks) == 2:
+			key, val = toks
+		else:
+			raise ValueError("parse_recentering wants key=value format, but got %s" % (arg))
+		# Handle the values
+		if ":" in val:
+			val = [float(w)*utils.degree for w in val.split(":")]
+		info[key] = val
+	if "from" not in info:
+		raise ValueError("parse_recentering needs at least the from argument")
+	return info
+
+def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=120):
+	"""Given an obsinfo as returned by a loader.query(), return the set
+	of contiguous scanning periods in the form [:,{ctime_from,ctime_to}].
+
+	ttol: number of seconds of gap between obs before a new period is started.
+	For LAT scans, one doesn't save space by starting a new period before 2 hours
+	have passed due to the super-wide arcs one scans in. For shorter-scanning
+	surveys, this could be reduced.
+	"""
+	from scipy import ndimage
+	atol = atol/utils.degree
+	info = np.array([obsinfo[a] for a in ["baz", "bel", "waz", "wel", "ctime", "dur"]]).T
+	# Get rid of nan entries
+	bad  = np.any(~np.isfinite(info),1)
+	# get rid of too short tods, since those don't have reliable az bounds
+	bad |= info[:,-1] < mindur
+	info = info[~bad]
+	t1   = info[:,-2]
+	info = info[np.argsort(t1)]
+	# Start, end
+	t1   = info[:,-2]
+	t2   = t1 + info[:,-1]
+	# Remove angle ambiguities
+	info[:,0] = utils.rewind(info[:,0])
+	# How to find jumps:
+	# 1. It's a jump if the scanning changes
+	# 2. It's also a jump if a the interval between tod-ends and tod-starts becomes too big
+	changes    = np.abs(info[1:,:4]-info[:-1,:4])
+	jumps      = np.any(changes > atol,1)
+	jumps      = np.concatenate([[0], jumps]) # from diff-inds to normal inds
+	# Time in the middle of each gap
+	gap_times = np.mean(find_period_gaps(np.array([t1,t2]).T, ttol=ttol),1)
+	gap_inds  = np.searchsorted(t1, gap_times)
+	jumps[gap_inds] = True
+	# raw:  aaaabbbbcccc
+	# diff: 00010001000
+	# 0pre: 000010001000
+	# cum:  000011112222
+	labels  = np.cumsum(jumps)
+	linds   = np.arange(np.max(labels)+1)
+	t1s     = ndimage.minimum(t1, labels, linds)
+	t2s     = ndimage.maximum(t2, labels, linds)
+	# Periods is [nperiod,{start,end}] in ctime. Start is the start of the first tod
+	# in the scanning period. End is the end of the last tod in the scanning period.
+	periods = np.array([t1s, t2s]).T
+	return periods
+
+def find_period_gaps(periods, ttol=60):
+	"""Helper for find_scan_periods. Given the [:,{ctime_from,ctime_to}] for all
+	the individual scans, returns the times at which the gap between the end of
+	a tod and the start of the next is greater than ttol (default 60 seconds)."""
+	# We want to sort these and look for any places
+	# where a to is followed by a from too far away. To to this we need to keep
+	# track of which entries in the combined, sorted array was a from or a to
+	periods = np.asarray(periods)
+	types   = np.zeros(periods.shape, int)
+	types[:,1] = 1
+	types   = types.reshape(-1)
+	ts      = periods.reshape(-1)
+	order   = np.argsort(ts)
+	ts, types = ts[order], types[order]
+	# Now look for jumps
+	jumps = np.where((ts[1:]-ts[:-1] > ttol) & (types[1:]-types[:-1] < 0))[0]
+	# We will return the time corresponding to each gap
+	gap_times = np.array([ts[jumps], ts[jumps+1]]).T
+	return gap_times

@@ -23,34 +23,53 @@ class SoFastLoader:
 		obs_ids, wafs, bands = mapmaking.split_subids(subids)
 		inds     = utils.find(self.info["obs_id"], obs_ids)
 		# Build obsinfo for these ids
-		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
+		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(4,2))]
 		obsinfo       = np.zeros(len(inds), dtype).view(np.recarray)
 		obsinfo.id    = subids
-		obsinfo.ndet  = 1000 # no simple way to get this :(
+		# The maximum number of detectors we could get. The real number
+		# will be lower due to cuts, but that info isn't efficiently
+		# available.
+		obsinfo.ndet  = utils.dict_lookup(flavor_ndets_per_band, self.info["tube_flavor"][inds])
 		obsinfo.nsamp = self.info["n_samples"][inds]
 		obsinfo.ctime = self.info["start_time"][inds]
 		obsinfo.dur   = self.info["stop_time"][inds]-self.info["start_time"][inds]
-		# How come the parts that have to do with pointing.
+		# Here come the parts that have to do with pointing.
 		# These arrays have a nasty habit of being object dtype
-		baz0  = self.info["az_center"][inds].astype(np.float64)
-		waz   = self.info["az_throw" ][inds].astype(np.float64)
-		bel0  = self.info["el_center"][inds].astype(np.float64)
+		obsinfo.baz   = self.info["az_center"][inds].astype(np.float64) * utils.degree
+		obsinfo.bel   = self.info["el_center"][inds].astype(np.float64) * utils.degree
+		obsinfo.waz   = self.info["az_throw" ][inds].astype(np.float64) * utils.degree
+		# Restrict to valid values
+		good    = np.all([np.isfinite(obsinfo[a]) for a in ["ctime","dur","baz","bel","waz","wel"]],0)
+		obsinfo, subids, inds, wafs, bands = [a[good] for a in [obsinfo, subids, inds, wafs, bands]]
 		# Need the rough pointing for each observation. This isn't
 		# directly available in the obsid. We will assume that each wafer-slot
 		# has approximately constant pointing offsets.
-		# 1. Find a reference subid for each wafer slot
-		ref_ids, order, edges = get_ref_subids(subids)
+		# 1. Find a reference subid for each tube-wslot
+		tub_waf_band = [self.info["telescope"][inds],self.info["tube_slot"][inds], wafs, bands]
+		tag = utils.label_multi(tub_waf_band)
+		uvals, order, edges = utils.find_equal_groups_fast(tag)
 		wafer_centers = np.zeros((len(subids),2))
-		wafer_rads    = np.zeros((len(subids)))
-		for ri, ref_id in enumerate(ref_ids):
+		wafer_rads    = np.zeros(len(subids))
+		good          = np.zeros(len(subids),bool)
+		for gi in range(len(uvals)):
+			ginds  = order[edges[gi]:edges[gi+1]]
+			ref_ind= ginds[0]
+			ref_id = subids[ref_ind]
 			# 2. Get the focal plane offsets for this subid
-			focal_plane = get_focal_plane(self.fast_meta, ref_id)
-			mid, rad    = get_fplane_extent(focal_plane)
-			wafer_centers[order[edges[ri]:edges[ri+1]]] = mid
-			wafer_rads   [order[edges[ri]:edges[ri+1]]] = rad
+			try:
+				focal_plane = get_focal_plane(self.fast_meta, ref_id)
+				mid, rad    = get_fplane_extent(focal_plane)
+				wafer_centers[ginds] = mid
+				wafer_rads   [ginds] = rad
+				good         [ginds] = True
+			except KeyError:
+				# This happens for wafers with no focal plane information
+				print("warning: no focal plane info for %s:%s:%s:%s" % tuple([a[ref_ind] for a in tub_waf_band]))
+		# Final prune
+		obsinfo, wafer_centers, wafer_rads = [a[good] for a in [obsinfo, wafer_centers, wafer_rads]]
 		# Fill in the last entries in obsinfo
 		obsinfo.r     = wafer_rads
-		obsinfo.sweep = make_sweep(obsinfo.ctime, baz0, waz, bel0, wafer_centers)
+		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
 		return obsinfo
 	def load(self, subid):
 		try:
@@ -143,14 +162,19 @@ class FastMeta:
 					core.OffsetAxis("samps", count=pl.samps[0], offset=pl.samps[1]))
 			# A bit awkward to time the time taken in the initialization
 			bench.add("fm_prep_loader", time.time()-t1)
-			#bench.print("prep_loader")
-			with bench.mark("fm_relcal"):
-				paman.wrap("relcal", pl.read("lpf_sig_run1/relcal","d"), [(0,"dets")])
-			with bench.mark("fm_hwp_angle"):
-				paman.wrap("hwp_angle", pl.read("hwp_angle/hwp_angle","s"), [(0,"samps")])
-			with bench.mark("fm_hwpss"):
-				# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
-				paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
+
+			print("FIXME skipping relcal read")
+			#with bench.mark("fm_relcal"):
+			#	paman.wrap("relcal", pl.read("lpf_sig_run1/relcal","d"), [(0,"dets")])
+
+			# Need a better way to determine if hwp should be present or not
+			has_hwp = "hwp_angle" in pl.group
+			if has_hwp:
+				with bench.mark("fm_hwp_angle"):
+					paman.wrap("hwp_angle", pl.read("hwp_angle/hwp_angle","s"), [(0,"samps")])
+				with bench.mark("fm_hwpss"):
+					# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
+					paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
 			with bench.mark("fm_cuts"):
 				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags"), [(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_2pi", read_cuts(pl, "jumps_2pi/jump_flag"),[(0,"dets"),(1,"samps")])
@@ -195,9 +219,16 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 		("timestamps","signal/times"),
 		("az",        "ancil/az_enc"),
 		("el",        "ancil/el_enc"),
-		("roll",      "ancil/boresight_enc")]):
+		# FIXME: These have the same name for now, should revisit this
+		# when I figure out how they work
+		("roll",      "ancil/boresight_enc", "?"),
+		("roll",      "ancil/corotator_enc", "?")]):
 	import fast_g3
 	if alloc is None: alloc = fast_g3.DummyAlloc()
+	# Add "!", for mandatory field, to any field that doesn't have
+	# the third entry present
+	def field_pad(f): return (f[0],f[1],"!") if len(f)==2 else f
+	fields = [field_pad(f) for f in fields]
 	aman   = core.AxisManager(detax, sampax)
 	fnames = [finfo[0]          for finfo in finfos]
 	nsamps = [finfo[2]-finfo[1] for finfo in finfos]
@@ -206,10 +237,11 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 	with fast_g3.open_multi(fnames, samps=samps, file_nsamps=nsamps) as ifile:
 		fdets = ifile.fields["signal/data"].names
 		rows  = utils.find(fdets, aman.dets.vals)
-		for oname, iname in fields:
+		active_fields = [f for f in fields if f[2]=="!" or f[1] in ifile.fields]
+		for oname, iname, _ in active_fields:
 			ifile.queue(iname, rows=rows)
 		for fi, data in enumerate(ifile.read()):
-			for oname, iname in fields:
+			for oname, iname, _ in active_fields:
 				chunk = data[iname]
 				# Set up output if necessary
 				if fi == 0:
@@ -230,7 +262,8 @@ def calibrate(data, meta, dev=None):
 	# Go to a fourier-friendly length
 	mul   = 32
 	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=[2,3,5,7])*mul
-	timestamps, signal, cuts, az, el, roll, hwp_angle = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el,data.roll,meta.aman.hwp_angle]]
+	timestamps, signal, cuts, az, el, roll = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el,data.roll]]
+	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None
 
 	with bench.mark("ctime"):
 		ctime   = timestamps * meta.timestamp_to_ctime
@@ -247,15 +280,31 @@ def calibrate(data, meta, dev=None):
 	with bench.mark("signal → float32", tfun=dev.time):
 		signal  = dev.pools["tod"].empty(signal.shape, np.float32)
 		signal[:] = signal_
-	with bench.mark("calibrate", tfun=dev.time):
+
+	print("FIXME doing manual relcal")
+	with bench.mark("calibrate_manual", tfun=dev.time):
 		# Calibrate to CMB µK
-		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] * meta.aman.relcal[:,None]
+		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
+		relcal  = common_mode_calibrate(signal, dev=dev)
+		signal *= relcal[:,None]
+
+	print("FIXME deprojecting el")
+	with bench.mark("calibrate_manual", tfun=dev.time):
+		elrange = utils.minmax(el[::100])
+		if elrange[1]-elrange[0] > 1*utils.arcmin:
+			deproject_cosel(signal, el, dev=dev)
+
+	#with bench.mark("calibrate", tfun=dev.time):
+	#	# Calibrate to CMB µK
+	#	phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] * meta.aman.relcal[:,None]
+	#	signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
-	with bench.mark("subtract_hwpss", tfun=dev.time):
-		nmode = 16
-		signal = subtract_hwpss(signal, hwp_angle, meta.aman.hwpss_coeffs[:,:nmode]*phase_to_cmb, dev=dev)
+	if hwp_angle is not None:
+		with bench.mark("subtract_hwpss", tfun=dev.time):
+			nmode = 16
+			signal = subtract_hwpss(signal, hwp_angle, meta.aman.hwpss_coeffs[:,:nmode]*phase_to_cmb, dev=dev)
 	# Deglitching. Measure the values v1,v2 at the edge of
 	# each cut region. Subtract v2-v1 from everything following the cut, and fill the cut
 	# with v1
@@ -368,6 +417,10 @@ def calibrate(data, meta, dev=None):
 # Helpers below #
 #################
 
+# Hard-coded raw wafer detector counts per band. Independent of
+# telescope type, etc.
+flavor_ndets_per_band = {"lf":118, "mf": 864, "uhf": 864}
+
 # smurf: detset → channels, detset → wafer slot
 # assignment: channels → detectors
 # obsfiledb: obsid → detset
@@ -429,9 +482,16 @@ class DetCache:
 		"""Read in the det lists for obsid, if necessary."""
 		if obsid in self.done and not force: return
 		for dset in self.obsfiledb.get_detsets(obsid):
-			sinfo = self.smurf_info.get(dset)
-			ainfo = self.ass_info  .get(dset)
+			try:
+				sinfo = self.smurf_info.get(dset)
+				ainfo = self.ass_info  .get(dset)
+			except KeyError:
+				print("warning: dset %s missing" % dset)
+				# Some wafers may be missing
+				continue
 			# split dets into bands
+			# TODO: Should split cache into
+			# (obsid,wslot) → detset and (detset,band) → detinfo
 			for band, inds in split_bands(ainfo.dets):
 				subid = "%s:%s:%s" % (obsid, sinfo.wslot, band)
 				self.cache[subid] = bunch.Bunch(
@@ -459,12 +519,21 @@ class FplaneCache:
 		self.fname = fname
 		self.index = {}
 		with sqlite.open(fname) as sfile:
-			query = "select [dets:stream_id], [obs:timestamp__lo], [obs:timestamp__hi], files.name, dataset from map inner join files on file_id = files.id"
-			# Wafer here is e.g. ufm_mv15, not the wafer slot (w.g. ws0)
-			for wafer_name, t1, t2, hfname, gname in sfile.execute(query):
-				if wafer_name not in self.index:
-					self.index[wafer_name] = []
-				self.index[wafer_name].append((t1,t2,hfname,gname))
+			# Bleh, why is the format inconsistent?
+			if "[obs:timestamp__lo]" in sfile.columns("map"):
+				query = "select [dets:stream_id], [obs:timestamp__lo], [obs:timestamp__hi], files.name, dataset from map inner join files on file_id = files.id"
+				# Wafer here is e.g. ufm_mv15, not the wafer slot (w.g. ws0)
+				for wafer_name, t1, t2, hfname, gname in sfile.execute(query):
+					if wafer_name not in self.index:
+						self.index[wafer_name] = []
+					self.index[wafer_name].append((t1,t2,hfname,gname))
+			else:
+				query = "select [dets:stream_id], files.name, dataset from map inner join files on file_id = files.id"
+				# Wafer here is e.g. ufm_mv15, not the wafer slot (w.g. ws0)
+				for wafer_name, hfname, gname in sfile.execute(query):
+					if wafer_name not in self.index:
+						self.index[wafer_name] = []
+					self.index[wafer_name].append((-np.inf,np.inf,hfname,gname))
 		# The cache for the actual focal plane structures
 		self.fp_cache = {}
 	def find_entry(self, wafer_name, t):
@@ -746,7 +815,11 @@ class PrepLoader:
 
 def get_precfile(indexdb, subid):
 	obsid, wslot, band = subid.split(":")
-	query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot], [dets:wafer.bandpass] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' AND [dets:wafer.bandpass] = '%s' LIMIT 1;" % (obsid, wslot, band)
+	# Inconsistent format here too
+	if "[dets:wafer.bandpass]" in indexdb.columns("map"):
+		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot], [dets:wafer.bandpass] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' AND [dets:wafer.bandpass] = '%s' LIMIT 1;" % (obsid, wslot, band)
+	else:
+		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' LIMIT 1;" % (obsid, wslot)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in preprocess index" % subid)
 	return os.path.dirname(indexdb.fname) + "/" + fname, gname
@@ -761,7 +834,7 @@ def get_dcalfile(indexdb, subid):
 def get_matchfile(indexdb, detset):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:detset] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:detset] = '%s' LIMIT 1;" % (detset)
 	try: fname, gname = next(indexdb.execute(query))[:2]
-	except StopIteration: raise KeyError("%s not found in det match index" % subid)
+	except StopIteration: raise KeyError("%s not found in det match index" % detset)
 	return os.path.dirname(indexdb.fname) + "/" + fname, gname
 
 def get_smurffile(indexdb, detset):
@@ -786,8 +859,9 @@ def get_pointing_model(fname):
 
 def cmeta_lookup(cmeta, name):
 	for entry in cmeta:
-		if "label" in entry and entry["label"] == name:
-			return entry["db"]
+		for key in ["label", "name"]: # both not standardized?
+			if key in entry and entry[key] == name:
+				return entry["db"]
 
 def read_wiring_status(fname, parse=True):
 	for frame in fast_g3.get_header_frames(fname)["frames"]:
@@ -855,6 +929,19 @@ def apply_pointing_model(az, el, roll, model):
 		q_hor_fix   = q_base_tilt * q_hor_raw * q_fp_off * ~q_fp_rot * quat.euler(2,roll) * q_fp_rot
 		az, el, roll= quat.decompose_lonlat(q_hor_fix)
 		az         *= -1
+	elif model.version == "lat_naive":
+		# The corotator angle. roll itself has already had its sign flipped
+		roll += el - 60*utils.degree
+	elif model.version == "lat_test1":
+		az   += model.enc_offset_az
+		el   += model.enc_offset_el
+		roll -= model.enc_offset_boresight
+		roll += el - 60*utils.degree
+		q_fp_off    = quat.rotation_xieta(model.fp_offset_xi0, model.fp_offset_eta0)
+		q_hor_raw   = quat.rotation_lonlat(-az,el)
+		q_hor_fix   = q_hor_raw * q_fp_off * quat.euler(2,roll)
+		az, el, roll= quat.decompose_lonlat(q_hor_fix)
+		az         *= -1
 	else: raise ValueError("Unrecognized model '%s'" % str(model.version))
 	return az, el, roll
 
@@ -877,3 +964,53 @@ def deslope(signal, w=10, inplace=False, dev=None):
 	v2 = dev.np.mean(signal[:,-w:],1)
 	x  = dev.np.linspace(0, 1, signal.shape[1], dtype=signal.dtype)
 	return detwise_axb(signal, x, v2-v1, v1, tod_mul=1, abmul=-1, dev=dev, inplace=True)
+
+def common_mode_calibrate(signal, bsize=80, down=20, dev=None):
+	ndet, nsamp = signal.shape
+	if dev is None: dev = device.get_device()
+	# downgrade to reduce noise, then median to reduce impact of glitches
+	dsig = dev.np.median(dev.np.mean(signal[:,:nsamp//bsize//down*bsize*down].reshape(ndet,-1,bsize,down),-1),-1)
+	# Find the strongest eigenmode
+	cov  = dev.np.cov(dev.np.diff(dsig,axis=-1))
+	# Initial normalization, to avoid single detectors dominating
+	g1   = dev.np.diag(cov)**0.5
+	cov /= g1[:,None]
+	cov /= g1[None,:]
+	# Find the strongest eigenvector
+	E, V = dev.np.linalg.eigh(cov)
+	g2   = V[:,-1]
+	# Normalize to be mostly positive and have a mean of 1
+	g2  /= dev.np.mean(g2)
+	# We want to be able to apply the calibration by multiplying
+	gtot = 1/g1/g2
+	return gtot
+
+# This isn't robust to glitches. Should use a block-median or something
+# if that's a problem
+def deproject_cosel(signal, el, nmode=2, dev=None):
+	ndet, nsamp = signal.shape
+	if dev is None: dev = device.get_device()
+	# Sky signal should go as 1/cos(el)
+	depth = 1/dev.np.cos(dev.np.asarray(el, dtype=signal.dtype))
+	# Build a basis
+	depth -= dev.np.mean(depth)
+	B   = dev.np.zeros((nmode,nsamp),signal.dtype)
+	def nmat(x):
+		fx = dev.lib.rfft(x)
+		fx[...,:100] = 0
+		return dev.lib.irfft(fx, x.copy())
+	for i in range(nmode): B[i] = depth**(i+1)
+	rhs = dev.np.einsum("mi,di->md",B,nmat(signal))
+	div = dev.np.einsum("mi,ni->mn",B,nmat(B))
+	print("div")
+	print(dev.get(div))
+	idiv   = dev.np.linalg.inv(div)
+	coeffs = idiv.dot(rhs)
+	print(dev.get(coeffs))
+	# Subtract the el-dependent parts. signal = -coeffs.T matmul B + signal
+	# But fortran is column-major, so it's -coeffs
+	print(dev.np.std(signal))
+	#utils.call_help(dev.lib.sgemm, "N", "N", nsamp, ndet, nmode, -1, B, B.shape[1], coeffs, coeffs.shape[1], 1, signal, signal.shape[1])
+	signal -= dev.np.einsum("md,mi->di", coeffs, B)
+
+	print(dev.np.std(signal))

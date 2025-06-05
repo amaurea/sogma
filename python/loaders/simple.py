@@ -28,6 +28,7 @@ class SimpleLoader:
 # Helpers below
 
 def read_obsinfo(fname, nmax=None):
+	# FIXME: Currently missing baz, bel and waz. Not present in current text files
 	dtype = [("path","U256"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
 	info  = np.loadtxt(fname, dtype=dtype, max_rows=nmax, ndmin=1).view(np.recarray)
 	ids   = np.char.rpartition(np.char.rpartition(info.path,"/")[:,2],".")[:,0]

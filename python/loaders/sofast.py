@@ -14,7 +14,7 @@ class SoFastLoader:
 		self.fast_meta = FastMeta(self.config, self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
-	def query(self, query=None, wafers=None, bands=None):
+	def query(self, query=None, wafers=None, bands=None, sweeps=False):
 		# wafers and bands should ideally be a part of the query!
 		from sotodlib import mapmaking
 		subids = mapmaking.get_subids(query, context=self.context)
@@ -38,38 +38,40 @@ class SoFastLoader:
 		obsinfo.baz   = self.info["az_center"][inds].astype(np.float64) * utils.degree
 		obsinfo.bel   = self.info["el_center"][inds].astype(np.float64) * utils.degree
 		obsinfo.waz   = self.info["az_throw" ][inds].astype(np.float64) * utils.degree
+		obsinfo.r     = 1.0*utils.degree # default value
 		# Restrict to valid values
 		good    = np.all([np.isfinite(obsinfo[a]) for a in ["ctime","dur","baz","bel","waz","wel"]],0)
 		obsinfo, subids, inds, wafs, bands = [a[good] for a in [obsinfo, subids, inds, wafs, bands]]
-		# Need the rough pointing for each observation. This isn't
-		# directly available in the obsid. We will assume that each wafer-slot
-		# has approximately constant pointing offsets.
-		# 1. Find a reference subid for each tube-wslot
-		tub_waf_band = [self.info["telescope"][inds],self.info["tube_slot"][inds], wafs, bands]
-		tag = utils.label_multi(tub_waf_band)
-		uvals, order, edges = utils.find_equal_groups_fast(tag)
-		wafer_centers = np.zeros((len(subids),2))
-		wafer_rads    = np.zeros(len(subids))
-		good          = np.zeros(len(subids),bool)
-		for gi in range(len(uvals)):
-			ginds  = order[edges[gi]:edges[gi+1]]
-			ref_ind= ginds[0]
-			ref_id = subids[ref_ind]
-			# 2. Get the focal plane offsets for this subid
-			try:
-				focal_plane = get_focal_plane(self.fast_meta, ref_id)
-				mid, rad    = get_fplane_extent(focal_plane)
-				wafer_centers[ginds] = mid
-				wafer_rads   [ginds] = rad
-				good         [ginds] = True
-			except KeyError:
-				# This happens for wafers with no focal plane information
-				print("warning: no focal plane info for %s:%s:%s:%s" % tuple([a[ref_ind] for a in tub_waf_band]))
-		# Final prune
-		obsinfo, wafer_centers, wafer_rads = [a[good] for a in [obsinfo, wafer_centers, wafer_rads]]
-		# Fill in the last entries in obsinfo
-		obsinfo.r     = wafer_rads
-		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
+		if sweeps:
+			# This fills in obsinfo.r and obsinfo.sweep, but it's
+			# relatively slow (1-3 s) and assumes time-independent pointing offsets
+			# (probably fine); but most importantly, I don't use it currently.
+			# 1. Find a reference subid for each tube-wslot
+			tub_waf_band = [self.info["telescope"][inds],self.info["tube_slot"][inds], wafs, bands]
+			tag = utils.label_multi(tub_waf_band)
+			uvals, order, edges = utils.find_equal_groups_fast(tag)
+			wafer_centers = np.zeros((len(subids),2))
+			wafer_rads    = np.zeros(len(subids))
+			good          = np.zeros(len(subids),bool)
+			for gi in range(len(uvals)):
+				ginds  = order[edges[gi]:edges[gi+1]]
+				ref_ind= ginds[0]
+				ref_id = subids[ref_ind]
+				# 2. Get the focal plane offsets for this subid
+				try:
+					focal_plane = get_focal_plane(self.fast_meta, ref_id)
+					mid, rad    = get_fplane_extent(focal_plane)
+					wafer_centers[ginds] = mid
+					wafer_rads   [ginds] = rad
+					good         [ginds] = True
+				except KeyError:
+					# This happens for wafers with no focal plane information
+					print("warning: no focal plane info for %s:%s:%s:%s" % tuple([a[ref_ind] for a in tub_waf_band]))
+			# Final prune
+			obsinfo, wafer_centers, wafer_rads = [a[good] for a in [obsinfo, wafer_centers, wafer_rads]]
+			# Fill in the last entries in obsinfo
+			obsinfo.r     = wafer_rads
+			obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
 		return obsinfo
 	def load(self, subid):
 		try:
@@ -289,10 +291,10 @@ def calibrate(data, meta, dev=None):
 		relcal  = common_mode_calibrate(signal, dev=dev)
 		signal *= relcal[:,None]
 
-	print("FIXME deprojecting el")
 	with bench.mark("calibrate_manual", tfun=dev.time):
 		elrange = utils.minmax(el[::100])
 		if elrange[1]-elrange[0] > 1*utils.arcmin:
+			print("FIXME deprojecting el")
 			deproject_cosel(signal, el, dev=dev)
 
 	#with bench.mark("calibrate", tfun=dev.time):
@@ -370,7 +372,8 @@ def calibrate(data, meta, dev=None):
 		# I can't find an efficient way to do this. BLAS can't
 		# do it since it's a triple multiplication. Hopefully the
 		# gpu won't have trouble with it
-		ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
+		with dev.pools["pointing"].as_allocator():
+			ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
 	# Back to real space
 	with bench.mark("ifft", tfun=dev.time):
 		dev.lib.irfft(ftod, signal)
@@ -962,25 +965,27 @@ def deslope(signal, w=10, inplace=False, dev=None):
 	if not inplace: signal = signal.copy()
 	v1 = dev.np.mean(signal[:, :w],1)
 	v2 = dev.np.mean(signal[:,-w:],1)
-	x  = dev.np.linspace(0, 1, signal.shape[1], dtype=signal.dtype)
+	with dev.pools["pointing"].as_allocator():
+		x  = dev.np.linspace(0, 1, signal.shape[1], dtype=signal.dtype)
 	return detwise_axb(signal, x, v2-v1, v1, tod_mul=1, abmul=-1, dev=dev, inplace=True)
 
 def common_mode_calibrate(signal, bsize=80, down=20, dev=None):
 	ndet, nsamp = signal.shape
 	if dev is None: dev = device.get_device()
-	# downgrade to reduce noise, then median to reduce impact of glitches
-	dsig = dev.np.median(dev.np.mean(signal[:,:nsamp//bsize//down*bsize*down].reshape(ndet,-1,bsize,down),-1),-1)
-	# Find the strongest eigenmode
-	cov  = dev.np.cov(dev.np.diff(dsig,axis=-1))
-	# Initial normalization, to avoid single detectors dominating
-	g1   = dev.np.diag(cov)**0.5
-	cov /= g1[:,None]
-	cov /= g1[None,:]
-	# Find the strongest eigenvector
-	E, V = dev.np.linalg.eigh(cov)
-	g2   = V[:,-1]
-	# Normalize to be mostly positive and have a mean of 1
-	g2  /= dev.np.mean(g2)
+	with dev.pools["pointing"].as_allocator():
+		# downgrade to reduce noise, then median to reduce impact of glitches
+		dsig = dev.np.median(dev.np.mean(signal[:,:nsamp//bsize//down*bsize*down].reshape(ndet,-1,bsize,down),-1),-1)
+		# Find the strongest eigenmode
+		cov  = dev.np.cov(dev.np.diff(dsig,axis=-1))
+		# Initial normalization, to avoid single detectors dominating
+		g1   = dev.np.diag(cov)**0.5
+		cov /= g1[:,None]
+		cov /= g1[None,:]
+		# Find the strongest eigenvector
+		E, V = dev.np.linalg.eigh(cov)
+		g2   = V[:,-1]
+		# Normalize to be mostly positive and have a mean of 1
+		g2  /= dev.np.mean(g2)
 	# We want to be able to apply the calibration by multiplying
 	gtot = 1/g1/g2
 	return gtot

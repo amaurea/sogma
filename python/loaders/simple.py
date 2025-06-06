@@ -10,7 +10,7 @@ class SimpleLoader:
 		self.dev     = dev or device.get_device()
 		self.lookup  = {id:i for i,id in enumerate(self.obsinfo.id)}
 		self.mul     = mul
-	def query(self, query=None, wafers=None, bands=None):
+	def query(self, query=None, wafers=None, bands=None, sweeps=False):
 		if query or wafers or bands: raise NotImplementedError
 		return self.obsinfo
 	def load(self, id):

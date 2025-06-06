@@ -515,7 +515,7 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 			if signal.output:
 				signal.write(prefix, "map", val)
 
-def make_map_perobs(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, prealloc=True):
+def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefix=None, dump=[], maxiter=500, prealloc=True):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
 	if inds is None:
@@ -523,15 +523,58 @@ def make_map_perobs(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dum
 	if prefix is None:
 		prefix = ""
 	ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
-	if prealloc:
-		mapmaking.setup_buffers(dev, ntot_max)
+	if prealloc: setup_buffers(mapmaker.dev, ntot_max)
 	# Map indivdual tods
 	for ind in inds:
 		subinfo = obsinfo[ind:ind+1]
 		id      = subinfo.id[0]
 		subpre  = prefix + id.replace(":","_") + "_"
 		L.print("Mapping %4d/%d %s" % (ind+1,nfile,id))
-		make_map(mapmaker, loader, subinfo, mpi.COMM_SELF, prefix=subpre, dump=dump, maxiter=args.maxiter, prealloc=False)
+		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, prealloc=False)
+
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dump=[], maxiter=500, fullinfo=None, prealloc=True):
+	# Find scanning periods. We want to base this on the full
+	# set of observations, so depth-1 maps cover consistent periods
+	# even if 
+	from pixell import bench
+	if prefix   is None: prefix = ""
+	if fullinfo is None: fullinfo = loader.query()
+	periods = gutils.find_scan_periods(fullinfo)
+	# Which period each obs belongs to
+	pinds   = utils.find_range(periods, obsinfo.ctime+obsinfo.dur/2)
+	# Get rid of observations that don't belong to a period. This shouldn't happen
+	bad = pinds<0
+	if np.any(bad):
+		L.print("Warning: %d obs with no period! %s" % (np.sum(bad), ", ".join(obsinfo.id[bad])), color=colors.red, id=0)
+		obsinfo = obsinfo[~bad]
+		pinds   = pinds  [~bad]
+	# * We could split by band, tube, wafer etc. here, but for now, we will
+	# keep things simple by requiring the user to run the mapmaker separately
+	# for things they want to keep separate. E.g. one run for f090 and one for f150,
+	# just like with the other mapmaking modes.
+	# * How to paralellize? For big runs, there will be many more periods than
+	# obs per period, so one would want to paralellize over periods. But for small
+	# runs it's the other way around. And there's an awkward intermediate regime
+	# where one would want both. Let's do it over periods for now
+	# * period i has obsinds order[edges[i]:edges[i+1]] and trange periods[pids[i]],
+	# which should be the same as periods[i]
+	pids, order, edges = utils.find_equal_groups_fast(pinds)
+	# Set up buffers. We get all the tods we will process to calculate how big
+	# buffers we will need
+	my_pinds   = list(range(comm.rank, len(pids), comm.size))
+	my_obsinds = np.concatenate([order[edges[pind]:edges[pind+1]] for pind in my_pinds])
+	ntot_max   = np.max(obsinfo.ndet[my_obsinds]*obsinfo.nsamp[my_obsinds])
+	if prealloc: setup_buffers(mapmaker.dev, ntot_max)
+	# Finally map each period
+	for pind in my_pinds:
+		pid    = pids[pind]
+		subinfo= obsinfo[order[edges[pind]:edges[pind+1]]]
+		# Name period after starting ctime for now
+		name   = "%10.0f" % periods[pid][0]
+		subpre = prefix + name + "_"
+		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(subinfo)))
+		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, prealloc=False)
+
 
 def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case

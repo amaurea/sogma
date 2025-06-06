@@ -15,7 +15,7 @@ parser.add_argument("-L", "--loader",  type=str, default="auto")
 parser.add_argument("-D", "--device",  type=str, default="auto")
 parser.add_argument("-I", "--maxiter", type=int, default=500)
 parser.add_argument("-@", "--center-at",type=str, default=None)
-parser.add_argument("-i", "--individual", action="store_true")
+parser.add_argument("-m", "--mode",    type=str, default="full")
 parser.add_argument("-a", "--autocrop",   action="store_true")
 args = parser.parse_args()
 
@@ -27,8 +27,11 @@ from pixell import enmap, utils, mpi, colors
 import cupy
 from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
 
+if   args.mode in ["individual","depth1"]: separate = True
+elif args.mode in ["full"]:                separate = False
+else: raise ValueError("Unknown mode '%s'" % (str(args.mode)))
 comm_all   = mpi.COMM_WORLD
-comm_per   = mpi.COMM_SELF if args.individual else mpi.COMM_WORLD
+comm_per   = mpi.COMM_SELF if separate else mpi.COMM_WORLD
 dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
@@ -61,8 +64,10 @@ signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev)
 #mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatUncorr(dev=dev), dev=dev)
 mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_map], dtype=dtype_tod, verbose=True, noise_model=nmat.NmatDebug(dev=dev), dev=dev)
 
-if args.individual:
-	mapmaking.make_map_perobs(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=10, maxiter=args.maxiter)
-else:
-	# Map them all together
+if   args.mode == "full":
 	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=10, maxiter=args.maxiter)
+elif args.mode == "individual":
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=10, maxiter=args.maxiter)
+elif args.mode == "depth1":
+	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=10, maxiter=args.maxiter)
+else: raise ValueError("Unknown mode '%s'" % str(args.mode))

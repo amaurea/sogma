@@ -309,7 +309,7 @@ def parse_recentering(desc):
 		raise ValueError("parse_recentering needs at least the from argument")
 	return info
 
-def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=120):
+def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	"""Given an obsinfo as returned by a loader.query(), return the set
 	of contiguous scanning periods in the form [:,{ctime_from,ctime_to}].
 
@@ -323,7 +323,8 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=120):
 	info = np.array([obsinfo[a] for a in ["baz", "bel", "waz", "wel", "ctime", "dur"]]).T
 	# Get rid of nan entries
 	bad  = np.any(~np.isfinite(info),1)
-	# get rid of too short tods, since those don't have reliable az bounds
+	# Can eliminate too short tods here. We did this in act because those would
+	# have unreliable az bounds, but this isn't an issue with SO
 	bad |= info[:,-1] < mindur
 	info = info[~bad]
 	t1   = info[:,-2]

@@ -118,8 +118,9 @@ class TileDistribution:
 		if pixbox is not None and pixbox == "auto":
 			pixbox = get_pixbounds(lp)
 		self.pixbox = pixbox
+		print("pixbox", pixbox)
 		if pixbox is not None:
-			_, self.pwcs = enmap.crop_geometry(shape, wcs, pixbox=pixbox)
+			_, self.pwcs = enmap.crop_geometry(shape, wcs, pixbox=pixbox, recenter=True)
 		else: self.pwcs = wcs
 		# Set up the work tiling. Would be nice if the
 		# latter could be part of 
@@ -182,27 +183,32 @@ class TileDistribution:
 		argument was passed to the constructor, then this subset
 		of the full map will be output.
 		Does not assume pre = (3,)."""
+		# Set up our output map, which we will copy stuff into
+		pre   = dmap.shape[1:-2]
 		tsize = np.prod(dmap.shape[1:])
-		sbuf = np.ascontiguousarray(dmap[self.ompi.sinds].reshape(-1))
-		rbuf = np.zeros(self.ompi.rtot*tsize, dmap.dtype) if self.ompi.comm.rank == 0 else None
-		rinfo= (self.ompi.rcount*tsize, self.ompi.roffs*tsize)
-		self.ompi.comm.Gatherv(sbuf, (rbuf, rinfo), root=root)
 		if self.ompi.comm.rank == 0:
-			rbuf = rbuf.reshape((-1,)+dmap.shape[1:])
-			omap = np.zeros((self.ompi.onty,self.ompi.ontx)+dmap.shape[1:],dmap.dtype)
-			omap[self.ompi.rinds[0],self.ompi.rinds[1]] = rbuf
-			# Before this we had [nty,ntx,ncomp,y,x].
-			# This moves it to   [ncomp,nty,x,nty,y]
-			#omap = np.moveaxis(omap, (2,3,4), (0,2,4))
-			#omap = omap.reshape(omap.shape[0],omap.shape[1]*omap.shape[2],omap.shape[3]*omap.shape[4])
-			# We have [nty,ntx,...,y,x] and want [...,nty,y,ntx,x]
-			omap = np.moveaxis(omap, (0,1), (-4,-2))
-			omap = omap.reshape(omap.shape[:-4]+(omap.shape[-4]*omap.shape[-3],omap.shape[-2]*omap.shape[-1]))
-			# self.mpi.obox will not have negative values or wrapping issues the way we have
-			# constructed things here
-			(y1,x1),(y2,x2) = self.ompi.obox
-			omap = omap[...,y1:y2,x1:x2]
-			omap = enmap.ndmap(omap, self.pwcs)
+			omap = enmap.zeros(pre+self.ompi.oshape, self.pwcs, dmap.dtype)
+		# Now loop over individual output slabs, receive each, and insert into
+		# the output
+		for i, sub in enumerate(self.ompi.subs):
+			sbuf = np.ascontiguousarray(dmap[sub.sinds].reshape(-1))
+			rbuf = np.zeros(sub.rtot*tsize, dmap.dtype) if sub.comm.rank == 0 else None
+			rinfo= (sub.rcount*tsize, sub.roffs*tsize)
+			sub.comm.Gatherv(sbuf, (rbuf, rinfo), root=root)
+			if self.ompi.comm.rank == 0:
+				rbuf   = rbuf.reshape((-1,)+dmap.shape[1:])
+				submap = np.zeros((sub.onty,sub.ontx)+dmap.shape[1:],dmap.dtype)
+				submap[sub.rinds[0],sub.rinds[1]] = rbuf
+				# We have [nty,ntx,...,y,x] and want [...,nty,y,ntx,x]
+				submap = np.moveaxis(submap, (0,1), (-4,-2))
+				submap = submap.reshape(submap.shape[:-4]+(submap.shape[-4]*submap.shape[-3],submap.shape[-2]*submap.shape[-1]))
+				# sub.obox will not have negative values or wrapping issues the way we have
+				# constructed things here
+				(iy1,ix1),(iy2,ix2) = sub.ibox
+				(oy1,ox1),(oy2,ox2) = sub.obox
+				# Copy over to output map
+				omap[...,oy1:oy2,ox1:ox2] = submap[...,iy1:iy2,ix1:ix2]
+		if self.ompi.comm.rank == 0:
 			return omap
 	@property
 	def oshape(self): return (self.work.ntile,self.ncomp,self.tshape[0],self.tshape[1])
@@ -277,12 +283,52 @@ def build_mpi_info(dist_inds, work_inds, comm):
 
 	return mpi
 
+# What to do when pixbox straddles the x wrap? Tiles no lonager align then.
+# Might be simplest to split into 2 sub-pixboxes in that case, each with
+# its own info. Maybe simplest to just call build_omap_mpi multiple times
+
+
 def build_omap_mpi(shape, wcs, tshape, dist_inds, comm, pixbox=None):
+	if pixbox is None: pixbox = [[0,0],list(shape[-2:])]
+	# * sboxes = split but not wrapped pixboxes. These are directly
+	#   comparable to the input pixbox
+	# * wboxes = also wrapped. These are directly comparable to the full
+	#   pixelization, and will lie inside it
+	sboxes, wboxes = wrap_pixbox(pixbox, shape)
+	ompi = bunch.Bunch(oshape=tuple(pixbox[1]-pixbox[0]), subs=[], comm=comm)
+	for sbox, wbox in zip(sboxes, wboxes):
+		sub = _build_omap_mpi_single(shape, wcs, tshape, dist_inds, comm, pixbox=wbox)
+		sub.obox = sbox-pixbox[0]
+		ompi.subs.append(sub)
+	return ompi
+
+def wrap_pixbox(pixbox, shape):
+	# Find how many wraps we have in each direction
+	sboxes, wboxes = [], []
+	t1 = pixbox[0]//shape
+	t2 = (pixbox[1]-1)//shape+1
+	for ty in range(t1[0],t2[0]):
+		y1 = max(ty*shape[0],pixbox[0,0])
+		y2 = min((ty+1)*shape[0],pixbox[1,0])
+		for tx in range(t1[1],t2[1]):
+			x1 = max(tx*shape[1],pixbox[0,1])
+			x2 = min((tx+1)*shape[1],pixbox[1,1])
+			sbox = np.array([[y1,x1],[y2,x2]])
+			wbox = sbox - [ty*shape[0],tx*shape[1]]
+			sboxes.append(sbox)
+			wboxes.append(wbox)
+	return sboxes, wboxes
+
+def _build_omap_mpi_single(shape, wcs, tshape, dist_inds, comm, pixbox=None):
 	"""Build the information needed to go from the distributed
 	maps to a single enmap on the root node"""
 	if pixbox is None: pixbox = [[0,0],list(shape[-2:])]
 	# 1. Split pixbox into tile fragments consisting of
 	#    [tyx,subpixbox]
+	print("pixbox")
+	print(pixbox)
+	print("shape")
+	print(shape)
 	tinfo    = tile_pixbox(pixbox, tshape)
 	# 2. Wrap tyx to be within nty,ntx
 	tinds    = tinfo.tinds % dist_inds.shape
@@ -305,19 +351,19 @@ def build_omap_mpi(shape, wcs, tshape, dist_inds, comm, pixbox=None):
 	rinds   -= (tinfo.t1 % dist_inds.shape)[:,None]
 	rtot     = np.sum(rcount)
 	# Infer the output geometry we will get after slicing
-	return bunch.Bunch(onty=tinfo.nty, ontx=tinfo.ntx, obox=tinfo.obox, sinds=sinds, scount=scount, rinds=rinds, rcount=rcount, roffs=roffs, rtot=rtot, comm=comm)
+	return bunch.Bunch(onty=tinfo.nty, ontx=tinfo.ntx, ibox=tinfo.ibox, sinds=sinds, scount=scount, rinds=rinds, rcount=rcount, roffs=roffs, rtot=rtot, comm=comm)
 
 def tile_pixbox(pixbox, tshape):
 	pixbox   = np.asarray(pixbox)
 	t1       = pixbox[0]    //tshape
 	t2       = (pixbox[1]-1)//tshape+1
 	nty,ntx  = t2-t1
-	obox     = pixbox - t1*tshape
+	ibox     = pixbox - t1*tshape
 	# Build full list of indices
 	tinds        = np.zeros((nty,ntx,2),int)
 	tinds[:,:,0] = np.arange(t1[0],t2[0])[:,None]
 	tinds[:,:,1] = np.arange(t1[1],t2[1])[None,:]
-	return bunch.Bunch(t1=t1, t2=t2, nty=nty, ntx=ntx, obox=obox, tinds=tinds)
+	return bunch.Bunch(t1=t1, t2=t2, nty=nty, ntx=ntx, ibox=ibox, tinds=tinds)
 
 def infer_fullsky_geometry(shape, wcs):
 	"""Given a cylindrical geometry shape,wcs, return the fullsky geometry
@@ -441,8 +487,8 @@ def get_pixbounds(lp):
 	ycells = np.where(np.sum(hit,1)>0)[0]
 	# Nothing hit?!
 	if len(ycells) == 0: return np.array([[0,0],[1,1]])
-	y1 = ycells[ 0]*64
-	y2 = np.minimum(ycells[-1]*64+1, lp.nypix_global)
+	y1 = ycells[0]*64
+	y2 = np.minimum((ycells[-1]+1)*64, lp.nypix_global)
 	# The x bounds are harder. We don't want a huge stripe across the
 	# sky just because our exposed area straddles the wrapping point.
 	# Start by getting the x-range each x-cell covers

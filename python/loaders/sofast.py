@@ -351,7 +351,8 @@ def calibrate(data, meta, dev=None):
 
 	# 100 ms for this :(
 	with bench.mark("deslope", tfun=dev.time):
-		deslope(signal, w=w, dev=dev, inplace=True)
+		with dev.pools["ft"].as_allocator():
+			deslope(signal, w=w, dev=dev, inplace=True)
 
 	# FFT stuff should definitely be on the gpu. 640 ms
 	with bench.mark("fft", tfun=dev.time):
@@ -960,14 +961,47 @@ def detwise_axb(tod, x, a, b, inplace=False, tod_mul=0, abmul=1, dev=None):
 	dev.lib.sgemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
 	return tod
 
-def deslope(signal, w=10, inplace=False, dev=None):
-	if dev is None: dev = device.get_device()
+def deslope(signal, w=10, inplace=False, n=None, dev=None, return_edges=False):
+	if dev  is None: dev  = device.get_device()
+	if n    is None: n    = signal.shape[-1]
 	if not inplace: signal = signal.copy()
+	# Allow us to work on other arrays than 2d.
+	ishape = signal.shape
+	signal = signal.reshape(-1, signal.shape[-1])
+	# Measure edge values
 	v1 = dev.np.mean(signal[:, :w],1)
-	v2 = dev.np.mean(signal[:,-w:],1)
-	with dev.pools["pointing"].as_allocator():
-		x  = dev.np.linspace(0, 1, signal.shape[1], dtype=signal.dtype)
-	return detwise_axb(signal, x, v2-v1, v1, tod_mul=1, abmul=-1, dev=dev, inplace=True)
+	v2 = dev.np.mean(signal[:,n-w:n],1)
+	if n != signal.shape[-1]:
+		# Avoid paying double cost for uncommon case
+		x = dev.np.zeros(signal.shape[-1], dtype=signal.dtype)
+		x[:n] = dev.np.linspace(0, 1, n, dtype=signal.dtype)
+	else:
+		x = dev.np.linspace(0, 1, n, dtype=signal.dtype)
+	otod = detwise_axb(signal, x, v2-v1, v1, tod_mul=1, abmul=-1, dev=dev, inplace=True)
+	# Restore to original shape
+	otod = otod.reshape(ishape)
+	v1   = v1.reshape(ishape[:-1],v1.shape[-1])
+	v2   = v2.reshape(ishape[:-1],v2.shape[-1])
+	if return_edges: return otod, v1, v2
+	else: return otod
+
+def reslope(signal, v1, v2, inplace=False, n=None, dev=None):
+	if dev  is None: dev  = device.get_device()
+	if n    is None: n    = signal.shape[-1]
+	if not inplace: signal = signal.copy()
+	# Allow us to work on other arrays than 2d.
+	ishape = signal.shape
+	signal = signal.reshape(-1, signal.shape[-1])
+	if n != signal.shape[-1]:
+		# Avoid paying double cost for uncommon case
+		x = dev.np.zeros(signal.shape[-1], dtype=signal.dtype)
+		x[:n] = dev.np.linspace(0, 1, n, dtype=signal.dtype)
+	else:
+		x = dev.np.linspace(0, 1, n, dtype=signal.dtype)
+	otod = detwise_axb(signal, x, v2-v1, v1, tod_mul=1, abmul=1, dev=dev, inplace=True)
+	# Restore to original shape
+	otod = otod.reshape(ishape)
+	return otod
 
 def common_mode_calibrate(signal, bsize=80, down=20, dev=None):
 	ndet, nsamp = signal.shape

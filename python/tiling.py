@@ -114,21 +114,19 @@ class TileDistribution:
 		shape = shape[-2:]
 		self.shape, self.wcs = shape, wcs
 		# Sub-rectangle we're actually interested in.
-		# Used when reducing the map
-		if pixbox is not None and pixbox == "auto":
-			pixbox = get_pixbounds(lp)
+		# Used when reducing the map.
+		if pixbox is not None and utils.streq(pixbox,"auto"):
+			pixbox = get_pixbounds(lp, comm)
 		self.pixbox = pixbox
-		print("pixbox", pixbox)
 		if pixbox is not None:
 			_, self.pwcs = enmap.crop_geometry(shape, wcs, pixbox=pixbox, recenter=True)
 		else: self.pwcs = wcs
 		# Set up the work tiling. Would be nice if the
-		# latter could be part of 
+		# latter could be part of
 		self.work  = bunch.Bunch(lp=lp)
-		self.work.ntile = np.sum(lp.cell_offsets_cpu>=0)
-		self.work.size  = self.work.ntile*self.tsize
-		self.work.cell_offsets = lp.cell_offsets_cpu # alias to avoid annoying name
-		self.work.cell_inds    = self.work.cell_offsets//self.tsize
+		self.work.cell_inds = lp.cell_offsets_cpu//self.tsize
+		self.work.ntile     = np.sum(self.work.cell_inds>=0)
+		self.work.shape     = (self.work.ntile,self.ncomp)+self.tshape
 		# Set up the distributed tile tiling
 		downer    = distribute_global_tiles_exposed_simple(self.work.cell_inds, comm)
 		self.dist = build_dist_tiling(downer, comm, tsize=self.tsize)
@@ -165,6 +163,7 @@ class TileDistribution:
 		if dmap is None: dmap = self.dmap(dtype=wmap.dtype)
 		tshape= dmap.shape[1:]
 		rbuf  = np.zeros((self.mpi.d2w_stot,)+tshape, dmap.dtype)
+		# Problem: d2w_rinds is somehow zero
 		sbuf  = np.ascontiguousarray(wmap[self.mpi.d2w_rinds])
 		rinfo = (self.mpi.d2w_scount*self.tsize, self.mpi.d2w_soffs*self.tsize)
 		sinfo = (self.mpi.d2w_rcount*self.tsize, self.mpi.d2w_roffs*self.tsize)
@@ -207,7 +206,7 @@ class TileDistribution:
 				(iy1,ix1),(iy2,ix2) = sub.ibox
 				(oy1,ox1),(oy2,ox2) = sub.obox
 				# Copy over to output map
-				omap[...,oy1:oy2,ox1:ox2] = submap[...,iy1:iy2,ix1:ix2]
+				omap[...,oy1:oy2,ox1:ox2] += submap[...,iy1:iy2,ix1:ix2]
 		if self.ompi.comm.rank == 0:
 			return omap
 	@property
@@ -217,8 +216,8 @@ class TileDistribution:
 	def dmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.dshape, dtype)
 	def wmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.oshape, dtype)
 	def gwmap(self, buf=None, dtype=np.float32):
-		if buf: arr = buf.zeros(self.work.size, dtype)
-		else:   arr = self.dev.np.zeros(self.work.size, dtype)
+		if buf: arr = buf.zeros(self.work.shape, dtype)
+		else:   arr = self.dev.np.zeros(self.work.shape, dtype)
 		return self.dev.lib.LocalMap(self.work.lp, arr)
 
 def build_dist_tiling(dist_owner, comm, tsize=1):
@@ -228,8 +227,6 @@ def build_dist_tiling(dist_owner, comm, tsize=1):
 	dist.size  = dist.ntile*tsize
 	dist.cell_inds = np.full(dist_owner.shape, -1, dist_owner.dtype)
 	dist.cell_inds[dist.mine] = np.arange(dist.ntile)
-	dist.cell_offsets = np.full(dist_owner.shape, -1, dist_owner.dtype)
-	dist.cell_offsets[dist.mine] = np.arange(dist.ntile)*tsize
 	return dist
 
 def distoff_owners(dmine, comm):
@@ -247,7 +244,7 @@ def build_mpi_info(dist_inds, work_inds, comm):
 	# Build owners
 	mpi   = bunch.Bunch(comm=comm)
 	dmine = dist_inds >= 0
-	wmine = work_inds  >= 0
+	wmine = work_inds >= 0
 	owners= distoff_owners(dmine, comm)
 
 	# We order tiles in buffers in send order
@@ -325,10 +322,6 @@ def _build_omap_mpi_single(shape, wcs, tshape, dist_inds, comm, pixbox=None):
 	if pixbox is None: pixbox = [[0,0],list(shape[-2:])]
 	# 1. Split pixbox into tile fragments consisting of
 	#    [tyx,subpixbox]
-	print("pixbox")
-	print(pixbox)
-	print("shape")
-	print(shape)
 	tinfo    = tile_pixbox(pixbox, tshape)
 	# 2. Wrap tyx to be within nty,ntx
 	tinds    = tinfo.tinds % dist_inds.shape
@@ -338,7 +331,7 @@ def _build_omap_mpi_single(shape, wcs, tshape, dist_inds, comm, pixbox=None):
 	out_inds = dist_inds[oty,otx].reshape(tinfo.nty,tinfo.ntx)
 	mine     = out_inds >= 0
 	sinds    = out_inds[mine]
-	scount   = np.sum(sinds)
+	scount   = len(sinds)
 	# 4. Build the receive info. This is only relevant for the
 	#    root. Find out which cells everybody will send to root.
 	owners   = distoff_owners(dist_inds>=0, comm)
@@ -475,14 +468,19 @@ def owners2rtiles(owners, tys, txs):
 	for ty,tx in zip(tys,txs):
 		if owners[ty,tx] >= 0:
 			yxlist[owners[ty,tx]].append((ty,tx))
-	# 3. Flatten. The reshape ensures that things
-	#    work even if the list is empty
+	# We could end up with some tasks owning nothing.
+	# This isn't ideal in general, but we should at least
+	# make sure it doesn't crash by turning them into correct-
+	# shaped 0-size arrays
+	yxlist = [np.array(a, dtype=np.int32).reshape(-1,2) for a in yxlist]
+	# 3. Flatten
 	rty, rtx = np.concatenate(yxlist, 0).reshape(-1,2).astype(np.int32).T
 	return rty, rtx
 
-def get_pixbounds(lp):
+def get_pixbounds(lp, comm):
 	"""Return a pixbox bounding the active cells in a LocalPixelization"""
 	hit  = lp.cell_offsets_cpu >= 0
+	hit  = utils.allreduce(hit.astype(int), comm) > 0
 	# The y bounds are simple, since there's no wrapping there
 	ycells = np.where(np.sum(hit,1)>0)[0]
 	# Nothing hit?!
@@ -493,15 +491,17 @@ def get_pixbounds(lp):
 	# sky just because our exposed area straddles the wrapping point.
 	# Start by getting the x-range each x-cell covers
 	xcells  = np.where(np.sum(hit,0)>0)[0]
+	if len(xcells) == 0: return np.array([[0,0],[1,1]])
 	xranges = np.array([xcells*64,(xcells+1)*64]).T
 	xranges = np.minimum(xranges, lp.nxpix_global)
-	# Find the biggest jump between cell starts
-	gaps    = xranges[1:,0]-xranges[:-1,1]
-	ijump   = np.argmax(gaps)
-	# If this jump is bigger than half the sky, then
-	# it will be more efficient to rewrap
-	if gaps[ijump] >= lp.nxpix_global//2:
-		xranges[:ijump+1] += lp.nxpix_global
+	if len(xranges) > 1:
+		# Find the biggest jump between cell starts
+		gaps    = xranges[1:,0]-xranges[:-1,1]
+		ijump   = np.argmax(gaps)
+		# If this jump is bigger than half the sky, then
+		# it will be more efficient to rewrap
+		if gaps[ijump] >= lp.nxpix_global//2:
+			xranges[:ijump+1] += lp.nxpix_global
 	# Ok, it should be safe now
 	x1 = np.min(xranges[:,0])
 	x2 = np.max(xranges[:,1])

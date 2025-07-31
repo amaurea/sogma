@@ -220,6 +220,7 @@ class SignalMap(Signal):
 		# could pass this in, but fast to construct. Should ideally match what's used in
 		# signal_cut to be safest, but only uses .clear which should be the same for all
 		# of them anyway
+		print("FIXME: Figure out if I'm handling cuts consistently")
 		pcut   = pmat.PmatCutFull(obs.cuts, dev=self.dev)
 		if pmap is None:
 			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=Nd.dtype)
@@ -279,6 +280,10 @@ class SignalMap(Signal):
 		# Set up our degrees of freedom
 		self.dof   = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
 		self.idiv  = gutils.safe_inv(self.div)
+		## FIXME
+		#print("div", self.div.shape, self.dev.np.max(self.div), self.dev.np.min(self.div))
+		#self.idiv  = gutils.safe_invert_ivar(self.div)
+		#print("idiv", self.idiv.shape, self.dev.np.max(self.idiv), self.dev.np.min(self.idiv))
 		t8 = time.time()
 		L.print("Prep fin %6.3f div %6.3f red %6.3f prec %6.3f" % (t2-t1, t4-t3+t6-t5, t3-t2+t5-t4+t7-t6, t8-t7), level=2)
 		self.ready = True
@@ -309,8 +314,9 @@ class SignalMap(Signal):
 			enmap.write_map(oname, omap)
 		return oname
 	def write_misc(self, prefix):
-		self.write(prefix, "rhs", self.rhs)
+		self.write(prefix, "rhs",  self.rhs)
 		self.write(prefix, "ivar", self.div[:,0])
+		self.write(prefix, "bin",  self.idiv*self.rhs)
 
 class SignalCutFull(Signal):
 	# Placeholder for when we have a gpu implementation
@@ -443,7 +449,7 @@ class SignalCutPoly(SignalCutFull):
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
 
 # Mapmaking function
-def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, prealloc=True):
+def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True):
 	if prefix is None: prefix = ""
 	if inds is None:
 		dist = tiling.distribute_tods_semibrute(obsinfo, comm.size)
@@ -457,32 +463,29 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 	# good.
 	if prealloc:
 		ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
-		print("ntot_max", ntot_max)
-		print("ndet_max", np.max(obsinfo.ndet[inds]))
-		print("nsamp_max", np.max(obsinfo.nsamp[inds]))
 		setup_buffers(dev, ntot_max)
 	# Start map from scartch
-	with gutils.leakcheck(dev, "mapmaker.reset"):
-		mapmaker.reset()
+	mapmaker.reset()
 	# Add our observations
 	for i, ind in enumerate(inds):
 		id    = obsinfo.id[ind]
 		t1    = time.time()
 		try:
-			with gutils.leakcheck(dev, "load"):
-				data  = loader.load(id)
+			data  = loader.load(id)
+			#del data
+			#print(dev.pools)
+			#continue
 		except utils.DataMissing as e:
 		#except () as e:
 			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
 			continue
 		t2    = time.time()
 
-		print("FIXME")
+		print("FIXME handle empty cuts")
 		if data.cuts.size == 0: data.cuts = np.array([[0],[10],[1]],np.int32)
 
-		with gutils.leakcheck(dev, "add_obs"):
-			mapmaker.add_obs(id, data, deslope=False)
-			dev.garbage_collect()
+		mapmaker.add_obs(id, data, deslope=False)
+		dev.garbage_collect()
 		del data
 		t3    = time.time()
 		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2), level=2)
@@ -492,30 +495,26 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 		L.print("No tods survived!", id=0, level=0, color=colors.red)
 		return None
 
-	with gutils.leakcheck(dev, "prepare"):
-		mapmaker.prepare()
+	mapmaker.prepare()
 	# Write rhs and ivar
-	with gutils.leakcheck(dev, "write_misc"):
-		for signal in mapmaker.signals:
-			if signal.output:
-				signal.write_misc(prefix)
+	for signal in mapmaker.signals:
+		if signal.output:
+			signal.write_misc(prefix)
 
 	# Solve the equation system
-	with gutils.leakcheck(dev, "solve"):
-		for step in mapmaker.solve(maxiter=maxiter):
-			L.print("CG %4d %15.7e (%6.3f s)" % (step.i, step.err, step.t), id=0, level=1, color=colors.lgreen)
-			if len(dump) > 0 and (step.i in dump or step.i % dump[-1] == 0):
-				for signal, val in zip(mapmaker.signals, step.x):
-					if signal.output:
-						signal.write(prefix, "map%04d" % step.i, val)
-			print(dev.pools)
+	for step in mapmaker.solve(maxiter=maxiter, maxerr=maxerr):
+		will_dump = len(dump) > 0 and (step.i in dump or step.i % dump[-1] == 0)
+		L.print("CG %4d %15.7e  %6.3f s%s" % (step.i, step.err, step.t, " (write)" if will_dump else ""), id=0, level=1, color=colors.lgreen)
+		if will_dump:
+			for signal, val in zip(mapmaker.signals, step.x):
+				if signal.output:
+					signal.write(prefix, "map%04d" % step.i, val)
 	# Write the final result
-	with gutils.leakcheck(dev, "write final"):
-		for signal, val in zip(mapmaker.signals, step.x):
-			if signal.output:
-				signal.write(prefix, "map", val)
+	for signal, val in zip(mapmaker.signals, step.x):
+		if signal.output:
+			signal.write(prefix, "map", val)
 
-def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefix=None, dump=[], maxiter=500, prealloc=True):
+def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
 	if inds is None:
@@ -530,9 +529,9 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefi
 		id      = subinfo.id[0]
 		subpre  = prefix + id.replace(":","_") + "_"
 		L.print("Mapping %4d/%d %s" % (ind+1,nfile,id))
-		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, prealloc=False)
+		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False)
 
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dump=[], maxiter=500, fullinfo=None, prealloc=True):
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
@@ -573,7 +572,7 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dum
 		name   = "%10.0f" % periods[pid][0]
 		subpre = prefix + name + "_"
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(subinfo)))
-		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, prealloc=False)
+		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False)
 
 
 def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
@@ -592,6 +591,7 @@ def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 	dev.pools["tod"]        .empty(ntot, dtype=dtype)
 	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
 	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
+	dev.pools.reset()
 	# The remaining are:
 	# * plan
 	# * cut
@@ -614,17 +614,6 @@ class ArrayZipper:
 	def unzip(self, x):  return x.reshape(self.shape).astype(self.dtype, copy=False)
 	def dot(self, a, b):
 		return np.sum(a*b) if self.comm is None else self.comm.allreduce(np.sum(a*b))
-
-class MapZipper:
-	def __init__(self, shape, wcs, dtype, comm=None):
-		self.shape, self.wcs = shape, wcs
-		self.ndof  = int(np.prod(shape))
-		self.dtype = dtype
-		self.comm  = comm
-	def zip(self, map): return np.asarray(map.reshape(-1))
-	def unzip(self, x): return enmap.ndmap(x.reshape(self.shape), self.wcs).astype(self.dtype, copy=False)
-	def dot(self, a, b):
-		return np.sum(a*b) if self.comm is None else utils.allreduce(np.sum(a*b),self.comm)
 
 class MultiZipper:
 	def __init__(self):

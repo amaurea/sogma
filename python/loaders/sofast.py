@@ -4,7 +4,7 @@ from sotodlib import preprocess, core
 import fast_g3, h5py, yaml, ast
 import so3g
 from so3g.proj import quat
-from .. import device
+from .. import device, gutils
 
 class SoFastLoader:
 	def __init__(self, configfile, dev=None, mul=32):
@@ -14,7 +14,7 @@ class SoFastLoader:
 		self.fast_meta = FastMeta(self.config, self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
-	def query(self, query=None, wafers=None, bands=None, sweeps=False):
+	def query(self, query=None, wafers=None, bands=None, sweeps=True):
 		# wafers and bands should ideally be a part of the query!
 		from sotodlib import mapmaking
 		subids = mapmaking.get_subids(query, context=self.context)
@@ -112,13 +112,13 @@ class FastMeta:
 		# 4. Focal plane
 		self.fp_cache   = FplaneCache(cmeta_lookup(context["metadata"], "focal_plane"))
 		# 5. Pointing model, which seems to be static for now
-		self.pointing_model = get_pointing_model(cmeta_lookup(context["metadata"], "pointing_model"))
+		self.pointing_model_cache = PointingModelCache(cmeta_lookup(context["metadata"], "pointing_model"))
 	def read(self, subid):
 		obsid, wslot, band = subid.split(":")
 		# Find which hdf files are relevant for this observation
 		try:
-			with bench.mark("fm_precfile"):
-				precfile,  precgroup  = get_precfile (self.prep_index,  subid)
+			with bench.mark("fm_prepfile"):
+				prepfile,  prepgroup  = get_prepfile (self.prep_index,  subid)
 				dcalfile,  dcalgroup  = get_dcalfile (self.dcal_index,  subid)
 		except KeyError as e: raise utils.DataMissing(str(e))
 		# 1. Get our starting set of detectors
@@ -158,14 +158,14 @@ class FastMeta:
 		# superflous detectors in these files, and I didn't find an efficient
 		# way to read only those needed, so just read all of them and merge
 		t1 = time.time()
-		with PrepLoader(precfile, precgroup) as pl:
+		with PrepLoader(prepfile, prepgroup) as pl:
 			paman = core.AxisManager(
 					core.LabelAxis("dets", pl.dets),
 					core.OffsetAxis("samps", count=pl.samps[0], offset=pl.samps[1]))
 			# A bit awkward to time the time taken in the initialization
 			bench.add("fm_prep_loader", time.time()-t1)
 
-			print("FIXME skipping relcal read")
+			#print("FIXME skipping relcal read")
 			#with bench.mark("fm_relcal"):
 			#	paman.wrap("relcal", pl.read("lpf_sig_run1/relcal","d"), [(0,"dets")])
 
@@ -178,9 +178,22 @@ class FastMeta:
 					# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
 					paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
 			with bench.mark("fm_cuts"):
-				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags"), [(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_2pi", read_cuts(pl, "jumps_2pi/jump_flag"),[(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_slow", read_cuts(pl, "jumps_slow/jump_flag"),[(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags"),[(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag"),  [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag"),      [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag"), [(0,"dets"),(1,"samps")])
+				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds"), [(0,"dets"),(1,"samps")])
+
+		# Eventually we will need to be able to read in sample-ranges.
+		# Easiest to handle that with paman.restrict("samps", ...) here.
+		# The rest should follow automatically
+
+		#i = utils.find(paman.dets.vals, "sch_ufm_mv20_1740684471_3_294")
+		#p = paman.cuts_glitch
+		#print("i", i)
+		#print(paman.dets.vals[i])
+		#print(p.ranges[p.bins[i,0]:p.bins[i,1]])
+		#1/0
 
 		with bench.mark("fm_merge2"):
 			aman.merge(paman)
@@ -207,13 +220,16 @@ class FastMeta:
 			iir_params["fscale"]  = 1/flux_ramp_rate
 		# Get our absolute calibration
 		with bench.mark("fm_abscal"):
-			abscal_cmb = self.acal_cache.get(wslot, band).abscal_cmb
+			stream_id = "_".join(detset.split("_")[:2])
+			abscal_cmb = self.acal_cache.get(stream_id, band).abscal_cmb
+		with bench.mark("pointing_model"):
+			pointing_model = self.pointing_model_cache.get_by_subid(subid)
 		# Return our results. We don't put everything in an axismanager
 		# because that has significant overhead, and we don't need an
 		# axismanager for things that don't have any axes
 		return bunch.Bunch(aman=aman, iir_params=iir_params, finfos=finfos,
 			dac_to_phase = np.pi/2**15, timestamp_to_ctime=1e-8,
-			abscal_cmb = abscal_cmb, pointing_model=self.pointing_model)
+			abscal_cmb = abscal_cmb, pointing_model=pointing_model)
 
 # This doesn't really belong here, unless we rename the module
 def fast_data(finfos, detax, sampax, alloc=None, fields=[
@@ -221,10 +237,11 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 		("timestamps","signal/times"),
 		("az",        "ancil/az_enc"),
 		("el",        "ancil/el_enc"),
-		# FIXME: These have the same name for now, should revisit this
-		# when I figure out how they work
-		("roll",      "ancil/boresight_enc", "?"),
-		("roll",      "ancil/corotator_enc", "?")]):
+		# For SAT we read in the boresight rotation.
+		# For LAT we read in the corotator angle.
+		# These will be transformed to the roll elsewhere
+		("brot",      "ancil/boresight_enc", "?"),
+		("corot",     "ancil/corotator_enc", "?")]):
 	import fast_g3
 	if alloc is None: alloc = fast_g3.DummyAlloc()
 	# Add "!", for mandatory field, to any field that doesn't have
@@ -259,12 +276,12 @@ def calibrate(data, meta, dev=None):
 	if dev is None: dev = device.get_device()
 	# Merge the cuts. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
-		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_slow"]])
+		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_jump","cuts_slow"]])#,"cuts_turn"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 	# Go to a fourier-friendly length
 	mul   = 32
-	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=[2,3,5,7])*mul
-	timestamps, signal, cuts, az, el, roll = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el,data.roll]]
+	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=dev.lib.fft_factors)*mul
+	timestamps, signal, cuts, az, el = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None
 
 	with bench.mark("ctime"):
@@ -273,7 +290,12 @@ def calibrate(data, meta, dev=None):
 	with bench.mark("boresight"):
 		az      = az   * utils.degree
 		el      = el   * utils.degree
-		roll    =-roll * utils.degree
+		if "brot" in data:
+			# SAT: boresight angle → roll
+			roll = -data.brot [:nsamp]*utils.degree
+		else:
+			# LAT: corotator angle → roll
+			roll = -data.corot[:nsamp]*utils.degree + el - 60*utils.degree
 	with bench.mark("pointing correction"):
 		az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
 	# Do we need to deslope at float64 before it is safe to drop to float32?
@@ -283,82 +305,75 @@ def calibrate(data, meta, dev=None):
 		signal  = dev.pools["tod"].empty(signal.shape, np.float32)
 		signal[:] = signal_
 
-	print("FIXME doing manual relcal")
-	with bench.mark("calibrate_manual", tfun=dev.time):
+	with bench.mark("calibrate", tfun=dev.time):
 		# Calibrate to CMB µK
-		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None]
+		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] # * meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
-		relcal  = common_mode_calibrate(signal, dev=dev)
-		signal *= relcal[:,None]
 
-	with bench.mark("calibrate_manual", tfun=dev.time):
+	#print("FIXME doing manual relcal")
+	#with bench.mark("calibrate_manual", tfun=dev.time):
+	#	# Calibrate to CMB µK
+	#	phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None]
+	#	signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
+	#	relcal  = common_mode_calibrate(signal, dev=dev)
+	#	signal *= relcal[:,None]
+
+	#i = utils.find(meta.aman.dets.vals, "sch_ufm_mv20_1740683992_0_003")
+	#bunch.write("test_sogma_postcalib.hdf", bunch.Bunch(tod=signal[i]))
+	#print("abscal_cmb", meta.abscal_cmb)
+	#print("phase_to_pW", meta.aman.phase_to_pW[i])
+	#1/0
+
+	with bench.mark("deproject cosel", tfun=dev.time):
 		elrange = utils.minmax(el[::100])
 		if elrange[1]-elrange[0] > 1*utils.arcmin:
 			print("FIXME deprojecting el")
 			deproject_cosel(signal, el, dev=dev)
 
-	#with bench.mark("calibrate", tfun=dev.time):
-	#	# Calibrate to CMB µK
-	#	phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] * meta.aman.relcal[:,None]
-	#	signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
+
+	#print("FIXME common mode deprojection")
+	#cmode = dev.np.median(signal,0)[None]
+	## Smooth it
+	#utils.deslope(cmode, inplace=True)
+	#fmode = dev.lib.rfft(cmode)
+	#fmode[:,fmode.shape[-1]//10:] = 0
+	#dev.lib.irfft(fmode, cmode)
+	#cmode /= cmode.shape[-1]
+	#def nmath(a): return np.diff(utils.block_reduce(a, 100))
+	#def deproj(a, B, nmath):
+	#	hNa = nmath(a)
+	#	hNB = nmath(B)
+	#	rhs = np.sum(hNa[:,None,:]*hNB[None,:,:],-1)
+	#	div = np.sum(hNB[:,None,:]*hNB[None,:,:],-1)
+	#	idiv = np.linalg.inv(div)
+	#	amp = np.einsum("ab,db->da",idiv,rhs)
+	#	return a - amp.dot(B)
+	#signal[:] = deproj(signal, cmode, nmath)
+
+
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
 	if hwp_angle is not None:
 		with bench.mark("subtract_hwpss", tfun=dev.time):
 			nmode = 16
 			signal = subtract_hwpss(signal, hwp_angle, meta.aman.hwpss_coeffs[:,:nmode]*phase_to_cmb, dev=dev)
-	# Deglitching. Measure the values v1,v2 at the edge of
-	# each cut region. Subtract v2-v1 from everything following the cut, and fill the cut
-	# with v1
-	# For each cut region we want a region up to n samples wide on its borders, but not
-	# inside other cuts
+
+	# Deglitch and dejump
 	w = 10
-	with bench.mark("get_cut_borders"):
-		borders = get_cut_borders(cuts,w)
-	# Hm, need to read out mean in each of these border regions. No easy way to do this
-	# Let's see how expensive it is to loop. 28 ms. Probably worth implementing in
-	# low-level code
-	with bench.mark("border vals", tfun=dev.time):
-		bvals = dev.np.zeros((len(borders),2), signal.dtype)
-		for di, (b1,b2) in enumerate(cuts.bins):
-			for ri in range(b1,b2):
-				bor   = borders[ri]
-				bvals1= signal[di,bor[0,0]:bor[0,1]]
-				bvals2= signal[di,bor[1,0]:bor[1,1]]
-				if bvals1.size  > 0: v1 = np.mean(bvals1)
-				if bvals2.size  > 0: v2 = np.mean(bvals2)
-				if bvals1.size == 0: v1 = v2
-				if bvals2.size == 0: v2 = v1
-				bvals[ri,0] = v1
-				bvals[ri,1] = v2
-	# 45 ms for this one. Not as slow as I feared, but should still be
-	# optimized. Unless it's faster on a gpu
-	with bench.mark("deglich", tfun=dev.time):
-		# Will subtract v2-v1 from entire region after that cut.
-		jumps = bvals[:,1]-bvals[:,0]
-		cumj  = dev.np.cumsum(jumps)
-		# Will subtract cumj[i] for range[i,1]:range[i+1,0].
-		# Will set range[i,0]:range[i,1] to bvals[i,1]-cumj[i]
-		for di, (b1,b2) in enumerate(cuts.bins):
-			if b1 >= b2: continue
-			dcumj = cumj[b1:b2]
-			if b1 > 0: dcumj = dcumj - cumj[b1-1] # NB: -= would clobber!
-			for i, ri in enumerate(range(b1,b2)):
-				r1,r2 = cuts.ranges[ri]
-				r3    = cuts.ranges[ri+1,0] if ri < b2-1 else cuts.nsamp
-				signal[di,r1:r2]  = bvals[ri,1]-dcumj[i]
-				signal[di,r2:r3] -= dcumj[i]
+	with bench.mark("deglitch", tfun=dev.time):
+		deglitch(signal, cuts, w=w, dev=dev)
 
 	# 100 ms for this :(
 	with bench.mark("deslope", tfun=dev.time):
 		with dev.pools["ft"].as_allocator():
-			deslope(signal, w=w, dev=dev, inplace=True)
+			gutils.deslope(signal, w=w, dev=dev, inplace=True)
 
 	# FFT stuff should definitely be on the gpu. 640 ms
 	with bench.mark("fft", tfun=dev.time):
-		ftod = dev.pools["ft"].empty((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
+		ftod = dev.pools["ft"].zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
 		dev.lib.rfft(signal, ftod)
 		norm = 1/signal.shape[1]
+
 	# Deconvolve iir and time constants
 	with bench.mark("iir_filter", tfun=dev.time):
 		dt    = (ctime[-1]-ctime[0])/(ctime.size-1)
@@ -374,7 +389,14 @@ def calibrate(data, meta, dev=None):
 		# do it since it's a triple multiplication. Hopefully the
 		# gpu won't have trouble with it
 		with dev.pools["pointing"].as_allocator():
-			ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
+			#ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
+			# Writing it this way saves some memroy
+			tfact = dev.np.full(ftod.shape, 2j*np.pi, ftod.dtype)
+			tfact *= dev.np.array(meta.aman.tau_eff)[:,None]
+			tfact *= freqs[None,:]
+			tfact += 1
+			ftod  *= tfact
+			del tfact
 	# Back to real space
 	with bench.mark("ifft", tfun=dev.time):
 		dev.lib.irfft(ftod, signal)
@@ -384,7 +406,7 @@ def calibrate(data, meta, dev=None):
 
 	# Restrict to these detectors
 	with bench.mark("final detector prune", tfun=dev.time):
-		tol    = 0.1
+		tol    = 0.2
 		ref    = np.median(rms[rms!=0])
 		good   = (rms > ref*tol)&(rms < ref/tol)
 		signal = dev.np.ascontiguousarray(signal[good]) # 600 ms!
@@ -415,6 +437,18 @@ def calibrate(data, meta, dev=None):
 	#res.response     = dev.np.zeros((2,len(res.tod)),res.tod.dtype)
 	#res.response[0]  = 2
 	#res.response[1]  = -1
+
+
+	#bunch.write("test_sogma_calib.hdf", res)
+	#small = res.copy()
+	#small.dets = small.dets[:4]
+	#small.tod  = small.tod [:4]
+	#small.polangle = small.polangle[:4]
+	#bunch.write("test_sogma_calib_small.hdf", small)
+	#1/0
+
+
+
 	return res
 
 #################
@@ -516,6 +550,15 @@ def split_bands(dets):
 		bdets[band].append(di)
 	return [(band, np.array(bdets[band])) for band in bdets]
 
+def trange_fmt(sfile, query_fmt):
+	if "obs:timestamp__lo" in sfile.columns("map"):
+		t1 = "[obs:timestamp__lo]"
+		t2 = "[obs:timestamp__hi]"
+	else:
+		t1 = "-1e9999"
+		t2 = "+1e9999"
+	return query_fmt.format(t1=t1, t2=t2)
+
 class FplaneCache:
 	def __init__(self, fname):
 		# The index file here is small, with efficient time
@@ -523,21 +566,13 @@ class FplaneCache:
 		self.fname = fname
 		self.index = {}
 		with sqlite.open(fname) as sfile:
-			# Bleh, why is the format inconsistent?
-			if "[obs:timestamp__lo]" in sfile.columns("map"):
-				query = "select [dets:stream_id], [obs:timestamp__lo], [obs:timestamp__hi], files.name, dataset from map inner join files on file_id = files.id"
-				# Wafer here is e.g. ufm_mv15, not the wafer slot (w.g. ws0)
-				for wafer_name, t1, t2, hfname, gname in sfile.execute(query):
-					if wafer_name not in self.index:
-						self.index[wafer_name] = []
-					self.index[wafer_name].append((t1,t2,hfname,gname))
-			else:
-				query = "select [dets:stream_id], files.name, dataset from map inner join files on file_id = files.id"
-				# Wafer here is e.g. ufm_mv15, not the wafer slot (w.g. ws0)
-				for wafer_name, hfname, gname in sfile.execute(query):
-					if wafer_name not in self.index:
-						self.index[wafer_name] = []
-					self.index[wafer_name].append((-np.inf,np.inf,hfname,gname))
+			# This handles both the case when time ranges are present and when they aren't
+			query = trange_fmt(sfile, "select [dets:stream_id], {t1}, {t2}, files.name, dataset from map inner join files on file_id = files.id")
+			# Wafer here is e.g. ufm_mv15, not the wafer slot (w.g. ws0)
+			for wafer_name, t1, t2, hfname, gname in sfile.execute(query):
+				if wafer_name not in self.index:
+					self.index[wafer_name] = []
+				self.index[wafer_name].append((t1,t2,hfname,gname))
 		# The cache for the actual focal plane structures
 		self.fp_cache = {}
 	def find_entry(self, wafer_name, t):
@@ -563,23 +598,53 @@ class FplaneCache:
 		wafer_name = "_".join(det_cache.get(subid).detset.split("_")[:2])
 		return self.get_by_wafer(wafer_name, ctime)
 
+class PointingModelCache:
+	def __init__(self, fname):
+		self.fname = fname
+		self.cache = {}
+		with sqlite.open(fname) as sfile:
+			query = trange_fmt(sfile, "select {t1}, {t2}, files.name, dataset from map inner join files on file_id = files.id")
+			# Get the mapping from time-range to hdf-file and dataset
+			self.index = list(sfile.execute(query))
+	def find_entry(self, t):
+		for i, entry in enumerate(self.index):
+			if entry[0] <= t and t < entry[1]:
+				return entry
+		# Return latest entry by default
+		return entry
+	def get_by_time(self, t):
+		entry = self.find_entry(t)
+		hfname, gname = entry[2:4]
+		key   = (hfname, gname)
+		if key not in self.cache:
+			fname = os.path.dirname(self.fname) + "/" + hfname
+			with h5py.File(fname, "r") as hfile:
+				param_str = hfile[gname].attrs["_scalars"]
+				params    = bunch.Bunch(**json.loads(param_str))
+				self.cache[key] = params
+		return self.cache[key]
+	def get_by_subid(self, subid):
+		obs_id, wafer_slot, band = subid.split(":")
+		ctime      = float(obs_id.split("_")[1])
+		return self.get_by_time(ctime)
+
 class AcalCache:
 	def __init__(self, fname):
 		self.fname  = fname
 		self.raw    = bunch.read(fname).abscal
 		self.lookup = {}
 		for row in self.raw:
-			key = row["dets:wafer_slot"].decode() + ":" + row["dets:wafer.bandpass"].decode()
+			key = row["dets:stream_id"].decode() + ":" + row["dets:wafer.bandpass"].decode()
 			self.lookup[key] = bunch.Bunch(
 				abscal_cmb = row["abscal_cmb"],
 				abscal_rj  = row["abscal_rj"],
-				beam_fwhm  = row["beam_fwhm"],
-				beam_solid_angle = row["beam_solid_angle"],
-				cal_source = row["cal_source"].decode(),
+				#beam_fwhm  = row["beam_fwhm"],
+				#beam_solid_angle = row["beam_solid_angle"],
+				#cal_source = row["cal_source"].decode(),
 			)
-	def get(self, wafer_band, band=None):
-		"""Either get("ws0:f150") or get("ws0", "f150") work"""
-		if band is not None: wafer_band = wafer_band + ":" + band
+	def get(self, stream_id, band=None):
+		"""Either get("ufm_mv13:f150") or get("ufm_mv13", "f150") work"""
+		if band is not None: wafer_band = stream_id + ":" + band
 		return self.lookup[wafer_band]
 
 # This takes 0.3 s the first time and 0 s later.
@@ -817,10 +882,10 @@ class PrepLoader:
 		res = res[()]
 		return res
 
-def get_precfile(indexdb, subid):
+def get_prepfile(indexdb, subid):
 	obsid, wslot, band = subid.split(":")
 	# Inconsistent format here too
-	if "[dets:wafer.bandpass]" in indexdb.columns("map"):
+	if "dets:wafer.bandpass" in indexdb.columns("map"):
 		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot], [dets:wafer.bandpass] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' AND [dets:wafer.bandpass] = '%s' LIMIT 1;" % (obsid, wslot, band)
 	else:
 		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' LIMIT 1;" % (obsid, wslot)
@@ -850,16 +915,16 @@ def get_smurffile(indexdb, detset):
 def get_acalfile(indexdb):
 	return os.path.dirname(indexdb.fname) + "/" + list(indexdb.execute("SELECT name FROM files INNER JOIN map ON files.id = map.file_id WHERE map.dataset = 'abscal'"))[0][0]
 
-def get_pointing_model(fname):
-	# Looks like the pointing model doesn't support time dependence at the
-	# moment, so we just have this simple function
-	with sqlite.open(fname) as sfile:
-		rows = list(sfile.execute("select name from files limit 2"))
-		if len(rows) != 1: raise IOError("Time-dependent pointing model loading not implemented. Figure out new format and implement")
-		hfname  = os.path.dirname(fname) + "/" + rows[0][0]
-		with h5py.File(hfname, "r") as hfile:
-			param_str = hfile["pointing_model"].attrs["_scalars"]
-		return bunch.Bunch(**json.loads(param_str))
+#def get_pointing_model(fname):
+#	# Looks like the pointing model doesn't support time dependence at the
+#	# moment, so we just have this simple function
+#	with sqlite.open(fname) as sfile:
+#		rows = list(sfile.execute("select name from files limit 2"))
+#		if len(rows) != 1: raise IOError("Time-dependent pointing model loading not implemented. Figure out new format and implement")
+#		hfname  = os.path.dirname(fname) + "/" + rows[0][0]
+#		with h5py.File(hfname, "r") as hfile:
+#			param_str = hfile["pointing_model"].attrs["_scalars"]
+#		return bunch.Bunch(**json.loads(param_str))
 
 def cmeta_lookup(cmeta, name):
 	for entry in cmeta:
@@ -910,6 +975,12 @@ def measure_rms(tod, bsize=32, nblock=10):
 	tod = tod[:,::bstep,:][:,:nblock,:]
 	return ap.median(ap.std(tod,-1),-1)
 
+def measure_rms2(tod, bsize=32, down=128):
+	ap  = device.anypy(tod)
+	tod = tod[:,:tod.shape[1]//bsize//down*bsize*down]
+	tod = tod.reshape(tod.shape[0],-1,bsize,down)
+	return ap.median(ap.std(ap.mean(tod,-1),-1),-1)
+
 # This takes 250 ms! And the quaternion stuff would be tedious
 # (but not difficult as such) to implement on the gpu
 def apply_pointing_model(az, el, roll, model):
@@ -918,6 +989,7 @@ def apply_pointing_model(az, el, roll, model):
 	[az, el, roll] = [np.array(a) for a in [az,el,roll]]
 	if   model.version == "sat_naive": pass
 	elif model.version == "sat_v1":
+		# Remember, roll = -boresight_angle. That's why there's a minus below
 		# Simple offsets
 		az   += model.enc_offset_az
 		el   += model.enc_offset_el
@@ -933,75 +1005,41 @@ def apply_pointing_model(az, el, roll, model):
 		q_hor_fix   = q_base_tilt * q_hor_raw * q_fp_off * ~q_fp_rot * quat.euler(2,roll) * q_fp_rot
 		az, el, roll= quat.decompose_lonlat(q_hor_fix)
 		az         *= -1
-	elif model.version == "lat_naive":
-		# The corotator angle. roll itself has already had its sign flipped
-		roll += el - 60*utils.degree
-	elif model.version == "lat_test1":
-		az   += model.enc_offset_az
-		el   += model.enc_offset_el
-		roll -= model.enc_offset_boresight
-		roll += el - 60*utils.degree
-		q_fp_off    = quat.rotation_xieta(model.fp_offset_xi0, model.fp_offset_eta0)
-		q_hor_raw   = quat.rotation_lonlat(-az,el)
-		q_hor_fix   = q_hor_raw * q_fp_off * quat.euler(2,roll)
-		az, el, roll= quat.decompose_lonlat(q_hor_fix)
-		az         *= -1
+	elif model.version == "lat_naive": pass
+	elif model.version == "lat_v0":
+		# Reconstruct the corotator angle
+		corot = -roll + el - 60*utils.degree
+		# Apply offsets
+		az    += model.az_offset * utils.degree
+		el    += model.el_offset * utils.degree
+		corot += model.cr_offset * utils.degree
+		q_enc     = quat.rotation_lonlat(-az, el)
+		q_mir     = quat.rotation_xieta(model.mir_xi_offset * utils.degree, model.mir_eta_offset * utils.degree)
+		q_tel     = quat.rotation_xieta(model.el_xi_offset  * utils.degree, model.el_eta_offset  * utils.degree)
+		q_rx      = quat.rotation_xieta(model.rx_xi_offset  * utils.degree, model.rx_eta_offset  * utils.degree)
+		q_el_roll = quat.euler(2, el - 60*utils.degree)
+		q_cr_roll = quat.euler(2, -corot)
+		q_tot     = q_enc * q_mir * q_el_roll * q_tel * q_cr_roll * q_rx
+		az, el, roll = quat.decompose_lonlat(q_tot)
+		az       *= -1
+	elif model.version == "lat_v1":
+		# Reconstruct the corotator angle
+		corot = el - roll - 60*utils.degree
+		# Apply offsets
+		az    += model.enc_offset_az
+		el    += model.enc_offset_el
+		corot += model.enc_offset_cr
+		q_lonlat     = quat.rotation_lonlat(-az, el)
+		q_mir_center = ~quat.rotation_xieta(model.mir_center_xi0, model.mir_center_eta0)
+		q_el_roll    = quat.euler(2, el - 60*utils.degree)
+		q_el_axis_center = ~quat.rotation_xieta(model.el_axis_center_xi0, model.el_axis_center_eta0)
+		q_cr_roll    = quat.euler(2, -corot)
+		q_cr_center  = ~quat.rotation_xieta(model.cr_center_xi0, model.cr_center_eta0)
+		q_tot        = q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
+		az, el, roll = quat.decompose_lonlat(q_tot)
+		az          *= -1
 	else: raise ValueError("Unrecognized model '%s'" % str(model.version))
 	return az, el, roll
-
-def detwise_axb(tod, x, a, b, inplace=False, tod_mul=0, abmul=1, dev=None):
-	if dev is None: dev = device.get_device()
-	if tod.dtype != np.float32: raise ValueError("Only float32 supported")
-	if not inplace: tod = tod.copy()
-	ndet, nsamp = tod.shape
-	B    = dev.np.empty([2,nsamp],dtype=tod.dtype) # [{a,b},nsamp]
-	B[0] = x
-	B[1] = 1
-	coeffs = dev.np.array([a,b]) # [{a,b},ndet]
-	dev.lib.sgemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
-	return tod
-
-def deslope(signal, w=10, inplace=False, n=None, dev=None, return_edges=False):
-	if dev  is None: dev  = device.get_device()
-	if n    is None: n    = signal.shape[-1]
-	if not inplace: signal = signal.copy()
-	# Allow us to work on other arrays than 2d.
-	ishape = signal.shape
-	signal = signal.reshape(-1, signal.shape[-1])
-	# Measure edge values
-	v1 = dev.np.mean(signal[:, :w],1)
-	v2 = dev.np.mean(signal[:,n-w:n],1)
-	if n != signal.shape[-1]:
-		# Avoid paying double cost for uncommon case
-		x = dev.np.zeros(signal.shape[-1], dtype=signal.dtype)
-		x[:n] = dev.np.linspace(0, 1, n, dtype=signal.dtype)
-	else:
-		x = dev.np.linspace(0, 1, n, dtype=signal.dtype)
-	otod = detwise_axb(signal, x, v2-v1, v1, tod_mul=1, abmul=-1, dev=dev, inplace=True)
-	# Restore to original shape
-	otod = otod.reshape(ishape)
-	v1   = v1.reshape(ishape[:-1],v1.shape[-1])
-	v2   = v2.reshape(ishape[:-1],v2.shape[-1])
-	if return_edges: return otod, v1, v2
-	else: return otod
-
-def reslope(signal, v1, v2, inplace=False, n=None, dev=None):
-	if dev  is None: dev  = device.get_device()
-	if n    is None: n    = signal.shape[-1]
-	if not inplace: signal = signal.copy()
-	# Allow us to work on other arrays than 2d.
-	ishape = signal.shape
-	signal = signal.reshape(-1, signal.shape[-1])
-	if n != signal.shape[-1]:
-		# Avoid paying double cost for uncommon case
-		x = dev.np.zeros(signal.shape[-1], dtype=signal.dtype)
-		x[:n] = dev.np.linspace(0, 1, n, dtype=signal.dtype)
-	else:
-		x = dev.np.linspace(0, 1, n, dtype=signal.dtype)
-	otod = detwise_axb(signal, x, v2-v1, v1, tod_mul=1, abmul=1, dev=dev, inplace=True)
-	# Restore to original shape
-	otod = otod.reshape(ishape)
-	return otod
 
 def common_mode_calibrate(signal, bsize=80, down=20, dev=None):
 	ndet, nsamp = signal.shape
@@ -1021,7 +1059,7 @@ def common_mode_calibrate(signal, bsize=80, down=20, dev=None):
 		# Normalize to be mostly positive and have a mean of 1
 		g2  /= dev.np.mean(g2)
 	# We want to be able to apply the calibration by multiplying
-	gtot = 1/g1/g2
+	gtot = 1/g2
 	return gtot
 
 # This isn't robust to glitches. Should use a block-median or something
@@ -1053,3 +1091,73 @@ def deproject_cosel(signal, el, nmode=2, dev=None):
 	signal -= dev.np.einsum("md,mi->di", coeffs, B)
 
 	print(dev.np.std(signal))
+
+def deglitch(signal, cuts, w=10, dev=None):
+	if dev is None: dev = device.get_device()
+	# Define sample ranges just before and after each
+	# cut, where we will measure a mean value for dejumping
+	with bench.mark("get_cut_borders", tfun=dev.time):
+		borders = get_cut_borders(cuts,w)
+	# Get on the format Kendrick wants
+	with bench.mark("index_map", tfun=dev.time):
+		ndet      = len(cuts.bins)
+		ncut      = len(borders)
+		nper      = cuts.bins[:,1]-cuts.bins[:,0]
+		index_map        = np.zeros((ncut,5), np.int32)
+		index_map[:,0]   = np.repeat(np.arange(ndet,dtype=np.int32),nper)
+		index_map[:,1:]  = borders.reshape(ncut,-1)
+		index_map2       = np.zeros((ncut,4), np.int32)
+		index_map2[:,0]  = index_map[:,0]
+		index_map2[:,1]  = np.repeat(cuts.bins[:,0],nper)
+		index_map2[:,2:] = cuts.ranges
+		index_map  = dev.np.array(index_map)
+		index_map2 = dev.np.array(index_map2)
+		bvals      = dev.np.zeros((ncut,2), signal.dtype)
+	# Measure the border values
+	with bench.mark("get_border_means", tfun=dev.time):
+		dev.lib.get_border_means(bvals, signal, index_map)
+	# Use them to deglitch
+	with bench.mark("deglitch core", tfun=dev.time):
+		dev.lib.deglitch(signal, bvals, index_map2)
+
+def deglitch_old(signal, cuts, w=10, dev=None):
+	if dev is None: dev = device.get_device()
+	# Define sample ranges just before and after each
+	# cut, where we will measure a mean value for dejumping
+	with bench.mark("get_cut_borders", tfun=dev.time):
+		borders = get_cut_borders(cuts,w)
+	# Hm, need to read out mean in each of these border regions. No easy way to do this
+	# Let's see how expensive it is to loop. 28 ms. Probably worth implementing in
+	# low-level code
+	# FIXME: This takes much longer for some tods, up to 100 s!
+	# Really must accelerate this!
+	with bench.mark("border vals %d" % len(borders), tfun=dev.time):
+		bvals = dev.np.zeros((len(borders),2), signal.dtype)
+		for di, (b1,b2) in enumerate(cuts.bins):
+			for ri in range(b1,b2):
+				bor   = borders[ri]
+				bvals1= signal[di,bor[0,0]:bor[0,1]]
+				bvals2= signal[di,bor[1,0]:bor[1,1]]
+				if bvals1.size  > 0: v1 = dev.np.mean(bvals1)
+				if bvals2.size  > 0: v2 = dev.np.mean(bvals2)
+				if bvals1.size == 0: v1 = v2
+				if bvals2.size == 0: v2 = v1
+				bvals[ri,0] = v1
+				bvals[ri,1] = v2
+	# 45 ms for this one. Not as slow as I feared, but should still be
+	# optimized. Unless it's faster on a gpu
+	with bench.mark("deglich core", tfun=dev.time):
+		# Will subtract v2-v1 from entire region after that cut.
+		jumps = bvals[:,1]-bvals[:,0]
+		cumj  = dev.np.cumsum(jumps)
+		# Will subtract cumj[i] for range[i,1]:range[i+1,0].
+		# Will set range[i,0]:range[i,1] to bvals[i,1]-cumj[i]
+		for di, (b1,b2) in enumerate(cuts.bins):
+			if b1 >= b2: continue
+			dcumj = cumj[b1:b2]
+			if b1 > 0: dcumj = dcumj - cumj[b1-1] # NB: -= would clobber!
+			for i, ri in enumerate(range(b1,b2)):
+				r1,r2 = cuts.ranges[ri]
+				r3    = cuts.ranges[ri+1,0] if ri < b2-1 else cuts.nsamp
+				signal[di,r1:r2]  = bvals[ri,1]-dcumj[i]
+				signal[di,r2:r3] -= dcumj[i]

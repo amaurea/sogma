@@ -10,7 +10,7 @@ class SotodlibLoader:
 		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
-	def query(self, query=None, wafers=None, bands=None, sweeps=False):
+	def query(self, query=None, wafers=None, bands=None, sweeps=True):
 		# wafers and bands should ideally be a part of the query!
 		subids = mapmaking.get_subids(query, context=self.context)
 		subids = mapmaking.filter_subids(subids, wafers=wafers, bands=bands)
@@ -33,11 +33,11 @@ class SotodlibLoader:
 		obsinfo.waz   = self.info["az_throw" ][inds].astype(np.float64) * utils.degree
 		# Should really have the proper array center, but it's clunky to get this,
 		# and ultimately it doesn't matter
-		if sweeps: raise NotImplementedError
-		#winfo   = get_wafer_info(self.context, info)
-		#wind    = utils.find(winfo.wafers, wafs[inds])
-		#obsinfo.r = winfo.r[wind]
-		#pos     = winfo.pos[wind]
+		#if sweeps: raise NotImplementedError
+		winfo   = get_wafer_info(self.context, info)
+		wind    = utils.find(winfo.wafers, wafs[inds])
+		obsinfo.r = winfo.r[wind]
+		pos     = winfo.pos[wind]
 		obsinfo.r = np.full(len(iinds), 1.0*utils.degree)
 		pos       = np.zeros((len(iinds),2))
 		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)

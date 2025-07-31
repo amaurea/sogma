@@ -376,3 +376,130 @@ def find_period_gaps(periods, ttol=60):
 	# We will return the time corresponding to each gap
 	gap_times = np.array([ts[jumps], ts[jumps+1]]).T
 	return gap_times
+
+def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1, adjoint=False, dev=None):
+	if dev is None: dev = device.get_device()
+	if tod.dtype != np.float32: raise ValueError("Only float32 supported")
+	if not inplace: tod = tod.copy()
+	ndet, nsamp = tod.shape
+	B    = dev.np.empty([2,nsamp],dtype=tod.dtype) # [{a,b},nsamp]
+	B[0] = x
+	B[1] = one
+	if adjoint:
+		# [coeffs] = [abmul  *B] [otod]
+		# [tod   ] = [tod_mul*I]
+		# coeffs   = abmul*B.dot(otod.T)
+		# tod      = tod_mul*otod
+		# transposed: coeffs' = abmul*otod.dot(B')
+		coeffs = dev.np.zeros((2,ndet), tod.dtype) # [{a,b},ndet]
+		dev.lib.sgemm("T", "N", ndet, 2, nsamp, abmul, tod, nsamp, B, nsamp, 0, coeffs, ndet)
+		if tod_mul != 1: tod *= tod_mul
+	else:
+		# otod = abmul*coeffs.T.dot(B) + tod_mul*tod
+		# transposed abmul*B'.dot(coeffs) + tod_mul*tod'
+		# In standard form
+		# [otod] = [abmul*B' tod_mul*I] [coeffs tod]'
+		coeffs = dev.np.array([a,b]) # [{a,b},ndet]
+		dev.lib.sgemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
+	return tod, coeffs[0], coeffs[1]
+
+def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, dev=None, external_v=False, return_edges=False):
+	if dev  is None: dev  = device.get_device()
+	if n    is None: n    = signal.shape[-1]
+	if not inplace: signal = signal.copy()
+	# Allow us to work on other arrays than 2d.
+	pre, nsamp = signal.shape[:-1], signal.shape[-1]
+	signal = signal.reshape(-1, nsamp)
+	# Measure edge values
+	if not external_v:
+		v1 = dev.np.mean(signal[:, :w],1)
+		v2 = dev.np.mean(signal[:,n-w:n],1)
+	# Build a basis that ignores the padded area
+	x   = linspace(0, 1, n, pad=nsamp-n, dtype=signal.dtype, dev=dev)
+	one = dev.np.full(nsamp, 1, dtype=signal.dtype)
+	one[n:] = 0
+	otod = detwise_axb(signal, x, v2-v1, v1, one=one, tod_mul=1, abmul=-1, dev=dev, inplace=True)[0]
+	# Restore to original shape
+	otod = otod.reshape(pre+(nsamp,))
+	v1   = v1.reshape(pre)
+	v2   = v2.reshape(pre)
+	if return_edges: return otod, v1, v2
+	else: return otod
+
+def adjoint_deslope(otod, v1, v2, w=10, inplace=False, n=None, dev=None, external_v=False, return_edges=False):
+	if dev  is None: dev  = device.get_device()
+	if n    is None: n    = otod.shape[-1]
+	if not inplace: v1, v2 = v1.copy(), v2.copy()
+	# Allow us to work on other arrays than 2d.
+	pre, nsamp = otod.shape[:-1], otod.shape[-1]
+	otod, v1, v2 = otod.reshape(-1, nsamp), v1.reshape(-1), v2.reshape(-1)
+	x = linspace(0, 1, n, pad=nsamp-n, dtype=otod.dtype, dev=dev)
+	one = dev.np.full(nsamp, 1, dtype=signal.dtype)
+	one[n:] = 0
+	# Transpose of the desloping itself
+	signal, a, b = detwise_axb(otod, x, one=one, tod_mul=1, abmul=-1, dev=dev, inplace=True, adjoint=True)
+	# Transpose of [a;b;v1;v2] = [-1 1;1 0;1 0;0 1][v1;v2] => [v1;v2] = [-1 1 1 0;1 0 0 1][a;b;v1;v2]
+	v1 += b-a
+	v2 += a
+	if not external_v:
+		# Transpose of measuring v1 and v2 from signal edges
+		# [v1]   [1'/w   0 ] [s1]     [s1] = [1/w  0  I  0] [v1]
+		# [v2] = [ 0   1'/w] [s2]     [s2]   [ 0  1/w 0  I] [v2]
+		# [s1]   [ I     0 ]       =>                       [s1]
+		# [s2]   [ 0     I ]                                [s2]
+		signal[:,:w]    += v1[:,None]/w
+		signal[:,n-w:n] += v2[:,None]/w
+	# Restore shape
+	signal = signal.reshape(pre+(nsamp,))
+	v1     = v1.reshape(pre)
+	v2     = v2.reshape(pre)
+	if return_edges: return signal, v1, v2
+	else: return signal
+
+def linspace(start, stop, num=50, pad=0, endpoint=True, dtype=None, dev=None):
+	if dev is None: dev = device.get_device()
+	res = dev.np.linspace(start, stop, num=num, endpoint=endpoint, dtype=dtype)
+	if pad > 0:
+		res_pad = dev.np.zeros(num+pad, dtype=dtype)
+		res_pad[:num] = res
+		res = res_pad
+	return res
+
+def downgrade(tod, bsize, inclusive=False, op=None):
+	ap = device.anypy(tod)
+	if op is None: op = ap.mean
+	nwhole = tod.shape[-1]//bsize
+	nall   = (tod.shape[-1]+bsize-1)//bsize
+	nblock = nall if inclusive else nwhole
+	otod = ap.zeros(tod.shape[:-1]+(nblock,), tod.dtype)
+	otod[...,:nwhole] = op(tod[...,:nwhole*bsize].reshape(tod.shape[:-1]+(nwhole,bsize)),-1)
+	if nblock > nwhole: otod[...,-1] = op(tod[...,nwhole*bsize:],-1)
+	return otod
+
+def block_scale(tod, bscale, bsize=1, inplace=False):
+	ap = device.anypy(tod)
+	if not inplace: tod = tod.copy()
+	nblock = tod.shape[-1]//bsize
+	btod   = tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))
+	btod  *= bscale[...,:nblock,None]
+	# incomplete last block
+	if tod.shape[-1] > nblock*bsize:
+		tod[...,nblock*bsize:] *= bscale[...,-1,None]
+	return tod
+
+def linint(arr, x):
+	ap = device.anypy(arr)
+	ix = ap.floor(x).astype(int)
+	ix = ap.clip(ix, 0, arr.shape[-1]-2)
+	rx = x-ix
+	return arr[...,ix]*(1-rx) + arr[...,ix+1]*rx
+
+def logint(arr, x):
+	ap = device.anypy(arr)
+	ix = ap.floor(x).astype(int)
+	ix = ap.clip(ix, 0, arr.shape[-1]-2)
+	# in log-log, it makes sense to start counting from 1 instead of
+	# 0 to avoid log(0), hence the +1.
+	rx   = (ap.log(x+1)-ap.log(ix+1))/(ap.log(ix+2)-ap.log(ix+1))
+	larr = ap.log(arr)
+	return ap.exp(larr[...,ix]*(1-rx) + larr[...,ix+1]*rx)

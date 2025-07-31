@@ -275,12 +275,22 @@ class PointingFit:
 		coeffs = coeffs.astype(self.dtype)
 		return coeffs # [{y,x,psi},ndet,ndof]
 	def eval(self, coeffs=None, B=None):
+		t1 = self.dev.time()
 		if B is None:
 			B = self.B if self.store_basis else self.basis(self.ref_pixs)
 		if coeffs is None:
 			coeffs = self.coeffs
+		t2 = self.dev.time()
 		pointing = self.dev.pools["pointing"].empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
-		coeffs.dot(B, out=pointing)
+		t3 = self.dev.time()
+		#coeffs.dot(B, out=pointing)
+		# coeffs[{y,x,psi},ndet,ndof]*B[ndof,nsamp] => pointing[{y,x,psi},ndet,nsamp]
+		# Cublas is column-major though, so we're doing pointing = B*coeffs
+		npre = coeffs.shape[0]*coeffs.shape[1]
+		ndof, nsamp = B.shape
+		self.dev.lib.sgemm("N", "N", nsamp, npre, ndof, 1, B, nsamp, coeffs.reshape(npre,ndof), ndof, 0, pointing.reshape(npre,nsamp), nsamp)
+		t4 = self.dev.time()
+		L.print("eval pointing %8.4f %8.4f %8.4f" % (t2-t1,t3-t2,t4-t3), level=3)
 		return pointing # [{y,x,psi},ndet,nsamp], on device
 	def eval_exact(self, ctime, bore, offs, polang, site=None, weather=None):
 		if site    is None: site    = self.site

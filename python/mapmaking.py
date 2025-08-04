@@ -316,6 +316,7 @@ class SignalMap(Signal):
 	def write_misc(self, prefix):
 		self.write(prefix, "rhs",  self.rhs)
 		self.write(prefix, "ivar", self.div[:,0])
+		self.write(prefix, "hits", self.hits[:,0])
 		self.write(prefix, "bin",  self.idiv*self.rhs)
 
 class SignalCutFull(Signal):
@@ -518,7 +519,7 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefi
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
 	if inds is None:
-		inds = list(range(comm_all.rank, len(obsinfo), comm_all.size))
+		inds = list(range(comm.rank, len(obsinfo), comm.size))
 	if prefix is None:
 		prefix = ""
 	ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
@@ -528,7 +529,7 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefi
 		subinfo = obsinfo[ind:ind+1]
 		id      = subinfo.id[0]
 		subpre  = prefix + id.replace(":","_") + "_"
-		L.print("Mapping %4d/%d %s" % (ind+1,nfile,id))
+		L.print("Mapping %s" % id)
 		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False)
 
 def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True):
@@ -537,7 +538,7 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dum
 	# even if 
 	from pixell import bench
 	if prefix   is None: prefix = ""
-	if fullinfo is None: fullinfo = loader.query()
+	if fullinfo is None: fullinfo = loader.query("type='obs'")
 	periods = gutils.find_scan_periods(fullinfo)
 	# Which period each obs belongs to
 	pinds   = utils.find_range(periods, obsinfo.ctime+obsinfo.dur/2)

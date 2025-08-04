@@ -5,6 +5,7 @@ import fast_g3, h5py, yaml, ast
 import so3g
 from so3g.proj import quat
 from .. import device, gutils
+from . import soquery
 
 class SoFastLoader:
 	def __init__(self, configfile, dev=None, mul=32):

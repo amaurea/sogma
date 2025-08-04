@@ -166,6 +166,9 @@ try:
 			self.lib.insert_ranges   = cpu_mm.insert_ranges
 			self.lib.extract_ranges  = cpu_mm.extract_ranges
 			self.lib.clear_ranges    = cpu_mm.clear_ranges
+			# Deglitching
+			self.lib.get_border_means= cpu_mm.get_border_means
+			self.lib.deglitch        = cpu_mm.deglitch
 			# ffts. No plan caching for now
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				return fft.rfft(dat, ft=out, axes=axis)
@@ -247,6 +250,3 @@ except ImportError:
 	# 7. PointingPrePlan
 	#    Must be constructable from (pointing, ny, nx, periodic_xcoord=True)
 	#    For sotodlib this and PointingPlan can be dummies
-
-
-

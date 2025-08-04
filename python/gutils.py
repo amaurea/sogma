@@ -319,7 +319,6 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	surveys, this could be reduced.
 	"""
 	from scipy import ndimage
-	atol = atol/utils.degree
 	info = np.array([obsinfo[a] for a in ["baz", "bel", "waz", "wel", "ctime", "dur"]]).T
 	# Get rid of nan entries
 	bad  = np.any(~np.isfinite(info),1)
@@ -329,6 +328,7 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	info = info[~bad]
 	t1   = info[:,-2]
 	info = info[np.argsort(t1)]
+
 	# Start, end
 	t1   = info[:,-2]
 	t2   = t1 + info[:,-1]
@@ -340,6 +340,7 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	changes    = np.abs(info[1:,:4]-info[:-1,:4])
 	jumps      = np.any(changes > atol,1)
 	jumps      = np.concatenate([[0], jumps]) # from diff-inds to normal inds
+
 	# Time in the middle of each gap
 	gap_times = np.mean(find_period_gaps(np.array([t1,t2]).T, ttol=ttol),1)
 	gap_inds  = np.searchsorted(t1, gap_times)

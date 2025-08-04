@@ -3,6 +3,7 @@ from pixell import utils, fft, bunch, bench
 import so3g
 from sotodlib import core, mapmaking, preprocess
 from .. import device
+from . import soquery
 
 # Standard Sotodlib slow load
 class SotodlibLoader:
@@ -10,44 +11,36 @@ class SotodlibLoader:
 		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
-	def query(self, query=None, wafers=None, bands=None, sweeps=True):
-		# wafers and bands should ideally be a part of the query!
-		subids = mapmaking.get_subids(query, context=self.context)
-		subids = mapmaking.filter_subids(subids, wafers=wafers, bands=bands)
-		# Need base ids to look up rest of the info in obsdb
-		obs_ids, wafs, bands = mapmaking.split_subids(subids)
-		info     = self.context.obsdb.query("type='obs' and az_center is not null")
-		iinds, oinds = utils.common_inds([info["obs_id"], obs_ids])
-		# Build obsinfo for these ids
+		self.tags    = soquery.get_tags(self.context.obsdb.conn)
+	def query(self, query=None, sweeps=True):
+		res_db = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
+		info   = core.metadata.resultset.ResultSet.from_cursor(res_db.execute("select * from obs"))
 		dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(4,2))]
-		obsinfo = np.zeros(len(oinds), dtype).view(np.recarray)
-		obsinfo.id    = subids[oinds]
-		obsinfo.ndet  = utils.dict_lookup(flavor_ndets_per_band, info["tube_flavor"][iinds])
-		obsinfo.nsamp = info["n_samples"][iinds]
-		obsinfo.ctime = info["start_time"][iinds]
-		obsinfo.dur   = info["stop_time"][iinds]-info["start_time"][iinds]
+		obsinfo = np.zeros(len(info), dtype).view(np.recarray)
+		obsinfo.id    = info["subobs_id"]
+		obsinfo.ndet  = utils.dict_lookup(flavor_ndets_per_band, info["tube_flavor"])
+		obsinfo.nsamp = info["n_samples"]
+		obsinfo.ctime = info["start_time"]
+		obsinfo.dur   = info["stop_time"]-info["start_time"]
 		# Here come the parts that have to do with pointing.
 		# These arrays have a nasty habit of being object dtype
-		obsinfo.baz   = self.info["az_center"][inds].astype(np.float64) * utils.degree
-		obsinfo.bel   = self.info["el_center"][inds].astype(np.float64) * utils.degree
-		obsinfo.waz   = self.info["az_throw" ][inds].astype(np.float64) * utils.degree
+		obsinfo.baz   = info["az_center"].astype(np.float64) * utils.degree
+		obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
+		obsinfo.waz   = info["az_throw" ].astype(np.float64) * utils.degree
 		# Should really have the proper array center, but it's clunky to get this,
 		# and ultimately it doesn't matter
 		#if sweeps: raise NotImplementedError
 		winfo   = get_wafer_info(self.context, info)
-		wind    = utils.find(winfo.wafers, wafs[inds])
+		wind    = utils.find(winfo.wafers, info["wafer_slots_list"])
 		obsinfo.r = winfo.r[wind]
 		pos     = winfo.pos[wind]
-		obsinfo.r = np.full(len(iinds), 1.0*utils.degree)
-		pos       = np.zeros((len(iinds),2))
-		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
+		#obsinfo.r = np.full(len(info), 1.0*utils.degree)
+		#pos       = np.zeros((len(info),2))
+		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, pos)
 		return obsinfo
 	def load(self, subid):
 		# Read in and calibrate all our data. This will depend on the
 		# calibration steps listed in the config file
-		#obs = self.context.get_obs(subid)
-		#bunch.write("test_ptraw_soslow.hdf", bunch.Bunch(az=obs.boresight.az, el=obs.boresight.el, roll=obs.boresight.roll))
-		#1/0
 		try:
 			with bench.mark("load_and_preprocess"):
 				obs = preprocess.load_and_preprocess(subid, self.config)

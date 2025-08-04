@@ -10,6 +10,82 @@ from . import soquery
 class SoFastLoader:
 	def __init__(self, configfile, dev=None, mul=32):
 		# Set up our metadata loader
+		self.config  = yaml.safe_load(configfile)
+		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
+		# Precompute the set of valid tags. Sadly this requires a scan through the whole
+		# database, but it's not that slow so far
+		self.tags   = soquery.get_tags(self.context.obsdb.conn)
+		self.fast_meta = FastMeta(self.config, self.context)
+		self.mul     = mul
+		self.dev     = dev or device.get_device()
+	def query(self, query=None, sweeps=True):
+		res_db = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
+		info   = core.metadata.resultset.ResultSet.from_cursor(res_db.execute("select * from obs"))
+		dtype  = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(4,2))]
+		obsinfo= np.zeros(len(info), dtype).view(np.recarray)
+		obsinfo.id = info["subobs_id"]
+		obsinfo.ndet  = utils.dict_lookup(flavor_ndets_per_band, info["tube_flavor"])
+		obsinfo.nsamp = info["n_samples"]
+		obsinfo.ctime = info["start_time"]
+		obsinfo.dur   = info["stop_time"]-info["start_time"]
+		# Here come the parts that have to do with pointing.
+		# These arrays have a nasty habit of being object dtype
+		obsinfo.baz   = info["az_center"].astype(np.float64) * utils.degree
+		obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
+		obsinfo.waz   = info["az_throw" ].astype(np.float64) * utils.degree
+		obsinfo.r     = 1.0*utils.degree # default value
+		if sweeps:
+			# This fills in obsinfo.r and obsinfo.sweep, but it's
+			# relatively slow (1-3 s) and assumes time-independent pointing offsets
+			# (probably fine); but most importantly, I don't use it currently.
+			# 1. Find a reference subid for each tube-wslot
+			tub_waf_band = [info["telescope"],info["tube_slot"], info["wafer_slots_list"], info["band"]]
+			tag = utils.label_multi(tub_waf_band)
+			uvals, order, edges = utils.find_equal_groups_fast(tag)
+			wafer_centers = np.zeros((len(info),2))
+			wafer_rads    = np.zeros(len(info))
+			good          = np.zeros(len(info),bool)
+			for gi in range(len(uvals)):
+				ginds  = order[edges[gi]:edges[gi+1]]
+				ref_ind= ginds[0]
+				ref_id = info["subobs_id"][ref_ind]
+				# 2. Get the focal plane offsets for this subid
+				try:
+					focal_plane = get_focal_plane(self.fast_meta, ref_id)
+					mid, rad    = get_fplane_extent(focal_plane)
+					wafer_centers[ginds] = mid
+					wafer_rads   [ginds] = rad
+					good         [ginds] = True
+				except KeyError:
+					# This happens for wafers with no focal plane information
+					print("warning: no focal plane info for %s:%s:%s:%s" % tuple([a[ref_ind] for a in tub_waf_band]))
+			# Final prune
+			obsinfo, wafer_centers, wafer_rads = [a[good] for a in [obsinfo, wafer_centers, wafer_rads]]
+			# Fill in the last entries in obsinfo
+			obsinfo.r     = wafer_rads
+			obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
+		return obsinfo
+	def load(self, subid):
+		try:
+			with bench.mark("load_meta"):
+				meta = self.fast_meta.read(subid)
+			# Load the raw data
+			with bench.mark("load_data"):
+				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
+			# Calibrate the data
+			with bench.mark("load_calib"):
+				obs = calibrate(data, meta, dev=self.dev)
+		except Exception as e:
+			# FIXME: Make this less broad
+			raise utils.DataMissing(type(e).__name__ + " " + str(e))
+		# Add timing info
+		obs.timing = [("meta",bench.t.load_meta),("data",bench.t.load_data),("calib",bench.t.load_calib)]
+		return obs
+
+class SoFastLoaderOld:
+	def __init__(self, configfile, dev=None, mul=32):
+		# Set up our metadata loader
+		self.config  = yaml.safe_load(configfile)
 		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
 		self.info    = self.context.obsdb.query()
 		self.fast_meta = FastMeta(self.config, self.context)

@@ -31,6 +31,7 @@ def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=
 	file) containing the resulting observations."""
 	if cols is None: cols = sqlite.columns(obsdb, "obs")
 	if tags is None: tags = get_tags(obsdb)
+	if not simple_query: simple_query = "1"
 	# Check if we have a subobsdb or not
 	is_subobs = "subobs_id" in cols
 	# Main parse of the simple query
@@ -64,7 +65,6 @@ def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=
 		if idfile:
 			# Drop the obslist table we created
 			obsdb.execute("drop table res.targ")
-	res_db.show("obs")
 	# Ok, by this we're detached again, and res_db contains the
 	# resulting obs and tags tables. But we may need a second pass
 	# if we're still at the obsdb level, but need a subobs db
@@ -173,7 +173,6 @@ def parse_query(simple_query, cols, tags):
 	if len(qtags) > 0:
 		# I tried exists too, but it was much slower
 		query += " and obs_id in (select obs_id from tags where " + " and ".join(qtags) + ")"
-		print(query)
 	return query, idfile
 
 def subobs_expansion(obsdb, tags=True):

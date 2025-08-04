@@ -30,12 +30,12 @@ class SotodlibLoader:
 		# Should really have the proper array center, but it's clunky to get this,
 		# and ultimately it doesn't matter
 		#if sweeps: raise NotImplementedError
-		winfo   = get_wafer_info(self.context, info)
-		wind    = utils.find(winfo.wafers, info["wafer_slots_list"])
-		obsinfo.r = winfo.r[wind]
-		pos     = winfo.pos[wind]
-		#obsinfo.r = np.full(len(info), 1.0*utils.degree)
-		#pos       = np.zeros((len(info),2))
+		#winfo   = get_wafer_info(self.context, info)
+		#wind    = utils.find(winfo.wafers, info["wafer_slots_list"])
+		#obsinfo.r = winfo.r[wind]
+		#pos     = winfo.pos[wind]
+		obsinfo.r = np.full(len(info), 0.35*utils.degree)
+		pos       = np.zeros((len(info),2))
 		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, pos)
 		return obsinfo
 	def load(self, subid):

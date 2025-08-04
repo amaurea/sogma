@@ -144,6 +144,8 @@ def parse_query(simple_query, cols, tags):
 		elif tok == "wel": tok = "el_throw"
 		elif tok == "dur": tok = "duration"
 		elif tok == "nsamp": tok = "n_samples"
+		# Constants
+		elif tok == "tcorot": tok = "1749513600"
 		# Don't interpret columns as tags if they conflict
 		elif tok in cols: pass
 		# Finally handle tags. These must be alone, not part of

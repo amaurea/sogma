@@ -7,6 +7,17 @@ from so3g.proj import quat
 from .. import device, gutils
 from . import soquery
 
+# We have a "sweeps" member of obsinfo, which encapsulates the
+# area hit by each observation on the sky, in equatorial coordinates.
+# This was motivated by wanting to select e.g. observations that hit some
+# spot on the sky, which is useful. However, the ObsDb does not contain
+# this information, and it's a bit expensive to get at it, especially the
+# wafer center and wafer radius. I also haven't implemented the actual
+# point-in-polygon lookup yet (though it's in ACT). Until ObsDb makes this
+# simpler, sweeps will just assume 0.35 degree radus wafers centered at 0,0.
+# This is not good enough for obs-hits-point calculation, but it's good enough
+# for task distribution, which is the only thing it's currenlty used for
+
 class SoFastLoader:
 	def __init__(self, configfile, dev=None, mul=32):
 		# Set up our metadata loader
@@ -43,22 +54,24 @@ class SoFastLoader:
 			tag = utils.label_multi(tub_waf_band)
 			uvals, order, edges = utils.find_equal_groups_fast(tag)
 			wafer_centers = np.zeros((len(info),2))
-			wafer_rads    = np.zeros(len(info))
-			good          = np.zeros(len(info),bool)
-			for gi in range(len(uvals)):
-				ginds  = order[edges[gi]:edges[gi+1]]
-				ref_ind= ginds[0]
-				ref_id = info["subobs_id"][ref_ind]
-				# 2. Get the focal plane offsets for this subid
-				try:
-					focal_plane = get_focal_plane(self.fast_meta, ref_id)
-					mid, rad    = get_fplane_extent(focal_plane)
-					wafer_centers[ginds] = mid
-					wafer_rads   [ginds] = rad
-					good         [ginds] = True
-				except KeyError:
-					# This happens for wafers with no focal plane information
-					print("warning: no focal plane info for %s:%s:%s:%s" % tuple([a[ref_ind] for a in tub_waf_band]))
+			wafer_rads    = np.full(len(info), 0.35*utils.degree)
+			good          = np.ones(len(info),bool)
+			#good          = np.zeros(len(info),bool)
+			#for gi in range(len(uvals)):
+			#	ginds  = order[edges[gi]:edges[gi+1]]
+			#	ref_ind= ginds[0]
+			#	ref_id = info["subobs_id"][ref_ind]
+			#	# 2. Get the focal plane offsets for this subid
+			#	try:
+			#		focal_plane = get_focal_plane(self.fast_meta, ref_id)
+			#		mid, rad    = get_fplane_extent(focal_plane)
+			#		print(ref_id, mid/utils.degree, rad/utils.degree)
+			#		wafer_centers[ginds] = mid
+			#		wafer_rads   [ginds] = rad
+			#		good         [ginds] = True
+			#	except KeyError:
+			#		# This happens for wafers with no focal plane information
+			#		print("warning: no focal plane info for %s:%s:%s:%s" % tuple([a[ref_ind] for a in tub_waf_band]))
 			# Final prune
 			obsinfo, wafer_centers, wafer_rads = [a[good] for a in [obsinfo, wafer_centers, wafer_rads]]
 			# Fill in the last entries in obsinfo
@@ -679,7 +692,7 @@ def make_sweep(ctime, baz0, waz, bel0, off, npoint=4):
 	# make sweeps[ntod,npoint,{ra,dec}]
 	# so3g can't handle per-sample pointing offsets, so it would
 	# force us to loop here. We therefore simply modify the pointing
-	# offsets to we can simply add them to az,el
+	# offsets so we can simply add them to az,el
 	az_off, el = coordinates.euler_rot((0.0, -bel0, 0.0), off.T)
 	az  = (baz0+az_off)[:,None] + np.linspace(-0.5,0.5,npoint)*waz[:,None]
 	el  = el   [:,None] + az*0

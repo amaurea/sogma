@@ -53,7 +53,7 @@ class MLMapmaker:
 				nmat = noise_model.build(gtod, srate=srate)
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
-				raise RuntimeError(msg)
+				raise gutils.RecoverableError(msg)
 		t4 = time.time()
 		# And apply it to the tod
 		gtod = nmat.apply(gtod)
@@ -473,9 +473,6 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 		t1    = time.time()
 		try:
 			data  = loader.load(id)
-			#del data
-			#print(dev.pools)
-			#continue
 		except utils.DataMissing as e:
 		#except () as e:
 			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
@@ -485,7 +482,11 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 		print("FIXME handle empty cuts")
 		if data.cuts.size == 0: data.cuts = np.array([[0],[10],[1]],np.int32)
 
-		mapmaker.add_obs(id, data, deslope=False)
+		try:
+			mapmaker.add_obs(id, data, deslope=False)
+		except gutils.RecoverableError as e:
+			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
+			continue
 		dev.garbage_collect()
 		del data
 		t3    = time.time()

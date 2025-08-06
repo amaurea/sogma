@@ -2,10 +2,9 @@ import numpy as np, contextlib, json, time, os, scipy, re
 from pixell import utils, fft, bunch, bench, sqlite
 from sotodlib import preprocess, core
 import fast_g3, h5py, yaml, ast
-import so3g
 from so3g.proj import quat
 from .. import device, gutils
-from . import soquery
+from . import soquery, socommon
 
 # We have a "sweeps" member of obsinfo, which encapsulates the
 # area hit by each observation on the sky, in equatorial coordinates.
@@ -29,9 +28,13 @@ class SoFastLoader:
 		self.fast_meta = FastMeta(self.config, self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
-	def query(self, query=None, sweeps=True):
+	def query(self, query=None, sweeps=True, output="sogma"):
+		if output not in ["sqlite", "resultset", "sogma"]:
+			raise ValueError("Unrecognized output format '%s" % str(output))
 		res_db = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
+		if output == "sqlite": return res_db
 		info   = core.metadata.resultset.ResultSet.from_cursor(res_db.execute("select * from obs"))
+		if output == "resultset": return info
 		dtype  = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(4,2))]
 		obsinfo= np.zeros(len(info), dtype).view(np.recarray)
 		obsinfo.id = info["subobs_id"]
@@ -44,39 +47,12 @@ class SoFastLoader:
 		obsinfo.baz   = info["az_center"].astype(np.float64) * utils.degree
 		obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
 		obsinfo.waz   = info["az_throw" ].astype(np.float64) * utils.degree
-		obsinfo.r     = 1.0*utils.degree # default value
+		wafer_centers, obsinfo.r = socommon.wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
 		if sweeps:
-			# This fills in obsinfo.r and obsinfo.sweep, but it's
-			# relatively slow (1-3 s) and assumes time-independent pointing offsets
-			# (probably fine); but most importantly, I don't use it currently.
-			# 1. Find a reference subid for each tube-wslot
-			tub_waf_band = [info["telescope"],info["tube_slot"], info["wafer_slots_list"], info["band"]]
-			tag = utils.label_multi(tub_waf_band)
-			uvals, order, edges = utils.find_equal_groups_fast(tag)
-			wafer_centers = np.zeros((len(info),2))
-			wafer_rads    = np.full(len(info), 0.35*utils.degree)
-			good          = np.ones(len(info),bool)
-			#good          = np.zeros(len(info),bool)
-			#for gi in range(len(uvals)):
-			#	ginds  = order[edges[gi]:edges[gi+1]]
-			#	ref_ind= ginds[0]
-			#	ref_id = info["subobs_id"][ref_ind]
-			#	# 2. Get the focal plane offsets for this subid
-			#	try:
-			#		focal_plane = get_focal_plane(self.fast_meta, ref_id)
-			#		mid, rad    = get_fplane_extent(focal_plane)
-			#		print(ref_id, mid/utils.degree, rad/utils.degree)
-			#		wafer_centers[ginds] = mid
-			#		wafer_rads   [ginds] = rad
-			#		good         [ginds] = True
-			#	except KeyError:
-			#		# This happens for wafers with no focal plane information
-			#		print("warning: no focal plane info for %s:%s:%s:%s" % tuple([a[ref_ind] for a in tub_waf_band]))
-			# Final prune
-			obsinfo, wafer_centers, wafer_rads = [a[good] for a in [obsinfo, wafer_centers, wafer_rads]]
-			# Fill in the last entries in obsinfo
-			obsinfo.r     = wafer_rads
-			obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
+			# Everything before this took around 16 µs/obs
+			# Make_sweep itself takes 20 µs/obs. So it's the biggest
+			# term, but not dominant
+			obsinfo.sweep = socommon.make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
 		return obsinfo
 	def load(self, subid):
 		try:
@@ -87,8 +63,9 @@ class SoFastLoader:
 				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 			# Calibrate the data
 			with bench.mark("load_calib"):
-				obs = calibrate(data, meta, dev=self.dev)
-		except Exception as e:
+				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
+		#except Exception as e:
+		except () as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Add timing info
@@ -277,14 +254,13 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 			i += chunk.shape[-1]
 	return aman
 
-def calibrate(data, meta, dev=None):
+def calibrate(data, meta, mul=32, dev=None):
 	if dev is None: dev = device.get_device()
 	# Merge the cuts. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
 		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_jump","cuts_slow"]])#,"cuts_turn"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 	# Go to a fourier-friendly length
-	mul   = 32
 	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=dev.lib.fft_factors)*mul
 	timestamps, signal, cuts, az, el = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None
@@ -323,18 +299,11 @@ def calibrate(data, meta, dev=None):
 	#	relcal  = common_mode_calibrate(signal, dev=dev)
 	#	signal *= relcal[:,None]
 
-	#i = utils.find(meta.aman.dets.vals, "sch_ufm_mv20_1740683992_0_003")
-	#bunch.write("test_sogma_postcalib.hdf", bunch.Bunch(tod=signal[i]))
-	#print("abscal_cmb", meta.abscal_cmb)
-	#print("phase_to_pW", meta.aman.phase_to_pW[i])
-	#1/0
-
 	with bench.mark("deproject cosel", tfun=dev.time):
 		elrange = utils.minmax(el[::100])
 		if elrange[1]-elrange[0] > 1*utils.arcmin:
 			print("FIXME deprojecting el")
 			deproject_cosel(signal, el, dev=dev)
-
 
 	#print("FIXME common mode deprojection")
 	#cmode = dev.np.median(signal,0)[None]
@@ -355,7 +324,6 @@ def calibrate(data, meta, dev=None):
 	#	return a - amp.dot(B)
 	#signal[:] = deproj(signal, cmode, nmath)
 
-
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
 	if hwp_angle is not None:
@@ -367,6 +335,7 @@ def calibrate(data, meta, dev=None):
 	w = 10
 	with bench.mark("deglitch", tfun=dev.time):
 		deglitch(signal, cuts, w=w, dev=dev)
+		#deglitch_commonsep(signal, cuts, w=w, dev=dev)
 
 	# 100 ms for this :(
 	with bench.mark("deslope", tfun=dev.time):
@@ -442,18 +411,6 @@ def calibrate(data, meta, dev=None):
 	#res.response     = dev.np.zeros((2,len(res.tod)),res.tod.dtype)
 	#res.response[0]  = 2
 	#res.response[1]  = -1
-
-
-	#bunch.write("test_sogma_calib.hdf", res)
-	#small = res.copy()
-	#small.dets = small.dets[:4]
-	#small.tod  = small.tod [:4]
-	#small.polangle = small.polangle[:4]
-	#bunch.write("test_sogma_calib_small.hdf", small)
-	#1/0
-
-
-
 	return res
 
 #################
@@ -686,23 +643,6 @@ def get_fplane_extent(focal_plane):
 	rad = np.max(utils.angdist(focal_plane[:,:2],mid[:,None]))
 	return mid, rad
 
-def make_sweep(ctime, baz0, waz, bel0, off, npoint=4):
-	from pixell import coordinates
-	# given ctime,baz0,waz,bel [ntod], off[ntod,{xi,eta}], make
-	# make sweeps[ntod,npoint,{ra,dec}]
-	# so3g can't handle per-sample pointing offsets, so it would
-	# force us to loop here. We therefore simply modify the pointing
-	# offsets so we can simply add them to az,el
-	az_off, el = coordinates.euler_rot((0.0, -bel0, 0.0), off.T)
-	az  = (baz0+az_off)[:,None] + np.linspace(-0.5,0.5,npoint)*waz[:,None]
-	el  = el   [:,None] + az*0
-	ts  = ctime[:,None] + az*0
-	sightline = so3g.proj.coords.CelestialSightLine.az_el(
-		ts.reshape(-1), az.reshape(-1), el.reshape(-1), site="so", weather="typical")
-	pos_equ = np.asarray(sightline.coords()) # [ntot,{ra,dec,cos,sin}]
-	sweep   = pos_equ.reshape(len(ctime),npoint,4)[:,:,:2]
-	return sweep
-
 # These functions could use some low-level acceleration
 
 def get_range_dets(bins, ranges):
@@ -743,7 +683,7 @@ def merge_cuts(cuts):
 	N    = nsamp+1 # +1 to avoid merging across dets
 	franges = []
 	for ci, cut in enumerate(cuts):
-		bind    = get_range_dets(cut.bins, cut.ranges)
+		bind    = get_range_dets(cut.bins, cut.ranges).astype(np.int64) # avoid overflow
 		franges.append(cut.ranges + bind[:,None]*N)
 	# 3. Merge overlapping ranges. We count how many times
 	# we enter and exit a cut region across all, and look for places
@@ -767,6 +707,7 @@ def merge_cuts(cuts):
 	# Unflatten into per-detector
 	bind     = oranges[:,0]//N
 	oranges -= bind[:,None]*N
+	oranges  = oranges.astype(np.int32)
 	nperdet  = np.bincount(bind, minlength=ndet)
 	obins    = counts_to_bins(nperdet)
 	# Finally construct a new cut with the result
@@ -1094,7 +1035,6 @@ def deproject_cosel(signal, el, nmode=2, dev=None):
 	print(dev.np.std(signal))
 	#utils.call_help(dev.lib.sgemm, "N", "N", nsamp, ndet, nmode, -1, B, B.shape[1], coeffs, coeffs.shape[1], 1, signal, signal.shape[1])
 	signal -= dev.np.einsum("md,mi->di", coeffs, B)
-
 	print(dev.np.std(signal))
 
 def deglitch(signal, cuts, w=10, dev=None):
@@ -1125,44 +1065,35 @@ def deglitch(signal, cuts, w=10, dev=None):
 	with bench.mark("deglitch core", tfun=dev.time):
 		dev.lib.deglitch(signal, bvals, index_map2)
 
-def deglitch_old(signal, cuts, w=10, dev=None):
+# The idea of this was to effectively gapfill using the
+# common mode. Maybe it could work, but in my test, it
+# didn't really fix the gapfilling artifacts in the map
+# (maybe a small improvement), while it significantly
+# increased both small-scale and large-scale noise in the
+# map, surprisingly.
+def deglitch_commonsep(signal, cuts, w=10, dev=None):
+	# Split signal into common mode and rest
+	ccuts   = merge_det_cuts(cuts)
+	cmode   = robust_common_mode(signal)
+	signal -= cmode
+	# Deglitch common mode subtracted tod
+	deglitch(signal, cuts, w=w, dev=dev)
+	# Deglitch common mode
+	deglitch(cmode[None], ccuts, w=w, dev=dev)
+	# Add back common mode
+	signal += cmode
+
+def robust_common_mode(signal, bsize=8, dev=None):
 	if dev is None: dev = device.get_device()
-	# Define sample ranges just before and after each
-	# cut, where we will measure a mean value for dejumping
-	with bench.mark("get_cut_borders", tfun=dev.time):
-		borders = get_cut_borders(cuts,w)
-	# Hm, need to read out mean in each of these border regions. No easy way to do this
-	# Let's see how expensive it is to loop. 28 ms. Probably worth implementing in
-	# low-level code
-	# FIXME: This takes much longer for some tods, up to 100 s!
-	# Really must accelerate this!
-	with bench.mark("border vals %d" % len(borders), tfun=dev.time):
-		bvals = dev.np.zeros((len(borders),2), signal.dtype)
-		for di, (b1,b2) in enumerate(cuts.bins):
-			for ri in range(b1,b2):
-				bor   = borders[ri]
-				bvals1= signal[di,bor[0,0]:bor[0,1]]
-				bvals2= signal[di,bor[1,0]:bor[1,1]]
-				if bvals1.size  > 0: v1 = dev.np.mean(bvals1)
-				if bvals2.size  > 0: v2 = dev.np.mean(bvals2)
-				if bvals1.size == 0: v1 = v2
-				if bvals2.size == 0: v2 = v1
-				bvals[ri,0] = v1
-				bvals[ri,1] = v2
-	# 45 ms for this one. Not as slow as I feared, but should still be
-	# optimized. Unless it's faster on a gpu
-	with bench.mark("deglich core", tfun=dev.time):
-		# Will subtract v2-v1 from entire region after that cut.
-		jumps = bvals[:,1]-bvals[:,0]
-		cumj  = dev.np.cumsum(jumps)
-		# Will subtract cumj[i] for range[i,1]:range[i+1,0].
-		# Will set range[i,0]:range[i,1] to bvals[i,1]-cumj[i]
-		for di, (b1,b2) in enumerate(cuts.bins):
-			if b1 >= b2: continue
-			dcumj = cumj[b1:b2]
-			if b1 > 0: dcumj = dcumj - cumj[b1-1] # NB: -= would clobber!
-			for i, ri in enumerate(range(b1,b2)):
-				r1,r2 = cuts.ranges[ri]
-				r3    = cuts.ranges[ri+1,0] if ri < b2-1 else cuts.nsamp
-				signal[di,r1:r2]  = bvals[ri,1]-dcumj[i]
-				signal[di,r2:r3] -= dcumj[i]
+	signal = signal[:signal.shape[0]//bsize//bsize*bsize*bsize].reshape(-1,bsize,bsize,signal.shape[-1])
+	return dev.np.median(dev.np.median(dev.np.mean(signal,-2),-2),-2)
+
+def merge_det_cuts(cuts):
+	# 1. Turn cuts into a list of single-det cuts
+	dcuts = []
+	for b in cuts.bins:
+		if b[1] == b[0]: continue
+		dcuts.append(Sampcut((b-b[0])[None], cuts.ranges[b[0]:b[1]], nsamp=cuts.nsamp))
+	# 2. Merge them into a single cut
+	ocuts = merge_cuts(dcuts)
+	return ocuts

@@ -4,6 +4,8 @@ from pixell import utils, colors
 from . import device
 from .logging import L
 
+class RecoverableError(Exception): pass
+
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 

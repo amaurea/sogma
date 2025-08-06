@@ -3,6 +3,20 @@
 # or artihmetic expressions. We should be able to select at
 # sub-id level, but also access the corresponding query() data.
 #
+# The current approach is simple but hacky. It relies on rewriting
+# the query into an SQL query without actually knowing SQL syntax.
+# This architecture makes supporting python-level functions like
+# hits() diffcult to shoehorn in.
+#
+# A more well-defined approach would be to requre that it's instead
+# transformable into *python* syntax, and then evaluating that on
+# abstract objects that simply capture what operations are being done
+# on colums, tags or constants. Any purely-sql thing that that remains
+# at the top-level "and" would be transformed into SQL and executed.
+# What's left would be evaled in python based on the result of the
+# SQL. Implementing this would be a lot of work though, so for now
+# I'm sticking with the simple approach.
+#
 # Can be done with these steps:
 # 1. separate out the sub-obs parts of the query. These are the wafer
 #    slot and band. Maybe others. These won't have a special syntax,
@@ -20,11 +34,6 @@ import re
 import numpy as np
 from pixell import sqlite, utils
 
-# TODO:
-# * Actual loading code will probably want to dump output of eval_query
-#   into a sotodlib ResultSet, at least for now
-# * Would be nice to support simple queries in soslow too...
-
 def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the
 	query and return a new SQL object (pointing to a temporary
@@ -35,7 +44,7 @@ def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=
 	# Check if we have a subobsdb or not
 	is_subobs = "subobs_id" in cols
 	# Main parse of the simple query
-	qwhere, idfile = parse_query(simple_query, cols, tags)
+	qwhere, idfile, pycode = parse_query(simple_query, cols, tags)
 	qjoin = ""
 	qsort = ""
 	# Create database we will put the result in, and attach
@@ -68,8 +77,8 @@ def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=
 	# Ok, by this we're detached again, and res_db contains the
 	# resulting obs and tags tables. But we may need a second pass
 	# if we're still at the obsdb level, but need a subobs db
-	if not subobs: return res_db # didn't ask for subobs
-	if is_subobs:  return res_db # already subobs
+	if not subobs: return res_db, pycode # didn't ask for subobs
+	if is_subobs:  return res_db, pycode # already subobs
 	# Ok, do the subobs expansion
 	with subobs_expansion(res_db) as subobs_db:
 		res_db.close() # don't need this one any more
@@ -91,10 +100,11 @@ def parse_query(simple_query, cols, tags):
 	# A Simple Query is a comma-separated list of constraints.
 	# Each constraint can be just a tag name, or a full expression
 	# 1. Translate ,-separation into ()and()
-	toks  = utils.split_outside(simple_query, ",", start="([{'\"", end=")]}'\"")
+	toks   = utils.split_outside(simple_query, ",", start="([{'\"", end=")]}'\"")
 	# 2. Inital pass through syntax that's only supported at top-level
-	idfile= None
-	otoks = []
+	idfile = None
+	otoks  = []
+	pycode = []
 	for tok in toks:
 		# Direct tod list. Can be combined with other constraints, but
 		# only to further restrict. Multiple @ per query not supported -
@@ -106,12 +116,19 @@ def parse_query(simple_query, cols, tags):
 		# not in the database will be silently discarded.
 		if tok.startswith("@"):
 			idfile = tok[1:]
+		# Very hacky! (See notes above on future directions)
+		# Look for specific function calls that must be implemented in python.
+		# If present, the whole top-level segment will be treated in python!
+		elif contains_pyfuncs(tok):
+			pycode.append(tok)
 		else:
 			otoks.append(tok)
 	toks = otoks
 	# Translate the rest into a general query, so it can all be processed
 	# homogeneously
 	query = " and ".join(["(%s)" % tok for tok in toks])
+	# Translate python code chunks into a single statement
+	pycode = " & ".join(["(%s)" % tok for tok in pycode])
 	# This helper function handles more specific band selection if available
 	if "band" in cols: bandsel = lambda ftag, flavor: "(band = '%s')" % ftag
 	else:              bandsel = lambda ftag, flavor: "(tube_flavor = '%s')" % flavor
@@ -175,7 +192,7 @@ def parse_query(simple_query, cols, tags):
 	if len(qtags) > 0:
 		# I tried exists too, but it was much slower
 		query += " and obs_id in (select obs_id from tags where " + " and ".join(qtags) + ")"
-	return query, idfile
+	return query, idfile, pycode
 
 def subobs_expansion(obsdb, tags=True):
 	"""Given an obsdb SQL, return a subobsdb SQL using looping in SQL"""
@@ -301,3 +318,12 @@ def load_obslist(fname):
 		uobss, inds = np.unique(obss, return_index=True)
 		obss    = obss[np.sort(inds)]
 	return {"obs":obss, "subobs":subobss}
+
+
+# Python functions we will recognize
+_pyfuncs = ["hits"]
+def contains_pyfuncs(s):
+	for pyfunc in _pyfuncs:
+		if pyfunc + "(" in s:
+			return True
+	return False

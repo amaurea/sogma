@@ -29,31 +29,8 @@ class SoFastLoader:
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
 	def query(self, query=None, sweeps=True, output="sogma"):
-		if output not in ["sqlite", "resultset", "sogma"]:
-			raise ValueError("Unrecognized output format '%s" % str(output))
-		res_db = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
-		if output == "sqlite": return res_db
-		info   = core.metadata.resultset.ResultSet.from_cursor(res_db.execute("select * from obs"))
-		if output == "resultset": return info
-		dtype  = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(4,2))]
-		obsinfo= np.zeros(len(info), dtype).view(np.recarray)
-		obsinfo.id = info["subobs_id"]
-		obsinfo.ndet  = utils.dict_lookup(flavor_ndets_per_band, info["tube_flavor"])
-		obsinfo.nsamp = info["n_samples"]
-		obsinfo.ctime = info["start_time"]
-		obsinfo.dur   = info["stop_time"]-info["start_time"]
-		# Here come the parts that have to do with pointing.
-		# These arrays have a nasty habit of being object dtype
-		obsinfo.baz   = info["az_center"].astype(np.float64) * utils.degree
-		obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
-		obsinfo.waz   = info["az_throw" ].astype(np.float64) * utils.degree
-		wafer_centers, obsinfo.r = socommon.wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
-		if sweeps:
-			# Everything before this took around 16 µs/obs
-			# Make_sweep itself takes 20 µs/obs. So it's the biggest
-			# term, but not dominant
-			obsinfo.sweep = socommon.make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
-		return obsinfo
+		res_db, pycode = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
+		return socommon.finish_query(res_db, pycode, sweeps=sweeps, output=output)
 	def load(self, subid):
 		try:
 			with bench.mark("load_meta"):
@@ -416,10 +393,6 @@ def calibrate(data, meta, mul=32, dev=None):
 #################
 # Helpers below #
 #################
-
-# Hard-coded raw wafer detector counts per band. Independent of
-# telescope type, etc.
-flavor_ndets_per_band = {"lf":118, "mf": 864, "uhf": 864}
 
 # smurf: detset → channels, detset → wafer slot
 # assignment: channels → detectors

@@ -26,6 +26,7 @@ with sqlite.open(obsdb_path) as db:
 			# Format our output
 			date  = datetime.datetime.fromtimestamp(row["start_time"], tz=datetime.UTC)
 			dfmt  = date.strftime("%Y-%m-%d %H:%M:%S")
-			print("%s %19s %6.2f %6.1f %6.1f %6.1f %6.1f %s,%s" % (row["subobs_id"], dfmt, row["duration"]/60, row["az_center"], 2*row["az_throw"], row["el_center"], row["roll_center"], row["type"], row["subtype"]))
+			baz   = (row["az_center"]+180)%360-180
+			print("%s %19s %6.2f %7.1f %6.1f %6.1f %6.1f %s,%s" % (row["subobs_id"], dfmt, row["duration"]/60, baz, 2*row["az_throw"], row["el_center"], row["roll_center"], row["type"], row["subtype"]))
 		if not args.quiet:
 			print("%d matches" % len(info))

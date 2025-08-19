@@ -15,8 +15,8 @@ def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu
 Devices = bunch.Bunch()
 
 class MMDeviceMinimal(device.DeviceCpu):
-	def __init__(self, align=None, alloc_factory=None):
-		super().__init__(align=align, alloc_factory=alloc_factory)
+	def __init__(self, align=None, alloc_factory=None, verbose=False):
+		super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
 		self.name = "minimal"
 		# ffts. No plan caching for now
 		def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
@@ -55,8 +55,8 @@ try:
 	from cupy.cuda import cublas
 
 	class MMDeviceGpu(device.DeviceGpu):
-		def __init__(self, align=None, alloc_factory=None):
-			super().__init__(align=align, alloc_factory=alloc_factory)
+		def __init__(self, align=None, alloc_factory=None, verbose=False):
+			super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
 			self.name = "gpu"
 			# pointing
 			self.lib.PointingPrePlan = gpu_mm.PointingPrePlan
@@ -164,8 +164,8 @@ try:
 	import cpu_mm
 
 	class MMDeviceCpu(device.DeviceCpu):
-		def __init__(self, align=None, alloc_factory=None):
-			super().__init__(align=align, alloc_factory=alloc_factory)
+		def __init__(self, align=None, alloc_factory=None, verbose=False):
+			super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
 			self.name = "cpu"
 			# pointing
 			self.lib.PointingPrePlan = cpu_mm.PointingPrePlan

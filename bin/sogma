@@ -18,7 +18,7 @@ parser.add_argument("-m", "--mode",    type=str, default="full")
 parser.add_argument("-a", "--autocrop",   action="store_true")
 parser.add_argument("-N", "--nmat",    type=str, default="new")
 parser.add_argument(      "--ignore",  type=str, default="recover")
-parser.add_argument("-d", "--dump",    type=int, default=10)
+parser.add_argument("-d", "--dump",    type=str, default="10,20,50,100")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -36,6 +36,7 @@ comm_per   = mpi.COMM_SELF if separate else mpi.COMM_WORLD
 dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
+dump       = [int(w) for w in args.dump.split(",")]
 # Set up our device
 dev = device.get_device(args.device)
 # Set up our logging
@@ -73,9 +74,9 @@ else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev)
 
 if   args.mode == "full":
-	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=args.dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
+	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 elif args.mode == "individual":
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=args.dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 elif args.mode == "depth1":
-	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=args.dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
+	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

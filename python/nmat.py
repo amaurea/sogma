@@ -389,7 +389,7 @@ class NmatAdaptive(Nmat):
 		hbmps      = bmps**-0.5
 		# 1b. Divide out from the tod. After this ftod is whitened, except
 		# for the detector correlations
-		gutils.block_scale(ftod, hbmps, bsize=bsize_mean, inplace=True)
+		self.dev.lib.block_scale(ftod, hbmps, bsize=bsize_mean, inplace=True)
 		# [Step 2]: Build the frequency bins
 		# 2a. Measure the smooth background behind the peaks. The bin size should
 		# be wider then any spike we want to ignore. A good size would be the 1/scan_period,
@@ -480,7 +480,7 @@ class NmatAdaptive(Nmat):
 		t3  = self.dev.time()
 		# Apply the high-resolution, non-detector-correlated part of the model.
 		# The *2 compensates for the cast to real
-		gutils.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
+		self.dev.lib.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
 		t4  = self.dev.time()
 		# Then handle the detector-correlation part.
 		# First set up work arrays. Safe to overwrite tod array here,
@@ -497,7 +497,7 @@ class NmatAdaptive(Nmat):
 		self.dev.synchronize()
 		t5 = self.dev.time()
 		# Second half of high-resolution part
-		gutils.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
+		self.dev.lib.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
 		t6 = self.dev.time()
 		# And finish
 		if not nofft: self.dev.lib.irfft(ft, tod)

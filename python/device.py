@@ -112,13 +112,23 @@ try:
 				cublas.sdgmm(handle, get_cublas_side(side),
 					m, n, self.ptr(A), ldA, self.ptr(X), incX, self.ptr(C), ldC)
 			self.lib.sdgmm = sdgmm
+			# Scaling
+			def block_scale(tod, bscale, bsize=1, inplace=False):
+				if not inplace: tod = tod.copy()
+				nblock = tod.shape[-1]//bsize
+				btod   = tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))
+				btod  *= bscale[...,:nblock,None]
+				# incomplete last block
+				if tod.shape[-1] > nblock*bsize:
+					tod[...,nblock*bsize:] *= bscale[...,-1,None]
+				return tod
+			self.lib.block_scale = block_scale
 
 	def get_cublas_op(op):
 		# TODO add more
 		return {"n": cublas.CUBLAS_OP_N, "t": cublas.CUBLAS_OP_T}[op.lower()]
 	def get_cublas_side(side):
 		return {"l": cublas.CUBLAS_SIDE_LEFT, "r": cublas.CUBLAS_SIDE_RIGHT}[side.lower()]
-
 	# Adapted from gpu_mm's version, to use our memory pools
 	class PlanCacheGpu:
 		def __init__(self, pool, lib):
@@ -206,6 +216,8 @@ try:
 				elif side.lower() == 'l': C[:] = A*X[None,:]
 				else: raise ValueError("Unrecognized side '%s'" % str(side))
 			self.lib.sdgmm = sdgmm
+			# Scaling
+			self.lib.block_scale = cpu_mm.block_scale
 
 	Devices.cpu = MMDeviceCpu
 

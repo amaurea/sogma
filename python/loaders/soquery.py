@@ -32,7 +32,10 @@
 
 import re
 import numpy as np
-from pixell import sqlite, utils
+from pixell import sqlite
+# only needed for split_outside and split_by_group
+# speed up loading by skipping?
+from pixell import utils
 
 def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the

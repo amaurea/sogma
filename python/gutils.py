@@ -479,17 +479,6 @@ def downgrade(tod, bsize, inclusive=False, op=None):
 	if nblock > nwhole: otod[...,-1] = op(tod[...,nwhole*bsize:],-1)
 	return otod
 
-def block_scale(tod, bscale, bsize=1, inplace=False):
-	ap = device.anypy(tod)
-	if not inplace: tod = tod.copy()
-	nblock = tod.shape[-1]//bsize
-	btod   = tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))
-	btod  *= bscale[...,:nblock,None]
-	# incomplete last block
-	if tod.shape[-1] > nblock*bsize:
-		tod[...,nblock*bsize:] *= bscale[...,-1,None]
-	return tod
-
 def linint(arr, x):
 	ap = device.anypy(arr)
 	ix = ap.floor(x).astype(int)

@@ -450,11 +450,17 @@ class SignalCutPoly(SignalCutFull):
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
 
 # Mapmaking function
-def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True):
+def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
 	if prefix is None: prefix = ""
 	if inds is None:
 		dist = tiling.distribute_tods_semibrute(obsinfo, comm.size)
 		inds = np.where(dist.owner == comm.rank)[0]
+	# Set up exception types we will ignore
+	if   ignore == "all":     etypes = (Exception,)
+	elif ignore == "missing": etypes = (utils.DataMissing,)
+	elif ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
+	elif ignore == "none":    etypes = ()
+	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
 	# Accept either a list of integers or a single integer
 	try: dump = list(dump)
 	except TypeError: dump = [dump]
@@ -473,8 +479,7 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 		t1    = time.time()
 		try:
 			data  = loader.load(id)
-		except utils.DataMissing as e:
-		#except () as e:
+		except etypes as e:
 			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
 			continue
 		t2    = time.time()
@@ -484,7 +489,7 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 
 		try:
 			mapmaker.add_obs(id, data, deslope=False)
-		except gutils.RecoverableError as e:
+		except etypes as e:
 			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
 			continue
 		dev.garbage_collect()
@@ -516,7 +521,7 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 		if signal.output:
 			signal.write(prefix, "map", val)
 
-def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True):
+def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
 	if inds is None:
@@ -531,9 +536,9 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefi
 		id      = subinfo.id[0]
 		subpre  = prefix + id.replace(":","_") + "_"
 		L.print("Mapping %s" % id)
-		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False)
+		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
 
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True):
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover"):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
@@ -574,7 +579,7 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dum
 		name   = "%10.0f" % periods[pid][0]
 		subpre = prefix + name + "_"
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(subinfo)))
-		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False)
+		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
 
 
 def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):

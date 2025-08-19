@@ -17,6 +17,8 @@ parser.add_argument("-@", "--center-at",type=str, default=None)
 parser.add_argument("-m", "--mode",    type=str, default="full")
 parser.add_argument("-a", "--autocrop",   action="store_true")
 parser.add_argument("-N", "--nmat",    type=str, default="jon")
+parser.add_argument(      "--ignore",  type=str, default="recover")
+parser.add_argument("-d", "--dump",    type=int, default=10)
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -60,18 +62,20 @@ signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev)
 signals    = [signal_cut, signal_map]
 # Set up the noise model
 if   args.nmat == "jon":    noise_model = nmat.NmatDetvecs(dev=dev)
+elif args.nmat == "jond":   noise_model = nmat.NmatDetvecs(dev=dev, downweight=[1e-4, 0.25, 0.50])
 elif args.nmat == "uncorr": noise_model = nmat.NmatUncorr(dev=dev)
 elif args.nmat == "debug":  noise_model = nmat.NmatDebug(dev=dev)
 elif args.nmat == "none":   noise_model = nmat.Nmat(dev=dev)
 elif args.nmat == "new":    noise_model = nmat.NmatAdaptive(dev=dev)
+elif args.nmat == "newb":   noise_model = nmat.NmatAdaptiveB(dev=dev)
 else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 # Set up the mapmaker
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev)
 
 if   args.mode == "full":
-	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=10, maxiter=args.maxiter, maxerr=args.maxerr)
+	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=args.dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 elif args.mode == "individual":
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=10, maxiter=args.maxiter, maxerr=args.maxerr)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=args.dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 elif args.mode == "depth1":
-	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=10, maxiter=args.maxiter, maxerr=args.maxerr)
+	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=args.dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

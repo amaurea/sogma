@@ -17,6 +17,32 @@ from . import soquery, socommon
 # This is not good enough for obs-hits-point calculation, but it's good enough
 # for task distribution, which is the only thing it's currenlty used for
 
+# Reading multiple wafers at the same time
+# ----------------------------------------
+# A) Call fast_meta.read for each, then merge them,
+#    followed by a single fast_data call, and a single calibrate.
+#    A problem with this is that calibrate assumes a common iir_params
+#    for all detectors. Also fast_data assumes that it will get all
+#    all detectors in one go. So this approach would requrie quite a few
+#    changes.
+# B) Call fast_meta.read for each, determining a common sample range.
+#    Restrict each aman to that sample range.
+#    Then loop over them, calling fast_data and calibrate on each.
+#    Finally, merge them into one result.
+#    This approach requres no changes to any of the read functions.
+#    It should also use a bit less memory (fft arrays are smaller).
+#    One problem is that each calibrate thinks it has ownership of
+#    the "tod" buffer, so they would clobber each other. Can fix
+#    this by allocating an output array first, and then copying over
+#    subobs by subobs, instead of doing it all at the end. This
+#    output buffer would ideally also be "tod" though, since it's
+#    assumed that this is the buffer tod lives in later.
+#    Implement a mempool.swap() operation to make this cheap?
+#    Or add an option to calibrate to make it not use a predefined buffer
+#    for the tod? This may be good in any case, as we don't need
+#    the read-in buffer later.
+
+
 class SoFastLoader:
 	def __init__(self, configfile, dev=None, mul=32):
 		# Set up our metadata loader
@@ -41,8 +67,7 @@ class SoFastLoader:
 			# Calibrate the data
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
-		#except Exception as e:
-		except () as e:
+		except Exception as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Add timing info
@@ -183,12 +208,15 @@ class FastMeta:
 			abscal_cmb = self.acal_cache.get(stream_id, band).abscal_cmb
 		with bench.mark("pointing_model"):
 			pointing_model = self.pointing_model_cache.get_by_subid(subid)
+		# Get our sensitivity limits
+		sens_lim = socommon.sens_limits[band]
 		# Return our results. We don't put everything in an axismanager
 		# because that has significant overhead, and we don't need an
 		# axismanager for things that don't have any axes
 		return bunch.Bunch(aman=aman, iir_params=iir_params, finfos=finfos,
 			dac_to_phase = np.pi/2**15, timestamp_to_ctime=1e-8,
-			abscal_cmb = abscal_cmb, pointing_model=pointing_model)
+			abscal_cmb = abscal_cmb, pointing_model=pointing_model,
+			sens_lim=sens_lim)
 
 # This doesn't really belong here, unless we rename the module
 def fast_data(finfos, detax, sampax, alloc=None, fields=[
@@ -267,6 +295,9 @@ def calibrate(data, meta, mul=32, dev=None):
 		# Calibrate to CMB µK
 		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] # * meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
+
+	#bunch.write("test_tod.hdf", bunch.Bunch(tod=dev.get(dev.np.mean(signal,0))))
+	#1/0
 
 	#print("FIXME doing manual relcal")
 	#with bench.mark("calibrate_manual", tfun=dev.time):
@@ -353,17 +384,15 @@ def calibrate(data, meta, mul=32, dev=None):
 		dev.lib.irfft(ftod, signal)
 
 	with bench.mark("measure noise", tfun=dev.time):
-		rms  = measure_rms(signal)
+		rms = socommon.measure_rms(signal, dt=dt)
 
 	# Restrict to these detectors
 	with bench.mark("final detector prune", tfun=dev.time):
-		tol    = 0.2
-		ref    = np.median(rms[rms!=0])
-		good   = (rms > ref*tol)&(rms < ref/tol)
+		good   = socommon.sensitivity_cut(rms, meta.sens_lim)
 		signal = dev.np.ascontiguousarray(signal[good]) # 600 ms!
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
-		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
+		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after rms cut")
 
 	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
 
@@ -885,20 +914,6 @@ def polar_2d(x, y):
 	r = (x**2+y**2)**0.5
 	φ = np.arctan2(y,x)
 	return r, φ
-
-def measure_rms(tod, bsize=32, nblock=10):
-	ap  = device.anypy(tod)
-	tod = tod[:,:tod.shape[1]//bsize*bsize]
-	tod = tod.reshape(tod.shape[0],-1,bsize)
-	bstep = max(1,tod.shape[1]//nblock)
-	tod = tod[:,::bstep,:][:,:nblock,:]
-	return ap.median(ap.std(tod,-1),-1)
-
-def measure_rms2(tod, bsize=32, down=128):
-	ap  = device.anypy(tod)
-	tod = tod[:,:tod.shape[1]//bsize//down*bsize*down]
-	tod = tod.reshape(tod.shape[0],-1,bsize,down)
-	return ap.median(ap.std(ap.mean(tod,-1),-1),-1)
 
 # This takes 250 ms! And the quaternion stuff would be tedious
 # (but not difficult as such) to implement on the gpu

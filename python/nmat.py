@@ -32,9 +32,268 @@ class Nmat:
 		if not self.ready:
 			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
 
-# TODO: Update these notes to reflect what's actually done
+class NmatDebug(Nmat):
+	def __init__(self, ivar=None, alpha=-3, fknee=2.5, profile=None, bsize=256, dev=None):
+		self.dev   = dev or device.get_device()
+		self.bsize = bsize
+		self.ivar  = ivar
+		self.alpha = alpha
+		self.fknee = fknee
+		self.profile = profile
+		self.ready = ivar is not None
+	def build(self, tod, srate, **kwargs):
+		nsamp  = tod.shape[1]
+		nblock = nsamp//self.bsize
+		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
+		with utils.nowarn():
+			ivar = utils.without_nan(1/var)
+		f = self.dev.np.fft.rfftfreq(nsamp, 1/srate)
+		with utils.nowarn():
+			profile = 1/(1+(f/self.fknee)**self.alpha)
+		profile /= nsamp # fft normalization
+		return NmatDebug(ivar=ivar, alpha=self.alpha, fknee=self.fknee, bsize=self.bsize, profile=profile, dev=self.dev)
+	def apply(self, tod, inplace=True):
+		tod = self.white(tod, inplace=inplace)
+		ft  = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))
+		self.dev.lib.rfft(tod, ft)
+		ft *= self.profile
+		self.dev.lib.irfft(ft, tod)
+		return tod
+	def white(self, tod, inplace=True):
+		if not inplace: tod = tod.copy()
+		tod *= self.ivar[:,None]
+		return tod
 
-# Our model will be:
+class NmatUncorr(Nmat):
+	def __init__(self, spacing="exp", nbin=100, nmin=10, window=2, bins=None, ips_binned=None, ivar=None, nwin=None, dev=None):
+		self.dev        = dev or device.get_device()
+		self.spacing    = spacing
+		self.nbin       = nbin
+		self.nmin       = nmin
+		self.bins       = bins
+		self.ips_binned = ips_binned
+		self.ivar       = ivar
+		self.window     = window
+		self.nwin       = nwin
+		self.ready      = bins is not None and ips_binned is not None and ivar is not None
+	def build(self, tod, srate, **kwargs):
+		# Apply window while taking fft
+		nwin  = utils.nint(self.window*srate)
+		gutils.apply_window(tod, nwin)
+		ft    = self.dev.lib.rfft(tod)
+		# Unapply window again
+		gutils.apply_window(tod, nwin, -1)
+		return self.build_fourier(ft, tod.shape[1], srate, nwin=nwin)
+	def build_fourier(self, ftod, nsamp, srate, nwin=0):
+		ps = self.dev.np.abs(ftod)**2
+		del ftod
+		if   self.spacing == "exp": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
+		elif self.spacing == "lin": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
+		else: raise ValueError("Unrecognized spacing '%s'" % str(self.spacing))
+		ps_binned  = self.dev.np.array([self.dev.np.mean(ps[:,b[0]:b[1]],1) for b in bins]).T
+		ps_binned /= nsamp
+		ips_binned = 1/ps_binned
+		# Compute the representative inverse variance per sample
+		ivar = self.dev.np.zeros(len(ps),ps.dtype)
+		for bi, b in enumerate(bins):
+			ivar += ips_binned[:,bi]*(b[1]-b[0])
+		ivar /= bins[-1,1]-bins[0,0]
+		return NmatUncorr(spacing=self.spacing, nbin=len(bins), nmin=self.nmin, bins=bins, ips_binned=ips_binned, ivar=ivar, window=self.window, nwin=nwin, dev=self.dev)
+	def apply(self, tod, inplace=True, exp=1):
+		self.check_ready()
+		if not inplace: tod = tod.copy()
+		gutils.apply_window(tod, self.nwin)
+		ftod = self.dev.lib.rfft(tod)
+		self.apply_fourier(ftod, tod.shape[1], exp=exp)
+		ftod /= tod.shape[-1]
+		self.dev.lib.irfft(ftod, tod)
+		gutils.apply_window(tod, self.nwin)
+		return tod
+	def apply_fourier(self, ftod, nsamp, exp=1):
+		self.check_ready()
+		# Candidate for speedup in C
+		for bi, b in enumerate(self.bins):
+			ftod[:,b[0]:b[1]] *= (self.ips_binned[:,None,bi])**exp/nsamp
+		# I divided by the normalization above instead of passing normalize=True
+		# here to reduce the number of operations needed
+	def white(self, tod, inplace=True):
+		self.check_ready()
+		if not inplace: tod = tod.copy()
+		gutils.apply_window(gtod, self.nwin)
+		tod *= self.ivar[:,None]
+		gutils.apply_window(gtod, self.nwin)
+		return tod
+	def write(self, fname):
+		self.check_ready()
+		data = bunch.Bunch(type="NmatUncorr")
+		for field in ["spacing", "nbin", "nmin", "bins", "ips_binned", "ivar", "window", "nwin"]:
+			data[field] = getattr(self, field)
+		bunch.write(fname, data)
+	@staticmethod
+	def from_bunch(data, dev=None):
+		return NmatUncorr(spacing=data.spacing, nbin=data.nbin, nmin=data.nmin, bins=data.bins, ips_binned=data.ips_binned, ivar=data.ivar, window=window, nwin=nwin, dev=dev)
+
+class NmatWhite(Nmat):
+	def __init__(self, ivar=None, bsize=256, dev=None):
+		self.dev   = dev or device.get_device()
+		self.bsize = bsize
+		self.ivar  = ivar
+		self.ready = ivar is not None
+	def build(self, tod, **kwargs):
+		nsamp  = tod.shape[1]
+		nblock = nsamp//self.bsize
+		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
+		with utils.nowarn():
+			ivar = utils.without_nan(1/var)
+		return NmatWhite(ivar=ivar, bsize=self.bsize, dev=self.dev)
+	def apply(self, tod, inplace=True):
+		if not inplace: tod = tod.copy()
+		tod *= self.ivar[:,None]
+		return tod
+	def white(self, tod, inplace=True): return self.apply(tod, inplace=inplace)
+	def write(self, fname):
+		bunch.write(fname, bunch.Bunch(type="NmatWhite"))
+	@staticmethod
+	def from_bunch(data, dev=None): return NmatWhite(ivar=data.ivar, dev=dev)
+	def check_ready(self):
+		if not self.ready:
+			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
+
+class NmatDetvecs(Nmat):
+	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
+			downweight=[], window=2, nwin=None, verbose=False, bins=None, iD=None, V=None,
+			Kh=None, iE=None, ivar=None, dev=None):
+		# Variables used for building the noise model
+		if bin_edges is None: bin_edges = np.array([
+			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
+			1.20, 1.40, 1.70, 2.00, 2.40, 2.80, 3.40, 3.80,
+			4.60, 5.00, 5.50, 6.00, 6.50, 7.00, 8.00, 9.00, 10.0, 11.0,
+			12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0,
+			24.0, 26.0, 28.0, 30.0, 32.0, 36.5, 41.0,
+			45.0, 50.0, 55.0, 65.0, 70.0, 80.0, 90.0,
+			100., 110., 120., 130., 140., 150., 160., 170.,
+			180., 190.
+		])
+		self.dev       = dev or device.get_device()
+		self.bin_edges = np.array(bin_edges)
+		self.mode_bins = np.array(mode_bins)
+		self.eig_lim   = eig_lim
+		self.single_lim= single_lim
+		self.verbose   = verbose
+		self.downweight= downweight
+		# Variables used for applying the noise model
+		self.bins      = bins
+		self.window    = window
+		self.nwin      = nwin
+		self.iD, self.V, self.Kh, self.ivar = iD, V, Kh, ivar
+		self.iE        = iE # not necessary
+		self.ready      = all([a is not None for a in [iD, V, Kh, ivar]])
+		if self.ready:
+			self.iD, self.V, self.Kh, self.ivar = [dev.np.asarray(a) for a in [iD, V, Kh, ivar]]
+			self.maxbin = np.max(self.bins[:,1]-self.bins[:,0])
+	def build(self, tod, srate, extra=False, **kwargs):
+		# Apply window before measuring noise model
+		dtype = tod.dtype
+		nwin  = utils.nint(self.window*srate)
+		ndet, nsamp = tod.shape
+		nfreq = nsamp//2+1
+		tod   = self.dev.np.asarray(tod)
+		gutils.apply_window(tod, nwin)
+		#bunch.write("test_sogma_full.hdf", bunch.Bunch(tod=tod, srate=srate))
+		ft    = self.dev.lib.rfft(tod)
+		# Unapply window again
+		gutils.apply_window(tod, nwin, -1)
+		#del tod
+		# First build our set of eigenvectors in two bins. The first goes from
+		# 0.25 to 4 Hz the second from 4Hz and up
+		mode_bins = makebins(self.mode_bins, srate, nfreq, 1000, rfun=np.round)[1:]
+		if np.any(np.diff(mode_bins) < 0):
+			raise RuntimeError(f"At least one of the frequency bins has a negative range: \n{mode_bins}")
+		# Then use these to get our set of basis vectors
+		V = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, force_common=True, verbose=self.verbose, dtype=dtype)
+		nmode= V.shape[1]
+		if V.size == 0: raise errors.ModelError("Could not find any noise modes")
+		# Cut bins that extend beyond our max frequency
+		bin_edges = self.bin_edges[self.bin_edges < srate/2 * 0.99]
+		bins      = makebins(bin_edges, srate, nfreq, nmin=2*nmode, rfun=np.round)
+		nbin      = len(bins)
+		# Now measure the power of each basis vector in each bin. The residual
+		# noise will be modeled as uncorrelated
+		E  = self.dev.np.zeros([nbin,nmode],dtype)
+		D  = self.dev.np.zeros([nbin,ndet],dtype)
+		Nd = self.dev.np.zeros([nbin,ndet],dtype)
+		for bi, b in enumerate(bins):
+			# Skip the DC mode, since it's it's unmeasurable and filtered away
+			b = np.maximum(1,b)
+			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
+		del Nd, ft
+		# Optionally downweight the lowest frequency bins
+		if self.downweight != None and len(self.downweight) > 0:
+			D[:len(self.downweight)] /= self.dev.np.array(self.downweight)[:,None]
+		# Also compute a representative white noise level
+		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
+		ivar  = self.dev.np.sum(1/D*bsize[:,None],0)/self.dev.np.sum(bsize)
+		ivar *= nsamp
+		# We need D", not D
+		iD, iE = 1/D, 1/E
+		# Precompute Kh = (E" + V'D"V)**-0.5
+		Kh = self.dev.np.zeros([nbin,nmode,nmode],dtype)
+		for bi in range(nbin):
+			iK = self.dev.np.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
+			Kh[bi] = np.linalg.cholesky(self.dev.np.linalg.inv(iK))
+		# Construct a fully initialized noise matrix
+		nmat = NmatDetvecs(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
+				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
+				bins=bins, iD=iD, V=V, Kh=Kh, iE=iE, ivar=ivar, dev=self.dev)
+		return nmat
+	def apply(self, gtod, inplace=True):
+		self.check_ready()
+		t1 =self.dev.time()
+		if not inplace: gtod = gtod.copy()
+		gutils.apply_window(gtod, self.nwin)
+		t2 =self.dev.time()
+		ft = self.dev.pools["ft"].empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
+		self.dev.lib.rfft(gtod, ft)
+		# If we don't cast to real here, we get the same result but much slower
+		rft = ft.view(gtod.dtype)
+		t3 =self.dev.time()
+		# Work arrays. Safe to overwrite tod array here, since we'll overwrite it with the ifft afterwards anyway
+		ndet, nmode = self.V.shape
+		nbin        = len(self.bins)
+		with self.dev.pools["tod"].as_allocator():
+			# Tmp must be big enough to hold a full bin's worth of data
+			tmp    = self.dev.np.empty([nmode,2*self.maxbin],dtype=rft.dtype)
+			vtmp   = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
+			divtmp = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
+			apply_vecs(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
+		self.dev.synchronize()
+		t4 =self.dev.time()
+		self.dev.lib.irfft(ft, gtod)
+		t5 =self.dev.time()
+		gutils.apply_window(gtod, self.nwin)
+		t6 =self.dev.time()
+		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
+		return gtod
+	def white(self, gtod, inplace=True):
+		self.check_ready()
+		if not inplace: gtod.copy()
+		gutils.apply_window(gtod, self.nwin)
+		gtod *= self.ivar[:,None]
+		gutils.apply_window(gtod, self.nwin)
+		return gtod
+	def write(self, fname):
+		data = bunch.Bunch(type="NmatDetvecs")
+		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
+				"bins", "D", "V", "E", "ivar"]:
+			data[field] = getattr(self, field)
+		bunch.write(fname, data)
+	@staticmethod
+	def from_bunch(data, dev=None):
+		return NmatDetvecs(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
+				window=data.window, nwin=data.nwin, downweight=data.downweight,
+				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar, dev=dev)
+
+# Originally considered a model of this form,
 #  ps = ps_detcov * Δperdet * Δmean * Δtweak
 # * ps_detcov is a detvecs noise model. Low frequency resolution
 # * Δperdet is a medium-resolution per-detector correction factor
@@ -47,304 +306,18 @@ class Nmat:
 #   correct overall weight, even if phases aren't captured the way
 #   they would have been in ps_detcov.
 #
-# The noise can have large spikes, especially due to the strong scan-synchronous
-# sgnal. The uncorrelated part of this will be captures by ps_mean and ps_perdet,
-# but we don't have the resolution to capture this in the detector-correlated model.
-# We will therefore do spike detection, and do separate mode finding in the spike
-# regions and atmospheric regions. Will also measure eigenvalues separately per
-# spike. If necessary can measure eigenvalues across multiple spikes at once if
-# there's not enough statistics.
+# However, Δperdet messed up the eigenvectors, and in practice got very
+# poor convergence, and Δtweak turned out to be numerically unstable.
+# So in the end I was left with ps = ps_detcov * Δmean.
 #
-# The overall measurement procedure will be:
-# 1. Measure mean(ps)
-# 2. Detect spikes in mean(ps). This only needs to capture the most important spikes.
-#    Use these to define spike bins. One find-bin across all
-# 3. Build atmospheric bins and find-bins
-# 4. Find eigenmodes in the find-bins
-# 5. Measure eigvals and white in each bin
-# 7. Predict ps_perdet. Define Δperdet as ps_perdet_true/ps_perdet_pred
-# 8. Predict mean(ps) using 6 and 7. Define Δmean as ps_mean_true/ps_mean_pred
-# 9. Predict ps(mean) using 6,7,8. Compare to true ps(mean). Define Δtweak
-#
-# Given the order we've measured things in, our model is actually
-#  N = Δtweak * Δmean * Δperdet * N_detcov
-# where N_detcov does not commute with Δperdet. Is this symmetric?
-# It can't be...
-
-
-# How to fix this? Could divide out the simple parts first (mean, perdet),
-# but this would leave all freqs equally important. I fear that would make
-# the eigenvectors it finds suboptimal, since t wouldn't know to prioritize
-# higher covariance, just higher correlation. But this can be fixed with
-# some care in the find-bins.
-
-
-# 1. Multiply by ips_mean * ips_tweak
-# 2. Multiply by ips_perdet
-# 3. Multiply by ips_detcorr
-
-
-# Fourier normalization
-# Define tod = F" ftod and Nf = <ftod ftod'>
-# Then N = <tod tod'> = F" <ftod ftod'> F"' = F" Nf F"'
-# and  N"= F' Nf" F
-# So we don't want the actual normalized inverse in apply().
-# But we can still choose our Fourier units to avoid overflow.
-# Currently we have F = rfft, but could also choose F = rfft/nsamp
-# to give us some breathing room.
-
-# Narrow bins are a problem as predicted. Possible approaches:
-# 1. Measure per bin, limiting modes to compensate for number of vectors
-#    and amplitudes measured. This is very limiting for narrow bins
-# 2. Measure overall, across all bins. Then fit amplitudes per bin,
-#    keeping the strongest, up to the width limit
-# 3. Measure up to N modes per bin, keeping them all regarless of how
-#    strong they are. Could help with capturing weak atmospheric power.
-#    Having some of the white noise caught up in modes isn't a problem
-#    as long as the total budges is ok. This approach would probably only
-#    make sense for pretty wide bins though.
-
-
-#class NmatAdaptive(Nmat):
-#	def __init__(self, eig_lim=16, single_lim=0.55, window=2, sampvar=1e-3,
-#			bsmooth=50, atm_res=2**(1/4), dev=None,
-#			hbmps=None, hbrel=None, bsize_mean=None, bsize_per=None,
-#			bins=None, iD=None, iE=None, V=None, Kh=None, ivar=None, nwin=None,
-#			normexp=-1):
-#		self.dev = dev or device.get_device()
-#		self.eig_lim    = eig_lim
-#		self.single_lim = single_lim
-#		self.window     = window
-#		self.sampvar    = sampvar
-#		self.bsmooth    = bsmooth
-#		self.atm_res    = atm_res
-#		self.normexp    = normexp
-#		# These are usually computed in build()
-#		self.bsize_mean = bsize_mean
-#		self.bsize_per  = bsize_per
-#		self.bins       = bins
-#		self.nwin       = nwin
-#		self.ready = all([a is not None for a in [bsize_mean,bsize_per,hbmps,hbrel,bins,iD,iE,V,Kh,ivar,nwin]])
-#		if self.ready:
-#			self.iD   = dev.np.ascontiguousarray(iD)
-#			self.ivar = dev.np.ascontiguousarray(ivar)
-#			self.hbmps= dev.np.ascontiguousarray(hbmps)
-#			self.hbrel= dev.np.ascontiguousarray(hbrel)
-#			self.V    = [dev.np.ascontiguousarray(v) for v in V]
-#			self.Kh   = [dev.np.ascontiguousarray(kh) for kh in Kh]
-#			self.iE   = iE
-#			self.maxbin = np.max(self.bins[:,1]-self.bins[:,0])
-#		self.dev.garbage_collect()
-#	def build(self, tod, srate, extra=False, **kwargs):
-#		# Improve on NmatDetvecs in two ways:
-#		# 1. Factorize out per-detector power
-#		# 2. Use the shape of the power spectrum to define
-#		#    both where to measure the eigenvectors, and
-#		#    the bins for the eigenvalues.
-#		nwin = utils.nint(self.window*srate)
-#		ndet, nsamp = tod.shape
-#		nfreq       = nsamp//2+1
-#		# Apply window in-place, to prefpare for fft
-#		gutils.apply_window(tod, nwin)
-#		ftod = self.dev.pools["fft"].empty((ndet,nfreq), utils.complex_dtype(tod.dtype))
-#		self.dev.lib.rfft(tod, ftod)
-#		# Normalize to avoid 32-bit overflow in atmospheric region.
-#		# Make sure apply and ivar are consistent
-#		ftod *= nsamp**self.normexp
-#		# Undo window
-#		gutils.apply_window(tod, nwin, -1)
-#		return self.build_fourier(ftod, srate, nsamp)
-#	def build_fourier(self, ftod, srate, nsamp):
-#		ndet, nfreq = ftod.shape
-#		dtype = utils.real_dtype(ftod.dtype)
-#		nwin  = utils.nint(self.window*srate)
-#		# [Step 1]: Build a detector-uncorrelated noise model
-#		# 1a. Measure power spectra
-#		ps  = self.dev.np.abs(ftod)**2  # full-res ps
-#		mps = self.dev.np.mean(ps,0)    # mean det power
-#		mtod= self.dev.np.mean(ftod,0)
-#		psm = self.dev.np.abs(mtod)**2  # power of common mode
-#		freqs = np.linspace(0, srate, nfreq)
-#		# The relative sample variance is 2/nsamp, which we want to be better than self.sampvar.
-#		# This requires nsamp > 2/self.sampvar
-#		bsize_mean = max(1,utils.ceil(2/self.sampvar/ndet))
-#		bsize_per  = max(1,utils.ceil(2/self.sampvar))
-#		# Simpler if the bin sizes are multiples of each other
-#		bsize_per  = utils.ceil(bsize_per, bsize_mean)
-#		bmps       = gutils.downgrade(mps, bsize_mean)
-#		brel       = gutils.downgrade(ps, bsize_per) / gutils.downgrade(mps, bsize_per)
-#		# Precompute whitening versions of these
-#		hbmps      = bmps**-0.5
-#		hbrel      = brel**-0.5
-#		# 1b. Divide out these from the tod. After this ftod is whitened, except
-#		# for the detector correlations
-#		gutils.block_scale(ftod, hbmps, bsize=bsize_mean, inplace=True)
-#		gutils.block_scale(ftod, hbrel, bsize=bsize_per,  inplace=True)
-#		# [Step 2]: Build the frequency bins
-#		# 2a. Measure the smooth background behind the peaks. The bin size should
-#		# be wider then any spike we want to ignore. A good size would be the 1/scan_period,
-#		# but we don't have az here. Can't use too wide bins, or we won't find the
-#		# first spikes
-#		bsize_smooth = self.bsmooth
-#		smooth_bps   = gutils.downgrade(mps, bsize_smooth, op=self.dev.np.median)
-#		smooth_ps    = gutils.logint(smooth_bps, self.dev.np.arange(nfreq)/bsize_smooth)
-#		# 2b. Find our spikes
-#		rel_ps       = mps/smooth_ps
-#		bins_spike   = find_spikes(self.dev.get(rel_ps))
-#		# If we detect a spike at the very beginning, in the extrapolated region, then it's
-#		# unreliable
-#		if bins_spike[0,0] == 0: bins_spike = bins_spike[1:]
-#		# 2c. Find atmospheric regions using smooth_bps
-#		bins_atm     = find_atm_bins(smooth_bps, bsize=bsize_smooth, step=self.atm_res)
-#		# Add a final all-the-rest bin
-#		bins_atm     = np.concatenate([bins_atm,[[bins_atm[-1,1],nfreq]]],0)
-#		# Want to exclude the spikes from the atmospheric model.
-#		# Since we model the freq-bins as independent and zero-mean,
-#		# we can just zero out the spike regions after measuring
-#		# them, and then compensate for the loss of power aftewards.
-#		# This lets us avoid splitting the atm-bins.
-#		# At the end (before the model can be applied), the freq-bins
-#		# and atm-bins *will* need to be harmonized into a single set
-#		# of non-overlapping bins, though.
-#		# 3a. Find modes in spike bins
-#		if len(bins_spike) > 0:
-#			vecs_spike = find_modes_individual(ftod, bins_spike,
-#				eig_lim=self.eig_lim, single_lim=self.single_lim, dtype=dtype)
-#			vecs_spike = fallback_modes(vecs_spike, first_nonempty(vecs_spike))
-#			# 3b. Measure mode power per spike. Spikes are narrow, so we probably
-#			# don't have enough statistics to measure all the modes we found.
-#			# Have ndet*bsize knowns. Will measure nmode+ndet unknowns. Need
-#			# nmode < bsize*(ndet-1)
-#			spike_power = measure_detvecs_ortho(ftod, bins_spike, vecs_spike, local_vecs=True)
-#		# 3c. Find atm modes
-#		mask = self.dev.np.ones(ftod.shape[-1], np.int32)
-#		for bi, (b1,b2) in enumerate(bins_spike):
-#			mask[b1:b2] = 0
-#		vecs_atm = find_modes_individual(ftod, bins_atm,
-#			eig_lim=self.eig_lim, single_lim=self.single_lim, dtype=dtype)
-#		vecs_atm = fallback_modes(vecs_atm, first_nonempty(vecs_atm))
-#		#vecs_atm = find_modes_jon(ftod, bins_atm, eig_lim=self.eig_lim,
-#		#	single_lim=self.single_lim, dtype=dtype)
-#		# 3d. Measure atm and residual power
-#		atm_power = measure_detvecs_ortho(ftod, bins_atm, vecs_atm, mask=mask, local_vecs=True)
-#		# 4. Interleave bins, unless we don't need to
-#		if len(bins_spike) > 0:
-#			bins, srcs, sinds = override_bins([bins_atm, bins_spike])
-#			bins  = np.array(bins)
-#			power = bunch.Bunch()
-#			for key in atm_power:
-#				power[key] = pick_data([atm_power[key], spike_power[key]], srcs, sinds)
-#		else:
-#			bins  = np.array(bins_atm)
-#			power = atm_power
-#
-#
-#		for bi, D in enumerate(power.Ds):
-#			print(bi, utils.minmax(D))
-#
-#		# 5. Precompute Kh and iD
-#		wtype = np.float64
-#		nbin = len(bins)
-#		iD = 1/self.dev.np.array(power.Ds).astype(wtype) # [nbin,ndet]
-#		iE = [1/e.astype(wtype) for e in power.Es]       # [nbin][nmode]
-#		# Precompute Kh = (E" + V'D"V)**-0.5. [nbin][nmode,nmode]
-#		Kh = []
-#		for bi in range(nbin):
-#			V = power.Vs[bi].astype(wtype)
-#			iK = self.dev.np.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
-#			Kh.append(np.linalg.cholesky(self.dev.np.linalg.inv(iK)))
-#		# Convert to target precsion
-#		iD = iD.astype(dtype)
-#		iE = [a.astype(dtype) for a in iE]
-#		Kh = [a.astype(dtype) for a in Kh]
-#		## 6. Calculate the chisquare per mode. We will use this to
-#		##    adjust bmps, interpreting any excess chisquare as
-#		##    unmodelled uncorrelated noise.
-#		#iNftod = ftod.copy()
-#		#rft    = iNftod.view(dtype)
-#		#maxnmode = max([V.shape[1] for V in power.Vs])
-#		#maxbin   = np.max(bins[:,1]-bins[:,0])
-#		#with self.dev.pools["pointing"].as_allocator():
-#		#	# Tmp must be big enough to hold a full bin's worth of data
-#		#	tmp    = self.dev.np.empty([maxnmode,2*maxbin],dtype=dtype)
-#		#	vtmp   = self.dev.np.empty([ndet,maxnmode], dtype=dtype)
-#		#	divtmp = self.dev.np.empty([ndet,maxnmode], dtype=dtype)
-#		#	apply_vecs2(rft, iD, power.Vs, Kh, bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
-#		#with self.dev.pools["pointing"].as_allocator():
-#		#	iNftod = self.dev.np.conj(iNftod)
-#		#	ftod  *= iNftod
-#		#chisq  = self.dev.np.mean(ftod.real,0)
-#		#bchisq = gutils.downgrade(chisq, bsize_mean)
-#		## 7. Update hmbps using bchisq
-#		#hbmps *= bchisq**-0.5
-#		# 7b. nsamp normalization of hbmps
-#		hbmps *= nsamp**self.normexp
-#		# 8. Also compute a representative white noise level
-#		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
-#		ivar  = self.dev.np.mean(hbmps**2)
-#		ivar *= nsamp
-#		self.dev.garbage_collect()
-#		# 6. Construct the full noise model
-#		return NmatAdaptive(
-#			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
-#			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res, dev=self.dev,
-#			hbmps=hbmps, hbrel=hbrel, bsize_mean=bsize_mean, bsize_per=bsize_per,
-#			bins=bins, iD=iD, iE=iE, V=power.Vs, Kh=Kh, ivar=ivar, nwin=nwin, normexp=self.normexp)
-#	def apply(self, tod, inplace=True, nofft=False):
-#		self.check_ready()
-#		t1 = self.dev.time()
-#		if not inplace: tod = tod.copy()
-#		if not nofft: gutils.apply_window(tod, self.nwin)
-#		t2 = self.dev.time()
-#		if not nofft:
-#			ft = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))
-#			self.dev.lib.rfft(tod, ft)
-#		else: ft = tod
-#		# If we don't cast to real here, we get the same result but much slower
-#		rft = ft.view(tod.dtype)
-#		t3  = self.dev.time()
-#		# Apply the high-resolution, non-detector-correlated part of the model.
-#		# The *2 compensates for the cast to real
-#		gutils.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
-#		gutils.block_scale(rft, self.hbrel, bsize=self.bsize_per *2, inplace=True)
-#		t4  = self.dev.time()
-#		# Then handle the detector-correlation part.
-#		# First set up work arrays. Safe to overwrite tod array here,
-#		# since we'll overwrite it with the ifft afterwards anyway
-#		ndet     = len(tod)
-#		maxnmode = max([V.shape[1] for V in self.V])
-#		nbin     = len(self.bins)
-#		with self.dev.pools["tod"].as_allocator():
-#			# Tmp must be big enough to hold a full bin's worth of data
-#			tmp    = self.dev.np.empty([maxnmode,2*self.maxbin],dtype=rft.dtype)
-#			vtmp   = self.dev.np.empty([ndet,maxnmode],         dtype=rft.dtype)
-#			divtmp = self.dev.np.empty([ndet,maxnmode],         dtype=rft.dtype)
-#			apply_vecs2(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
-#		self.dev.synchronize()
-#		t5 = self.dev.time()
-#		# Second half of high-resolution part
-#		gutils.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
-#		gutils.block_scale(rft, self.hbrel, bsize=self.bsize_per *2, inplace=True)
-#		t6 = self.dev.time()
-#		# And finish
-#		if not nofft: self.dev.lib.irfft(ft, tod)
-#		t7 =self.dev.time()
-#		if not nofft: gutils.apply_window(tod, self.nwin)
-#		t8 =self.dev.time()
-#		L.print("iN sub win %6.4f fft %6.4f s1 %6.4f mats %6.4f s2 %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6,t8-t7, tod.shape[0], tod.shape[1], maxnmode, len(self.bins)), level=3)
-#		return tod
-#	def white(self, gtod, inplace=True):
-#		self.check_ready()
-#		if not inplace: gtod.copy()
-#		gutils.apply_window(gtod, self.nwin)
-#		gtod *= self.ivar[:,None]
-#		gutils.apply_window(gtod, self.nwin)
-#		return gtod
+# Both of these factors are measured separately for spikes and the atmosphere,
+# since these don't have a lot in common. Spikes need narrow bins, while the atmosphere
+# needs to capture more eigenmodes.
 
 class NmatAdaptive(Nmat):
 	def __init__(self, eig_lim=16, single_lim=0.55, window=2, sampvar=1e-2,
 			bsmooth=50, atm_res=2**(1/4), maxmodes=100, dev=None,
-			hbmps=None, hbrel=None, bsize_mean=None, bsize_per=None,
+			hbmps=None, bsize_mean=None, bsize_per=None,
 			bins=None, iD=None, iE=None, V=None, Kh=None, ivar=None, nwin=None,
 			normexp=-1):
 		self.dev = dev or device.get_device()
@@ -361,12 +334,11 @@ class NmatAdaptive(Nmat):
 		self.bsize_per  = bsize_per
 		self.bins       = bins
 		self.nwin       = nwin
-		self.ready = all([a is not None for a in [bsize_mean,bsize_per,hbmps,hbrel,bins,iD,iE,V,Kh,ivar,nwin]])
+		self.ready = all([a is not None for a in [bsize_mean,bsize_per,hbmps,bins,iD,iE,V,Kh,ivar,nwin]])
 		if self.ready:
 			self.iD   = dev.np.ascontiguousarray(iD)
 			self.ivar = dev.np.ascontiguousarray(ivar)
 			self.hbmps= dev.np.ascontiguousarray(hbmps)
-			self.hbrel= dev.np.ascontiguousarray(hbrel)
 			self.V    = [dev.np.ascontiguousarray(v) for v in V]
 			self.Kh   = [dev.np.ascontiguousarray(kh) for kh in Kh]
 			self.iE   = iE
@@ -381,10 +353,6 @@ class NmatAdaptive(Nmat):
 		nwin = utils.nint(self.window*srate)
 		ndet, nsamp = tod.shape
 		nfreq       = nsamp//2+1
-
-		#bunch.write("test_tod.hdf", bunch.Bunch(tod=self.dev.get(self.dev.np.mean(tod,0))))
-		#1/0
-
 		# Apply window in-place, to prefpare for fft
 		gutils.apply_window(tod, nwin)
 		ftod = self.dev.pools["fft"].empty((ndet,nfreq), utils.complex_dtype(tod.dtype))
@@ -399,6 +367,10 @@ class NmatAdaptive(Nmat):
 		ndet, nfreq = ftod.shape
 		dtype = utils.real_dtype(ftod.dtype)
 		nwin  = utils.nint(self.window*srate)
+		# data-type to use in mode-finding. At some point it seemed like
+		# this needed to be float64, but float32 turned out to be fine
+		# after fixing some issues with overfit correlations
+		wtype = np.float32
 		# [Step 1]: Build a detector-uncorrelated noise model
 		# 1a. Measure power spectra
 		ps  = self.dev.np.abs(ftod)**2  # full-res ps
@@ -413,24 +385,11 @@ class NmatAdaptive(Nmat):
 		# Simpler if the bin sizes are multiples of each other
 		bsize_per  = utils.ceil(bsize_per, bsize_mean)
 		bmps       = gutils.downgrade(mps, bsize_mean)
-		brel       = gutils.downgrade(ps, bsize_per) / gutils.downgrade(mps, bsize_per)
-		# Turning off brel seems to improve convergence of intermediate scales,
-		# which is otherwise quite bad
-		print("FIXME brel")
-		brel[:] = 1
-		# The spectrum changes so quickly for the first few modes that the ratio gets
-		# unstable. One can end up with brel jumping by man orders of magnitude in
-		# the first bin. This can slow down convergence somewhat. We fix this by
-		# skipping the first few modes
-		sel = (Ellipsis,slice(5,max(bsize_per,7)))
-		brel[:,0]  = self.dev.np.mean(ps[sel],-1)/self.dev.np.mean(mps[sel])
-		# Precompute whitening versions of these
+		# Precompute whitening version
 		hbmps      = bmps**-0.5
-		hbrel      = brel**-0.5
-		# 1b. Divide out these from the tod. After this ftod is whitened, except
+		# 1b. Divide out from the tod. After this ftod is whitened, except
 		# for the detector correlations
 		gutils.block_scale(ftod, hbmps, bsize=bsize_mean, inplace=True)
-		gutils.block_scale(ftod, hbrel, bsize=bsize_per,  inplace=True)
 		# [Step 2]: Build the frequency bins
 		# 2a. Measure the smooth background behind the peaks. The bin size should
 		# be wider then any spike we want to ignore. A good size would be the 1/scan_period,
@@ -455,11 +414,9 @@ class NmatAdaptive(Nmat):
 		# them, and then compensate for the loss of power aftewards.
 		# This lets us avoid splitting the atm-bins when measuring.
 		# 3a. Find modes in spike bins
-		wtype = np.float32
 		# This is a bit ad-hoc, but it gives high but not completely dominating
 		# weight to the low-l atmospheric region
 		weight = (mps/np.mean(mps))**0.5
-
 		if len(bins_spike) > 0:
 			spike_power = noise_modes_hybrid(ftod, bins_spike, weight=weight,
 				eig_lim=self.eig_lim, single_lim=self.single_lim, nmax=self.maxmodes, wtype=wtype)
@@ -493,47 +450,20 @@ class NmatAdaptive(Nmat):
 		iD = iD.astype(dtype, copy=False)
 		iE = [a.astype(dtype, copy=False) for a in iE]
 		Kh = [a.astype(dtype, copy=False) for a in Kh]
-		## 6. Calculate the chisquare per mode. We will use this to
-		##    adjust bmps, interpreting any excess chisquare as
-		##    unmodelled uncorrelated noise.
-		#iNftod = ftod.copy()
-		#rft    = iNftod.view(dtype)
-		#maxnmode = max([V.shape[1] for V in power.Vs])
-		#maxbin   = np.max(bins[:,1]-bins[:,0])
-		#with self.dev.pools["pointing"].as_allocator():
-		#	# Tmp must be big enough to hold a full bin's worth of data
-		#	tmp    = self.dev.np.empty([maxnmode,2*maxbin],dtype=dtype)
-		#	vtmp   = self.dev.np.empty([ndet,maxnmode], dtype=dtype)
-		#	divtmp = self.dev.np.empty([ndet,maxnmode], dtype=dtype)
-		#	apply_vecs2(rft, iD, power.Vs, Kh, bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
-		#with self.dev.pools["pointing"].as_allocator():
-		#	iNftod = self.dev.np.conj(iNftod)
-		#	ftod  *= iNftod
-		#chisq  = self.dev.np.mean(ftod.real,0)
-		#bchisq = gutils.downgrade(chisq, bsize_mean)
-		## 7. Update hmbps using bchisq
-		#hbmps *= bchisq**-0.5
-		# 7b. nsamp normalization of hbmps
+		# 6. nsamp normalization of hbmps
 		hbmps *= nsamp**self.normexp
-		# 8. Also compute a representative white noise level
+		# 7. Also compute a representative white noise level
 		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
 		ivar  = self.dev.np.mean(1/gutils.downgrade(ps, bsize_per), -1)
 		# (nsamp**normexp)**2 * nsamp = nsamp**(2*normexp+1)
 		ivar *= nsamp**(2*self.normexp+1)
 		self.dev.garbage_collect()
-
-		## FIXME
-		## Ad-hoc low-f damping
-		#f  = self.dev.np.arange(ftod.shape[1])*(srate/2/ftod.shape[1])
-		#bf = gutils.downgrade(f, bsize_mean)
-		#hbmps *= (1+(bf/0.1)**-3)**-0.5
-
-		# 6. Construct the full noise model
+		# 8. Construct the full noise model
 		return NmatAdaptive(
 			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
 			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
 			maxmodes=self.maxmodes, dev=self.dev,
-			hbmps=hbmps, hbrel=hbrel, bsize_mean=bsize_mean, bsize_per=bsize_per,
+			hbmps=hbmps, bsize_mean=bsize_mean, bsize_per=bsize_per,
 			bins=bins, iD=iD, iE=iE, V=power.Vs, Kh=Kh, ivar=ivar, nwin=nwin, normexp=self.normexp)
 	def apply(self, tod, inplace=True, nofft=False):
 		self.check_ready()
@@ -551,7 +481,6 @@ class NmatAdaptive(Nmat):
 		# Apply the high-resolution, non-detector-correlated part of the model.
 		# The *2 compensates for the cast to real
 		gutils.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
-		gutils.block_scale(rft, self.hbrel, bsize=self.bsize_per *2, inplace=True)
 		t4  = self.dev.time()
 		# Then handle the detector-correlation part.
 		# First set up work arrays. Safe to overwrite tod array here,
@@ -568,18 +497,8 @@ class NmatAdaptive(Nmat):
 		self.dev.synchronize()
 		t5 = self.dev.time()
 		# Second half of high-resolution part
-		gutils.block_scale(rft, self.hbrel, bsize=self.bsize_per *2, inplace=True)
 		gutils.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
 		t6 = self.dev.time()
-
-		#psiN = self.dev.np.abs(ft)**2
-		#psiN_m = self.dev.np.mean(psiN,0)
-		#psiN_0 = self.dev.np.min(psiN,0)
-		#psiN_1 = self.dev.np.max(psiN,0)
-		#bunch.write("test.hdf", bunch.Bunch(mps0=mps0,
-		#	bmps=self.dev.get(self.hbmps**2), brel=self.dev.get(self.hbrel**2), psiN_m = self.dev.get(psiN_m),
-		#	psiN_0 = self.dev.get(psiN_0), psiN_1 = self.dev.get(psiN_1)))
-
 		# And finish
 		if not nofft: self.dev.lib.irfft(ft, tod)
 		t7 =self.dev.time()
@@ -596,47 +515,306 @@ class NmatAdaptive(Nmat):
 		return gtod
 
 
+#################
+# Helpers below #
+#################
 
+def apply_vecs(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
+	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
+	memory as arguments instead.
+
+	ftod: The fourier-transform of the TOD, cast to float32. [ndet,nfreq]
+	iD:   The inverse white noise variance. [nbin,ndet]
+	V:    The eigenvectors. [ndet,nmode]
+	Kh:   The square root of the Woodbury kernel (E"+V'DV)**-0.5. [nbin,nmode,nmode]
+	bins: The frequency ranges for each bin. [nbin,{from,to}]
+	tmp, vtmp, divtmp: Work arrays
+	"""
+	if out    is None: out = dat
+	if dev    is None: dev = device.get_device()
+	ndet, nmode = V.shape
+	nfreq = ftod.shape[1]
+	for bi, (i1,i2) in enumerate(2*bins):
+		bsize = i2-i1
+		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
+		# 1. divtmp = iD V      [ndet,nmode]
+		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
+		dev.lib.sdgmm("R", nmode, ndet, V, nmode, iD[bi], 1, divtmp, nmode)
+		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
+		dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi:bi+1], nmode, divtmp, nmode, 0, vtmp, nmode)
+		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
+		dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, nmode, 0, tmp[:,:bsize], tmp.shape[1])
+		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
+		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
+		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
+		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, nmode, 1, out[:,i1:i2], nfreq)
+
+def apply_vecs2(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
+	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
+	memory as arguments instead. This is like apply_vecs, but Kh can be jagged and
+	there's a separate V per bin.
+
+	ftod: The fourier-transform of the TOD, cast to float32. [ndet,nfreq]
+	iD:   The inverse white noise variance. [nbin,ndet]
+	V:    The eigenvectors. [nbin][ndet,nmode]
+	Kh:   The square root of the Woodbury kernel (E"+V'DV)**-0.5. [nbin][nmode,nmode]
+	bins: The frequency ranges for each bin. [nbin,{from,to}]
+	tmp, vtmp, divtmp: Work arrays
+	"""
+	if out    is None: out = dat
+	if dev    is None: dev = device.get_device()
+	nfreq = ftod.shape[1]
+	maxnmode = divtmp.shape[1]
+	for bi, (i1,i2) in enumerate(2*bins):
+		bsize = i2-i1
+		ndet, nmode = V[bi].shape
+		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
+		# 1. divtmp = iD V      [ndet,nmode]
+		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
+		dev.lib.sdgmm("R", nmode, ndet, V[bi], nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
+		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
+		dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
+		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
+		dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, maxnmode, 0, tmp[:,:bsize], tmp.shape[1])
+		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
+		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
+		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
+		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, maxnmode, 1, out[:,i1:i2], nfreq)
+
+def measure_cov(d, nmax=10000):
+	ap    = device.anypy(d)
+	d     = d[:,::max(1,d.shape[1]//nmax)]
+	n,m   = d.shape
+	res   = ap.zeros((n,n),utils.real_dtype(d.dtype))
+	# Blocked calculation to save memory
+	step  = 10000
+	for i in range(0,m,step):
+		sub  = ap.ascontiguousarray(d[:,i:i+step])
+		res += sub.dot(ap.conj(sub.T)).real
+	return res/m
+
+def project_out_from_matrix(A, V):
+	"""This is the equivalent of deprojecting V in a timestream,
+	and then measuring the covariance of the resulting timestream.
+	It will therefore always be positive definite."""
+	if V.size == 0: return A
+	AV = A.dot(V)
+	# q = a-VV'a, Q = <qq'> = A + VV'AV'V - AVV' - VV'A
+	return A + V.dot(V.T.dot(AV)).dot(V.T) - AV.dot(V.T) - V.dot(AV.T)
+
+def freq2ind(freqs, srate, nfreq, rfun=None):
+	"""Returns the index of the first fourier mode with greater than freq
+	frequency, for each freq in freqs."""
+	if freqs is None: return freqs
+	if rfun  is None: rfun = np.ceil
+	return rfun(np.asarray(freqs)/(srate/2.0)*nfreq).astype(int)
+
+def makebins(edge_freqs, srate, nfreq, nmin=0, rfun=None):
+	# Translate from frequency to index
+	binds  = freq2ind(edge_freqs, srate, nfreq, rfun=rfun)
+	# Make sure no bins have two few entries
+	if nmin > 0:
+		binds2 = [binds[0]]
+		for b in binds:
+			if b-binds2[-1] >= nmin: binds2.append(b)
+		binds = binds2
+	# Cap at nfreq and eliminate any resulting empty bins
+	binds = np.unique(np.minimum(np.concatenate([[0],binds,[nfreq]]),nfreq))
+	# Go from edges to [:,{from,to}]
+	bins  = np.array([binds[:-1],binds[1:]]).T
+	return bins
+
+# This function breaks down when run on narrow bins, especially with many
+# narrow bins. Previosly, it would ignore the fact that cov will have
+# fewer valid eigenvalues if based on a narrow bin, especially if modes
+# have already been projected out. I've fixed that now, but the structure
+# still doesn't work well with many bins, since it now uses up its allotment
+# of modes early on and then has to stop looping.
+#
+# In the original usage this wasn't a big problem, since it was only called
+# with two big bins. But with the adaptive noise model it's a big problem.
+# I need to fgure out a better way to do this for that model.
+
+def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, force_common=False, nmax_frac=0.1, verbose=False, dtype=np.float32, return_eigs=False):
+	ap   = device.anypy(ft)
+	ndet, nfreq = ft.shape
+	nmax = int(ndet*nmax_frac)+1
+	# Set up our output arrays
+	vecs = ap.zeros([ndet,0],dtype=dtype)
+	eigs = []
+	# Force common mode?
+	if force_common:
+		v = ap.full([ndet,1],ndet**-0.5,dtype=dtype)
+		vecs = ap.concatenate([vecs,v],1)
+		eigs.append(ap.array([np.var(v.T.dot(ft))], dtype=dtype))
+	# Measure new orthogonal modes in each bin
+	for bi, b in enumerate(bins):
+		cov  = measure_cov(ft[:,b[0]:b[1]])
+		ndof = ndof=2*(b[1]-b[0])
+		v, e = find_modes_single(cov, ndof, deproj=vecs, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, verb_prefix="bin %d %5d %5d " % (bi, b[0], b[1]), dtype=dtype, return_eigs=True)
+		# How many do modes can we afford?
+		nleft = nmax - vecs.shape[1]
+		e, v = e[-nleft:], v[:,-nleft:]
+		vecs = ap.concatenate([vecs,v],1)
+		eigs.append(e)
+		# Exit early if we've used our allowance
+		if vecs.shape[1] >= nmax: break
+	eigs = ap.concatenate(eigs)
+	if return_eigs: return vecs, eigs
+	else: return vecs
+
+def find_modes_merged(ft, bins, eig_lim=None, single_lim=0, nmax_frac=0.1, verbose=False, dtype=np.float32, return_eigs=False):
+	cov  = 0
+	ndof = 0
+	for bi, b in enumerate(bins):
+		cov  += measure_cov(ft[:,b[0]:b[1]])
+		ndof += 2*(b[1]-b[0])
+	return find_modes_single(cov, ndof, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, dtype=dtype, return_eigs=return_eigs)
+
+def find_modes_individual(ft, bins, eig_lim=None, single_lim=0, nmax_frac=0.1, verbose=False, dtype=np.float32):
+	vecs = []
+	for bi, b in enumerate(bins):
+		cov  = measure_cov(ft[:,b[0]:b[1]])
+		ndof = 2*(b[1]-b[0])
+		bin_vecs = find_modes_single(cov, ndof, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, dtype=dtype)
+		vecs.append(bin_vecs)
+	return vecs
+
+def first_nonempty(vecs):
+	for vec in vecs:
+		if vec.size > 0:
+			return vec
+
+def fallback_modes(vecs, vec_fallback):
+	return [(vec if vec.size > 0 else vec_fallback) for vec in vecs]
+
+def find_modes_single(cov, ndof, eig_lim=None, single_lim=0, nmax_frac=0.1, deproj=None, verbose=False, verb_prefix="", dtype=np.float32, return_eigs=False):
+	"""Find strong eigenmodes given a covmat measured from data with ndof samples per detector.
+	For complex data, ndof would be twice that."""
+	ap   = device.anypy(cov)
+	ndet = len(cov)
+	nmax = int(ndet*nmax_frac)+1
+	ndof = min(ndof, ndet)
+	if deproj is not None:
+		cov   = project_out_from_matrix(cov, deproj)
+		ndof -= deproj.shape[1]
+	if ndof <= 0:
+		e = ap.zeros(0, dtype)
+		v = ap.zeros((ndet,0), dtype)
+	else:
+		e, v = ap.linalg.eigh(cov)
+		# skip the invalid ones
+		e, v = e[-ndof:], v[:,-ndof:]
+		del cov
+		accept = ap.full(len(e), True, bool)
+		if eig_lim is not None:
+			# Only accept modes at least eig_lim times the median e
+			median_e = ap.median(e)
+			accept  &= e/median_e >= eig_lim
+		if verbose: print("%s%4d modes above eig_lim" % (verb_prefix, ap.sum(accept)))
+		if single_lim is not None and e.size:
+			# Reject modes too concentrated into a single mode. Since v is normalized,
+			# values close to 1 in a single component must mean that all other components are small
+			singleness = ap.max(ap.abs(v),0)
+			accept    &= singleness < single_lim
+		if verbose: print("%s%4d modes also above single_lim" % (verb_prefix, ap.sum(accept)))
+		e, v = e[accept], v[:,accept]
+	if return_eigs: return v, e
+	else: return v
+
+def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=0.55, nper=50, nmax=100, D_tol=0.1, wtype=np.float32):
+	"""Decompose the noise covariance per bin into D+VEV'.
+	For narrow bins, eigenvectors are measured globally,
+	and a few strong ones are used per bin. For wide bins,
+	the strongest N modes are used directly."""
+	ap   = device.anypy(ft)
+	ndet = len(ft)
+	dtype= utils.real_dtype(ft.dtype)
+	# 1. First find vectors globally. These will be used for
+	#    narrow bins.
+	if weight is not None: ft *= weight # avoids copy, at cost of weight=0 breaking
+	gV    = find_modes_merged(ft, bins, eig_lim=eig_lim, single_lim=single_lim).astype(wtype, copy=False)
+	if weight is not None: ft /= weight
+	nglob = gV.shape[1]
+	nmax  = min(nmax, ndet//2)
+	# Output arrays
+	Ds, Es, Vs = [], [], []
+	for bi, b in enumerate(bins):
+		cov  = measure_cov(ft[:,b[0]:b[1]]).real.astype(wtype, copy=False)
+		bsize= b[1]-b[0]
+		ndof = 2*bsize*ndet
+		if mask is not None:
+			# Compensate for missing power and lower statistics
+			nmask  = np.sum(mask[b[0]:b[1]]==0)
+			# Ignore mask if it would make our bin completely empty
+			if nmask < bsize:
+				ndof  -= 2*nmask
+				cov   *= (bsize-nmask)/bsize
+		budget_E = bsize
+		# How many vectors can we afford to measure?
+		# Measure as many amplitudes as we can afford
+		# C = VEV' => E = (V'V)"V'CV(V'V)"'. V ortho, so this is just E = V'CV
+		E     = ap.einsum("dm,de,em->m", gV, cov, gV)
+		E     = np.diag(gV.T.dot(cov).dot(gV))
+		inds  = ap.argsort(E)[-budget_E:][-nmax:]
+		E, V  = E[inds], gV[:,inds]
+		# Finally measure the remaining uncorrelated power
+		cov  = project_out_from_matrix(cov, V)
+		D    = ap.diag(cov)
+		# Disallow unrealistically low per-detector noise. This can happen if we
+		# have overfitted the vectors. That shouldn't happen, an I try to avoid it above,
+		# but if it does happen, we don't want things to break
+		D    = ap.maximum(D, ap.median(D[D>0])*D_tol)
+		# budget_V = max(0,utils.floor((ndof/nper-ndet)/(ndet+1)))
+		#print("A %3d %6d %6d %12.3e %12.3e %12.3e %12.3e %5d %5d %4d" % (bi, b[0], b[1], ap.min(D), ap.quantile(D, 0.9), ap.min(E), ap.max(E), budget_E, budget_V, V.shape[1]))
+		Ds.append(D.astype(dtype, copy=False))
+		Es.append(E.astype(dtype, copy=False))
+		Vs.append(V.astype(dtype, copy=False))
+	return bunch.Bunch(Vs=Vs, Es=Es, Ds=Ds)
+
+def measure_detvecs(ft, vecs):
+	# Measure amps when we have non-orthogonal vecs
+	ap   = device.anypy(ft)
+	rhs  = vecs.T.dot(ft)
+	div  = vecs.T.dot(vecs)
+	amps = ap.linalg.solve(div,rhs)
+	E    = ap.mean(ap.abs(amps)**2,1)
+	# Project out modes for every frequency individually
+	dclean = ft - vecs.dot(amps)
+	# The rest is assumed to be uncorrelated
+	Nu = ap.mean(ap.abs(dclean)**2,1)
+	# The total auto-power
+	Nd = ap.mean(ap.abs(ft)**2,1)
+	return E, Nu, Nd
+
+def sichol(A):
+	iA = np.linalg.inv(A)
+	try: return np.linalg.cholesky(iA), 1
+	except np.linalg.LinAlgError:
+		return np.linalg.cholesky(-iA), -1
+
+def woodbury_invert(D, V, s=1):
+	"""Given a compressed representation C = D + sVV', compute a
+	corresponding representation for inv(C) using the Woodbury
+	formula."""
+	V, D = map(np.asarray, [V,D])
+	# Flatten everything so we can be dimensionality-agnostic
+	D = D.reshape(-1, D.shape[-1])
+	V = V.reshape(-1, V.shape[-2], V.shape[-1])
+	I = np.eye(V.shape[2])
+	# Allocate our output arrays
+	iD = gutils.safe_inv(D)
+	iV = V*0
+	# Invert each
+	for i in range(len(D)):
+		core = I*s + (V[i].T*iD[i,None,:]).dot(V[i])
+		core, sout = sichol(core)
+		iV[i] = iD[i,:,None]*V[i].dot(core)
+	sout = -sout
+	return iD, iV, sout
 
 def pick_data(datas, srcs, sinds):
 	return [datas[src][sind] for src, sind in zip(srcs, sinds)]
-
-#def override_bins(bins_base, bins_override):
-#	ni = len(bins_base)
-#	nj = len(bins_override)
-#	i  = 0
-#	j  = 0
-#	obins, ofrom, oinds = [], [], []
-#	b1, b2 = bins_base[0]
-#	while True:
-#		# Advance past any override bins that start before us.
-#		# These will have already been dealt with
-#		while j < nj and bins_override[j][0] <= b1: j += 1
-#		# Handle everything that overlaps with us and
-#		# starts at or after our start
-#		while j < nj and bins_override[j][0] < b2:
-#			# Part of us before override
-#			if b1 < bins_override[j][0]:
-#				obins.append((b1,bins_override[j][0]))
-#				ofrom.append(0)
-#				oinds.append(i)
-#			# The override
-#			obins.append(bins_override[j])
-#			ofrom.append(1)
-#			oinds.append(j)
-#			b1 = bins_override[j][1]
-#			j += 1
-#		# Advance to next
-#		if i >= ni-1: break
-#		i += 1
-#		b1 = max(b1, bins_base[i][0])
-#		b2 = bins_base[i][1]
-#	# Handle any left-over
-#	if b1 < b2:
-#		obins.append((b1,b2))
-#		ofrom.append(0)
-#		oinds.append(i)
-#	return obins, ofrom, oinds
 
 def override_bins(binss):
 	# keep track of end of previous bin and progress
@@ -778,606 +956,3 @@ def find_first_below(arr, vals):
 			vi += 1
 	return inds
 
-class NmatDetvecs(Nmat):
-	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
-			downweight=[], window=2, nwin=None, verbose=False, bins=None, iD=None, V=None,
-			Kh=None, iE=None, ivar=None, dev=None):
-		# Variables used for building the noise model
-		if bin_edges is None: bin_edges = np.array([
-			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
-			1.20, 1.40, 1.70, 2.00, 2.40, 2.80, 3.40, 3.80,
-			4.60, 5.00, 5.50, 6.00, 6.50, 7.00, 8.00, 9.00, 10.0, 11.0,
-			12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0,
-			24.0, 26.0, 28.0, 30.0, 32.0, 36.5, 41.0,
-			45.0, 50.0, 55.0, 65.0, 70.0, 80.0, 90.0,
-			100., 110., 120., 130., 140., 150., 160., 170.,
-			180., 190.
-		])
-		self.dev       = dev or device.get_device()
-		self.bin_edges = np.array(bin_edges)
-		self.mode_bins = np.array(mode_bins)
-		self.eig_lim   = eig_lim
-		self.single_lim= single_lim
-		self.verbose   = verbose
-		self.downweight= downweight
-		# Variables used for applying the noise model
-		self.bins      = bins
-		self.window    = window
-		self.nwin      = nwin
-		self.iD, self.V, self.Kh, self.ivar = iD, V, Kh, ivar
-		self.iE        = iE # not necessary
-		self.ready      = all([a is not None for a in [iD, V, Kh, ivar]])
-		if self.ready:
-			self.iD, self.V, self.Kh, self.ivar = [dev.np.asarray(a) for a in [iD, V, Kh, ivar]]
-			self.maxbin = np.max(self.bins[:,1]-self.bins[:,0])
-	def build(self, tod, srate, extra=False, **kwargs):
-		# Apply window before measuring noise model
-		dtype = tod.dtype
-		nwin  = utils.nint(self.window*srate)
-		ndet, nsamp = tod.shape
-		nfreq = nsamp//2+1
-		tod   = self.dev.np.asarray(tod)
-		gutils.apply_window(tod, nwin)
-		#bunch.write("test_sogma_full.hdf", bunch.Bunch(tod=tod, srate=srate))
-		ft    = self.dev.lib.rfft(tod)
-		# Unapply window again
-		gutils.apply_window(tod, nwin, -1)
-		#del tod
-		# First build our set of eigenvectors in two bins. The first goes from
-		# 0.25 to 4 Hz the second from 4Hz and up
-		mode_bins = makebins(self.mode_bins, srate, nfreq, 1000, rfun=np.round)[1:]
-		if np.any(np.diff(mode_bins) < 0):
-			raise RuntimeError(f"At least one of the frequency bins has a negative range: \n{mode_bins}")
-		# Then use these to get our set of basis vectors
-		V = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, force_common=True, verbose=self.verbose, dtype=dtype)
-		nmode= V.shape[1]
-		if V.size == 0: raise errors.ModelError("Could not find any noise modes")
-		# Cut bins that extend beyond our max frequency
-		bin_edges = self.bin_edges[self.bin_edges < srate/2 * 0.99]
-		bins      = makebins(bin_edges, srate, nfreq, nmin=2*nmode, rfun=np.round)
-		nbin      = len(bins)
-		# Now measure the power of each basis vector in each bin. The residual
-		# noise will be modeled as uncorrelated
-		E  = self.dev.np.zeros([nbin,nmode],dtype)
-		D  = self.dev.np.zeros([nbin,ndet],dtype)
-		Nd = self.dev.np.zeros([nbin,ndet],dtype)
-		for bi, b in enumerate(bins):
-			# Skip the DC mode, since it's it's unmeasurable and filtered away
-			b = np.maximum(1,b)
-			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
-		del Nd, ft
-		# Optionally downweight the lowest frequency bins
-		if self.downweight != None and len(self.downweight) > 0:
-			D[:len(self.downweight)] /= self.dev.np.array(self.downweight)[:,None]
-		# Also compute a representative white noise level
-		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
-		ivar  = self.dev.np.sum(1/D*bsize[:,None],0)/self.dev.np.sum(bsize)
-		ivar *= nsamp
-		# We need D", not D
-		iD, iE = 1/D, 1/E
-		# Precompute Kh = (E" + V'D"V)**-0.5
-		Kh = self.dev.np.zeros([nbin,nmode,nmode],dtype)
-		for bi in range(nbin):
-			iK = self.dev.np.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
-			Kh[bi] = np.linalg.cholesky(self.dev.np.linalg.inv(iK))
-		# Construct a fully initialized noise matrix
-		nmat = NmatDetvecs(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
-				window=self.window, nwin=nwin, downweight=self.downweight, verbose=self.verbose,
-				bins=bins, iD=iD, V=V, Kh=Kh, iE=iE, ivar=ivar, dev=self.dev)
-		return nmat
-	def apply(self, gtod, inplace=True):
-		self.check_ready()
-		t1 =self.dev.time()
-		if not inplace: gtod = gtod.copy()
-		gutils.apply_window(gtod, self.nwin)
-		t2 =self.dev.time()
-		ft = self.dev.pools["ft"].empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
-		self.dev.lib.rfft(gtod, ft)
-		# If we don't cast to real here, we get the same result but much slower
-		rft = ft.view(gtod.dtype)
-		t3 =self.dev.time()
-		# Work arrays. Safe to overwrite tod array here, since we'll overwrite it with the ifft afterwards anyway
-		ndet, nmode = self.V.shape
-		nbin        = len(self.bins)
-		with self.dev.pools["tod"].as_allocator():
-			# Tmp must be big enough to hold a full bin's worth of data
-			tmp    = self.dev.np.empty([nmode,2*self.maxbin],dtype=rft.dtype)
-			vtmp   = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
-			divtmp = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
-			apply_vecs(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
-		self.dev.synchronize()
-		t4 =self.dev.time()
-		self.dev.lib.irfft(ft, gtod)
-		t5 =self.dev.time()
-		gutils.apply_window(gtod, self.nwin)
-		t6 =self.dev.time()
-		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
-		return gtod
-	def white(self, gtod, inplace=True):
-		self.check_ready()
-		if not inplace: gtod.copy()
-		gutils.apply_window(gtod, self.nwin)
-		gtod *= self.ivar[:,None]
-		gutils.apply_window(gtod, self.nwin)
-		return gtod
-	def write(self, fname):
-		data = bunch.Bunch(type="NmatDetvecs")
-		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
-				"bins", "D", "V", "E", "ivar"]:
-			data[field] = getattr(self, field)
-		bunch.write(fname, data)
-	@staticmethod
-	def from_bunch(data, dev=None):
-		return NmatDetvecs(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
-				window=data.window, nwin=data.nwin, downweight=data.downweight,
-				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar, dev=dev)
-
-def apply_vecs(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
-	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
-	memory as arguments instead.
-
-	ftod: The fourier-transform of the TOD, cast to float32. [ndet,nfreq]
-	iD:   The inverse white noise variance. [nbin,ndet]
-	V:    The eigenvectors. [ndet,nmode]
-	Kh:   The square root of the Woodbury kernel (E"+V'DV)**-0.5. [nbin,nmode,nmode]
-	bins: The frequency ranges for each bin. [nbin,{from,to}]
-	tmp, vtmp, divtmp: Work arrays
-	"""
-	if out    is None: out = dat
-	if dev    is None: dev = device.get_device()
-	ndet, nmode = V.shape
-	nfreq = ftod.shape[1]
-	for bi, (i1,i2) in enumerate(2*bins):
-		bsize = i2-i1
-		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
-		# 1. divtmp = iD V      [ndet,nmode]
-		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
-		dev.lib.sdgmm("R", nmode, ndet, V, nmode, iD[bi], 1, divtmp, nmode)
-		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
-		dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi:bi+1], nmode, divtmp, nmode, 0, vtmp, nmode)
-		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
-		dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, nmode, 0, tmp[:,:bsize], tmp.shape[1])
-		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
-		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
-		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
-		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, nmode, 1, out[:,i1:i2], nfreq)
-
-
-def apply_vecs2(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
-	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
-	memory as arguments instead. This is like apply_vecs, but Kh can be jagged and
-	there's a separate V per bin.
-
-	ftod: The fourier-transform of the TOD, cast to float32. [ndet,nfreq]
-	iD:   The inverse white noise variance. [nbin,ndet]
-	V:    The eigenvectors. [nbin][ndet,nmode]
-	Kh:   The square root of the Woodbury kernel (E"+V'DV)**-0.5. [nbin][nmode,nmode]
-	bins: The frequency ranges for each bin. [nbin,{from,to}]
-	tmp, vtmp, divtmp: Work arrays
-	"""
-	if out    is None: out = dat
-	if dev    is None: dev = device.get_device()
-	nfreq = ftod.shape[1]
-	maxnmode = divtmp.shape[1]
-	for bi, (i1,i2) in enumerate(2*bins):
-		bsize = i2-i1
-		ndet, nmode = V[bi].shape
-		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
-		# 1. divtmp = iD V      [ndet,nmode]
-		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
-		dev.lib.sdgmm("R", nmode, ndet, V[bi], nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
-		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
-		dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
-		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
-		dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, maxnmode, 0, tmp[:,:bsize], tmp.shape[1])
-		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
-		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
-		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
-		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, maxnmode, 1, out[:,i1:i2], nfreq)
-
-class NmatUncorr(Nmat):
-	def __init__(self, spacing="exp", nbin=100, nmin=10, window=2, bins=None, ips_binned=None, ivar=None, nwin=None, dev=None):
-		self.dev        = dev or device.get_device()
-		self.spacing    = spacing
-		self.nbin       = nbin
-		self.nmin       = nmin
-		self.bins       = bins
-		self.ips_binned = ips_binned
-		self.ivar       = ivar
-		self.window     = window
-		self.nwin       = nwin
-		self.ready      = bins is not None and ips_binned is not None and ivar is not None
-	def build(self, tod, srate, **kwargs):
-		# Apply window while taking fft
-		nwin  = utils.nint(self.window*srate)
-		gutils.apply_window(tod, nwin)
-		ft    = self.dev.lib.rfft(tod)
-		# Unapply window again
-		gutils.apply_window(tod, nwin, -1)
-		return self.build_fourier(ft, tod.shape[1], srate, nwin=nwin)
-	def build_fourier(self, ftod, nsamp, srate, nwin=0):
-		ps = self.dev.np.abs(ftod)**2
-		del ftod
-		if   self.spacing == "exp": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
-		elif self.spacing == "lin": bins = utils.expbin(ps.shape[-1], nbin=self.nbin, nmin=self.nmin)
-		else: raise ValueError("Unrecognized spacing '%s'" % str(self.spacing))
-		ps_binned  = self.dev.np.array([self.dev.np.mean(ps[:,b[0]:b[1]],1) for b in bins]).T
-		ps_binned /= nsamp
-		ips_binned = 1/ps_binned
-		# Compute the representative inverse variance per sample
-		ivar = self.dev.np.zeros(len(ps),ps.dtype)
-		for bi, b in enumerate(bins):
-			ivar += ips_binned[:,bi]*(b[1]-b[0])
-		ivar /= bins[-1,1]-bins[0,0]
-		return NmatUncorr(spacing=self.spacing, nbin=len(bins), nmin=self.nmin, bins=bins, ips_binned=ips_binned, ivar=ivar, window=self.window, nwin=nwin, dev=self.dev)
-	def apply(self, tod, inplace=True, exp=1):
-		self.check_ready()
-		if not inplace: tod = tod.copy()
-		gutils.apply_window(tod, self.nwin)
-		ftod = self.dev.lib.rfft(tod)
-		self.apply_fourier(ftod, tod.shape[1], exp=exp)
-		ftod /= tod.shape[-1]
-		self.dev.lib.irfft(ftod, tod)
-		gutils.apply_window(tod, self.nwin)
-		return tod
-	def apply_fourier(self, ftod, nsamp, exp=1):
-		self.check_ready()
-		# Candidate for speedup in C
-		for bi, b in enumerate(self.bins):
-			ftod[:,b[0]:b[1]] *= (self.ips_binned[:,None,bi])**exp/nsamp
-		# I divided by the normalization above instead of passing normalize=True
-		# here to reduce the number of operations needed
-	def white(self, tod, inplace=True):
-		self.check_ready()
-		if not inplace: tod = tod.copy()
-		gutils.apply_window(gtod, self.nwin)
-		tod *= self.ivar[:,None]
-		gutils.apply_window(gtod, self.nwin)
-		return tod
-	def write(self, fname):
-		self.check_ready()
-		data = bunch.Bunch(type="NmatUncorr")
-		for field in ["spacing", "nbin", "nmin", "bins", "ips_binned", "ivar", "window", "nwin"]:
-			data[field] = getattr(self, field)
-		bunch.write(fname, data)
-	@staticmethod
-	def from_bunch(data, dev=None):
-		return NmatUncorr(spacing=data.spacing, nbin=data.nbin, nmin=data.nmin, bins=data.bins, ips_binned=data.ips_binned, ivar=data.ivar, window=window, nwin=nwin, dev=dev)
-
-class NmatWhite(Nmat):
-	def __init__(self, ivar=None, bsize=256, dev=None):
-		self.dev   = dev or device.get_device()
-		self.bsize = bsize
-		self.ivar  = ivar
-		self.ready = ivar is not None
-	def build(self, tod, **kwargs):
-		nsamp  = tod.shape[1]
-		nblock = nsamp//self.bsize
-		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
-		with utils.nowarn():
-			ivar = utils.without_nan(1/var)
-		return NmatWhite(ivar=ivar, bsize=self.bsize, dev=self.dev)
-	def apply(self, tod, inplace=True):
-		if not inplace: tod = tod.copy()
-		tod *= self.ivar[:,None]
-		return tod
-	def white(self, tod, inplace=True): return self.apply(tod, inplace=inplace)
-	def write(self, fname):
-		bunch.write(fname, bunch.Bunch(type="NmatWhite"))
-	@staticmethod
-	def from_bunch(data, dev=None): return NmatWhite(ivar=data.ivar, dev=dev)
-	def check_ready(self):
-		if not self.ready:
-			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
-
-class NmatDebug(Nmat):
-	def __init__(self, ivar=None, alpha=-3, fknee=2.5, profile=None, bsize=256, dev=None):
-		self.dev   = dev or device.get_device()
-		self.bsize = bsize
-		self.ivar  = ivar
-		self.alpha = alpha
-		self.fknee = fknee
-		self.profile = profile
-		self.ready = ivar is not None
-	def build(self, tod, srate, **kwargs):
-		nsamp  = tod.shape[1]
-		nblock = nsamp//self.bsize
-		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
-		with utils.nowarn():
-			ivar = utils.without_nan(1/var)
-		f = self.dev.np.fft.rfftfreq(nsamp, 1/srate)
-		with utils.nowarn():
-			profile = 1/(1+(f/self.fknee)**self.alpha)
-		profile /= nsamp # fft normalization
-		return NmatDebug(ivar=ivar, alpha=self.alpha, fknee=self.fknee, bsize=self.bsize, profile=profile, dev=self.dev)
-	def apply(self, tod, inplace=True):
-		tod = self.white(tod, inplace=inplace)
-		ft  = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))
-		self.dev.lib.rfft(tod, ft)
-		ft *= self.profile
-		self.dev.lib.irfft(ft, tod)
-		return tod
-	def white(self, tod, inplace=True):
-		if not inplace: tod = tod.copy()
-		tod *= self.ivar[:,None]
-		return tod
-
-def measure_cov(d, nmax=10000):
-	ap    = device.anypy(d)
-	d     = d[:,::max(1,d.shape[1]//nmax)]
-	n,m   = d.shape
-	res   = ap.zeros((n,n),utils.real_dtype(d.dtype))
-	# Blocked calculation to save memory
-	step  = 10000
-	for i in range(0,m,step):
-		sub  = ap.ascontiguousarray(d[:,i:i+step])
-		res += sub.dot(ap.conj(sub.T)).real
-	return res/m
-
-def project_out(d, modes): return d-modes.T.dot(modes.dot(d))
-
-def project_out_from_matrix(A, V):
-	"""This is the equivalent of deprojecting V in a timestream,
-	and then measuring the covariance of the resulting timestream.
-	It will therefore always be positive definite."""
-	if V.size == 0: return A
-	AV = A.dot(V)
-	# q = a-VV'a, Q = <qq'> = A + VV'AV'V - AVV' - VV'A
-	return A + V.dot(V.T.dot(AV)).dot(V.T) - AV.dot(V.T) - V.dot(AV.T)
-
-def measure_power(d): return np.real(np.mean(d*np.conj(d),-1))
-
-def freq2ind(freqs, srate, nfreq, rfun=None):
-	"""Returns the index of the first fourier mode with greater than freq
-	frequency, for each freq in freqs."""
-	if freqs is None: return freqs
-	if rfun  is None: rfun = np.ceil
-	return rfun(np.asarray(freqs)/(srate/2.0)*nfreq).astype(int)
-
-def makebins(edge_freqs, srate, nfreq, nmin=0, rfun=None):
-	# Translate from frequency to index
-	binds  = freq2ind(edge_freqs, srate, nfreq, rfun=rfun)
-	# Make sure no bins have two few entries
-	if nmin > 0:
-		binds2 = [binds[0]]
-		for b in binds:
-			if b-binds2[-1] >= nmin: binds2.append(b)
-		binds = binds2
-	# Cap at nfreq and eliminate any resulting empty bins
-	binds = np.unique(np.minimum(np.concatenate([[0],binds,[nfreq]]),nfreq))
-	# Go from edges to [:,{from,to}]
-	bins  = np.array([binds[:-1],binds[1:]]).T
-	return bins
-
-def mycontiguous(a):
-	# I used this in act for some reason, but not sure why. I vaguely remember ascontiguousarray
-	# causing weird failures later in lapack
-	b = np.zeros(a.shape, a.dtype)
-	b[...] = a[...]
-	return b
-
-# This function breaks down when run on narrow bins, especially with many
-# narrow bins. Previosly, it would ignore the fact that cov will have
-# fewer valid eigenvalues if based on a narrow bin, especially if modes
-# have already been projected out. I've fixed that now, but the structure
-# still doesn't work well with many bins, since it now uses up its allotment
-# of modes early on and then has to stop looping.
-#
-# In the original usage this wasn't a big problem, since it was only called
-# with two big bins. But with the adaptive noise model it's a big problem.
-# I need to fgure out a better way to do this for that model.
-
-def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, force_common=False, nmax_frac=0.1, verbose=False, dtype=np.float32, return_eigs=False):
-	ap   = device.anypy(ft)
-	ndet, nfreq = ft.shape
-	nmax = int(ndet*nmax_frac)+1
-	# Set up our output arrays
-	vecs = ap.zeros([ndet,0],dtype=dtype)
-	eigs = []
-	# Force common mode?
-	if force_common:
-		v = ap.full([ndet,1],ndet**-0.5,dtype=dtype)
-		vecs = ap.concatenate([vecs,v],1)
-		eigs.append(ap.array([np.var(v.T.dot(ft))], dtype=dtype))
-	# Measure new orthogonal modes in each bin
-	for bi, b in enumerate(bins):
-		cov  = measure_cov(ft[:,b[0]:b[1]])
-		ndof = ndof=2*(b[1]-b[0])
-		v, e = find_modes_single(cov, ndof, deproj=vecs, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, verb_prefix="bin %d %5d %5d " % (bi, b[0], b[1]), dtype=dtype, return_eigs=True)
-		# How many do modes can we afford?
-		nleft = nmax - vecs.shape[1]
-		e, v = e[-nleft:], v[:,-nleft:]
-		vecs = ap.concatenate([vecs,v],1)
-		eigs.append(e)
-		# Exit early if we've used our allowance
-		if vecs.shape[1] >= nmax: break
-	eigs = ap.concatenate(eigs)
-	if return_eigs: return vecs, eigs
-	else: return vecs
-
-def find_modes_merged(ft, bins, eig_lim=None, single_lim=0, nmax_frac=0.1, verbose=False, dtype=np.float32, return_eigs=False):
-	cov  = 0
-	ndof = 0
-	for bi, b in enumerate(bins):
-		cov  += measure_cov(ft[:,b[0]:b[1]])
-		ndof += 2*(b[1]-b[0])
-	return find_modes_single(cov, ndof, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, dtype=dtype, return_eigs=return_eigs)
-
-def find_modes_individual(ft, bins, eig_lim=None, single_lim=0, nmax_frac=0.1, verbose=False, dtype=np.float32):
-	vecs = []
-	for bi, b in enumerate(bins):
-		cov  = measure_cov(ft[:,b[0]:b[1]])
-		ndof = 2*(b[1]-b[0])
-		bin_vecs = find_modes_single(cov, ndof, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, dtype=dtype)
-		vecs.append(bin_vecs)
-	return vecs
-
-def first_nonempty(vecs):
-	for vec in vecs:
-		if vec.size > 0:
-			return vec
-
-def fallback_modes(vecs, vec_fallback):
-	return [(vec if vec.size > 0 else vec_fallback) for vec in vecs]
-
-def find_modes_single(cov, ndof, eig_lim=None, single_lim=0, nmax_frac=0.1, deproj=None, verbose=False, verb_prefix="", dtype=np.float32, return_eigs=False):
-	"""Find strong eigenmodes given a covmat measured from data with ndof samples per detector.
-	For complex data, ndof would be twice that."""
-	ap   = device.anypy(cov)
-	ndet = len(cov)
-	nmax = int(ndet*nmax_frac)+1
-	ndof = min(ndof, ndet)
-	if deproj is not None:
-		cov   = project_out_from_matrix(cov, deproj)
-		ndof -= deproj.shape[1]
-	if ndof <= 0:
-		e = ap.zeros(0, dtype)
-		v = ap.zeros((ndet,0), dtype)
-	else:
-		e, v = ap.linalg.eigh(cov)
-		# skip the invalid ones
-		e, v = e[-ndof:], v[:,-ndof:]
-		del cov
-		accept = ap.full(len(e), True, bool)
-		if eig_lim is not None:
-			# Only accept modes at least eig_lim times the median e
-			median_e = ap.median(e)
-			accept  &= e/median_e >= eig_lim
-		if verbose: print("%s%4d modes above eig_lim" % (verb_prefix, ap.sum(accept)))
-		if single_lim is not None and e.size:
-			# Reject modes too concentrated into a single mode. Since v is normalized,
-			# values close to 1 in a single component must mean that all other components are small
-			singleness = ap.max(ap.abs(v),0)
-			accept    &= singleness < single_lim
-		if verbose: print("%s%4d modes also above single_lim" % (verb_prefix, ap.sum(accept)))
-		e, v = e[accept], v[:,accept]
-	if return_eigs: return v, e
-	else: return v
-
-def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=0.55, nper=50, nmax=100, D_tol=0.1, wtype=np.float64):
-	"""Decompose the noise covariance per bin into D+VEV'.
-	For narrow bins, eigenvectors are measured globally,
-	and a few strong ones are used per bin. For wide bins,
-	the strongest N modes are used directly."""
-	ap   = device.anypy(ft)
-	ndet = len(ft)
-	dtype= utils.real_dtype(ft.dtype)
-	# 1. First find vectors globally. These will be used for
-	#    narrow bins.
-	if weight is not None: ft *= weight # avoids copy, at cost of weight=0 breaking
-	gV    = find_modes_merged(ft, bins, eig_lim=eig_lim, single_lim=single_lim).astype(wtype, copy=False)
-	if weight is not None: ft /= weight
-	nglob = gV.shape[1]
-	nmax  = min(nmax, ndet//2)
-	# Output arrays
-	Ds, Es, Vs = [], [], []
-	for bi, b in enumerate(bins):
-		cov  = measure_cov(ft[:,b[0]:b[1]]).real.astype(wtype, copy=False)
-		bsize= b[1]-b[0]
-		ndof = 2*bsize*ndet
-		if mask is not None:
-			# Compensate for missing power and lower statistics
-			nmask  = np.sum(mask[b[0]:b[1]]==0)
-			# Ignore mask if it would make our bin completely empty
-			if nmask < bsize:
-				ndof  -= 2*nmask
-				cov   *= (bsize-nmask)/bsize
-		# How many amplitudes can we afford to measure?
-		#budget_E = max(0,utils.floor(ndof/nper-ndet))+1
-		# This applies if the bins are independent of the V measurement.
-		# But the first few bins could dominate V, reducing our budget in
-		# those bins. budget_E saturates pretty quckly anyway, so let's
-		# use something more conservative here: one mode per bsize
-		budget_E = bsize
-		# How many vectors can we afford to measure?
-		budget_V = max(0,utils.floor((ndof/nper-ndet)/(ndet+1)))
-		# If we can afford to measure at least as many modes as our
-		# global find gave, then just measure them locally
-		if False and budget_V >= min(nglob,nmax):
-			# Here we keep all the modes we find up to our budget or nmax, even
-			# if they're weak. This could be expensive.
-			V, E = find_modes_single(cov, ndof=ndof, single_lim=single_lim, nmax_frac=1, return_eigs=True, dtype=wtype)
-			E, V = E[-budget_V:][-nmax:], V[:,-budget_V:][:,-nmax:]
-		# Otherwise measure as many amplitudes as we can afford
-		else:
-			# C = VEV' => E = (V'V)"V'CV(V'V)"'. V ortho, so this is just E = V'CV
-			E     = ap.einsum("dm,de,em->m", gV, cov, gV)
-			E     = np.diag(gV.T.dot(cov).dot(gV))
-			inds  = ap.argsort(E)[-budget_E:][-nmax:]
-			E, V  = E[inds], gV[:,inds]
-		# Finally measure the remaining uncorrelated power
-		cov  = project_out_from_matrix(cov, V)
-		D    = ap.diag(cov)
-		# Disallow unrealistically low per-detector noise. This can happen if we
-		# have overfitted the vectors. That shouldn't happen, an I try to avoid it above,
-		# but if it does happen, we don't want things to break
-		D    = ap.maximum(D, ap.median(D[D>0])*D_tol)
-		print("A %3d %6d %6d %12.3e %12.3e %12.3e %12.3e %5d %5d %4d" % (bi, b[0], b[1], ap.min(D), ap.quantile(D, 0.9), ap.min(E), ap.max(E), budget_E, budget_V, V.shape[1]))
-		Ds.append(D.astype(dtype, copy=False))
-		Es.append(E.astype(dtype, copy=False))
-		Vs.append(V.astype(dtype, copy=False))
-	return bunch.Bunch(Vs=Vs, Es=Es, Ds=Ds)
-
-def measure_detvecs(ft, vecs):
-	# Measure amps when we have non-orthogonal vecs
-	ap   = device.anypy(ft)
-	rhs  = vecs.T.dot(ft)
-	div  = vecs.T.dot(vecs)
-	amps = ap.linalg.solve(div,rhs)
-	E    = ap.mean(ap.abs(amps)**2,1)
-	# Project out modes for every frequency individually
-	dclean = ft - vecs.dot(amps)
-	# The rest is assumed to be uncorrelated
-	Nu = ap.mean(ap.abs(dclean)**2,1)
-	# The total auto-power
-	Nd = ap.mean(ap.abs(ft)**2,1)
-	return E, Nu, Nd
-
-def measure_detvecs_sotodlib(ft, vecs, nper=2):
-	ap    = device.anypy(ft)
-	# Allow too narrow bins
-	nfull = vecs.shape[1]
-	n     = min(nfull, ft.shape[-1]//nper+1)
-	vecs  = vecs[:,:n]
-	# Measure amps when we have non-orthogonal vecs
-	rhs  = vecs.T.dot(ft)
-	div  = vecs.T.dot(vecs)
-	amps = ap.linalg.solve(div,rhs)
-	E    = ap.mean(ap.abs(amps)**2,1)
-	# Project out modes for every frequency individually
-	dclean = ft - vecs.dot(amps)
-	# The rest is assumed to be uncorrelated
-	Nu = ap.mean(ap.abs(dclean)**2,1)
-	# The total auto-power
-	Nd = ap.mean(ap.abs(ft)**2,1)
-	# Expand E to full requested len with low but
-	# non-zero power so we don't need to special-case elsewhere
-	small = ap.min(Nu)*1e-6
-	E  = ap.pad(E, (0,nfull-n), constant_values=small)
-	return E, Nu, Nd
-
-def sichol(A):
-	iA = np.linalg.inv(A)
-	try: return np.linalg.cholesky(iA), 1
-	except np.linalg.LinAlgError:
-		return np.linalg.cholesky(-iA), -1
-
-def woodbury_invert(D, V, s=1):
-	"""Given a compressed representation C = D + sVV', compute a
-	corresponding representation for inv(C) using the Woodbury
-	formula."""
-	V, D = map(np.asarray, [V,D])
-	# Flatten everything so we can be dimensionality-agnostic
-	D = D.reshape(-1, D.shape[-1])
-	V = V.reshape(-1, V.shape[-2], V.shape[-1])
-	I = np.eye(V.shape[2])
-	# Allocate our output arrays
-	iD = gutils.safe_inv(D)
-	iV = V*0
-	# Invert each
-	for i in range(len(D)):
-		core = I*s + (V[i].T*iD[i,None,:]).dot(V[i])
-		core, sout = sichol(core)
-		iV[i] = iD[i,:,None]*V[i].dot(core)
-	sout = -sout
-	return iD, iV, sout

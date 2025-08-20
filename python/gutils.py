@@ -4,6 +4,8 @@ from pixell import utils, colors
 from . import device
 from .logging import L
 
+class RecoverableError(Exception): pass
+
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 
@@ -319,7 +321,6 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	surveys, this could be reduced.
 	"""
 	from scipy import ndimage
-	atol = atol/utils.degree
 	info = np.array([obsinfo[a] for a in ["baz", "bel", "waz", "wel", "ctime", "dur"]]).T
 	# Get rid of nan entries
 	bad  = np.any(~np.isfinite(info),1)
@@ -329,6 +330,7 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	info = info[~bad]
 	t1   = info[:,-2]
 	info = info[np.argsort(t1)]
+
 	# Start, end
 	t1   = info[:,-2]
 	t2   = t1 + info[:,-1]
@@ -340,6 +342,7 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	changes    = np.abs(info[1:,:4]-info[:-1,:4])
 	jumps      = np.any(changes > atol,1)
 	jumps      = np.concatenate([[0], jumps]) # from diff-inds to normal inds
+
 	# Time in the middle of each gap
 	gap_times = np.mean(find_period_gaps(np.array([t1,t2]).T, ttol=ttol),1)
 	gap_inds  = np.searchsorted(t1, gap_times)
@@ -475,17 +478,6 @@ def downgrade(tod, bsize, inclusive=False, op=None):
 	otod[...,:nwhole] = op(tod[...,:nwhole*bsize].reshape(tod.shape[:-1]+(nwhole,bsize)),-1)
 	if nblock > nwhole: otod[...,-1] = op(tod[...,nwhole*bsize:],-1)
 	return otod
-
-def block_scale(tod, bscale, bsize=1, inplace=False):
-	ap = device.anypy(tod)
-	if not inplace: tod = tod.copy()
-	nblock = tod.shape[-1]//bsize
-	btod   = tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))
-	btod  *= bscale[...,:nblock,None]
-	# incomplete last block
-	if tod.shape[-1] > nblock*bsize:
-		tod[...,nblock*bsize:] *= bscale[...,-1,None]
-	return tod
 
 def linint(arr, x):
 	ap = device.anypy(arr)

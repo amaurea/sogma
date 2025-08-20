@@ -15,8 +15,8 @@ def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu
 Devices = bunch.Bunch()
 
 class MMDeviceMinimal(device.DeviceCpu):
-	def __init__(self, align=None, alloc_factory=None):
-		super().__init__(align=align, alloc_factory=alloc_factory)
+	def __init__(self, align=None, alloc_factory=None, verbose=False):
+		super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
 		self.name = "minimal"
 		# ffts. No plan caching for now
 		def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
@@ -55,8 +55,8 @@ try:
 	from cupy.cuda import cublas
 
 	class MMDeviceGpu(device.DeviceGpu):
-		def __init__(self, align=None, alloc_factory=None):
-			super().__init__(align=align, alloc_factory=alloc_factory)
+		def __init__(self, align=None, alloc_factory=None, verbose=False):
+			super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
 			self.name = "gpu"
 			# pointing
 			self.lib.PointingPrePlan = gpu_mm.PointingPrePlan
@@ -112,13 +112,23 @@ try:
 				cublas.sdgmm(handle, get_cublas_side(side),
 					m, n, self.ptr(A), ldA, self.ptr(X), incX, self.ptr(C), ldC)
 			self.lib.sdgmm = sdgmm
+			# Scaling
+			def block_scale(tod, bscale, bsize=1, inplace=False):
+				if not inplace: tod = tod.copy()
+				nblock = tod.shape[-1]//bsize
+				btod   = tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))
+				btod  *= bscale[...,:nblock,None]
+				# incomplete last block
+				if tod.shape[-1] > nblock*bsize:
+					tod[...,nblock*bsize:] *= bscale[...,-1,None]
+				return tod
+			self.lib.block_scale = block_scale
 
 	def get_cublas_op(op):
 		# TODO add more
 		return {"n": cublas.CUBLAS_OP_N, "t": cublas.CUBLAS_OP_T}[op.lower()]
 	def get_cublas_side(side):
 		return {"l": cublas.CUBLAS_SIDE_LEFT, "r": cublas.CUBLAS_SIDE_RIGHT}[side.lower()]
-
 	# Adapted from gpu_mm's version, to use our memory pools
 	class PlanCacheGpu:
 		def __init__(self, pool, lib):
@@ -154,8 +164,8 @@ try:
 	import cpu_mm
 
 	class MMDeviceCpu(device.DeviceCpu):
-		def __init__(self, align=None, alloc_factory=None):
-			super().__init__(align=align, alloc_factory=alloc_factory)
+		def __init__(self, align=None, alloc_factory=None, verbose=False):
+			super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
 			self.name = "cpu"
 			# pointing
 			self.lib.PointingPrePlan = cpu_mm.PointingPrePlan
@@ -166,6 +176,9 @@ try:
 			self.lib.insert_ranges   = cpu_mm.insert_ranges
 			self.lib.extract_ranges  = cpu_mm.extract_ranges
 			self.lib.clear_ranges    = cpu_mm.clear_ranges
+			# Deglitching
+			self.lib.get_border_means= cpu_mm.get_border_means
+			self.lib.deglitch        = cpu_mm.deglitch
 			# ffts. No plan caching for now
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				return fft.rfft(dat, ft=out, axes=axis)
@@ -203,6 +216,8 @@ try:
 				elif side.lower() == 'l': C[:] = A*X[None,:]
 				else: raise ValueError("Unrecognized side '%s'" % str(side))
 			self.lib.sdgmm = sdgmm
+			# Scaling
+			self.lib.block_scale = cpu_mm.block_scale
 
 	Devices.cpu = MMDeviceCpu
 
@@ -247,6 +262,3 @@ except ImportError:
 	# 7. PointingPrePlan
 	#    Must be constructable from (pointing, ny, nx, periodic_xcoord=True)
 	#    For sotodlib this and PointingPlan can be dummies
-
-
-

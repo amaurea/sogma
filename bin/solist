@@ -1,0 +1,32 @@
+#!/usr/bin/env python
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument("query")
+parser.add_argument("-C", "--context", type=str, default="/global/cfs/cdirs/sobs/metadata/lat/contexts/use_this_local.yaml")
+parser.add_argument("-q", "--quiet", action="store_true")
+args = parser.parse_args()
+from sogma.loaders import soquery, socommon
+from pixell import sqlite
+import yaml, datetime
+
+# Get our obsdb
+with open(args.context, "r") as ifile:
+	cdata = yaml.safe_load(ifile)
+obsdb_path = cdata["obsdb"].format(**cdata["tags"])
+with sqlite.open(obsdb_path) as db:
+	res_db, pycode = soquery.eval_query(db, args.query)
+	info = socommon.finish_query(res_db, pycode, sweeps=True, output="resultset")
+	if len(info) == 0:
+		if not args.quiet: print("0 matches")
+	else:
+		idlen = len(info[0]["subobs_id"])
+		if not args.quiet:
+			print("#%*s %19s %6s %6s %6s %6s %6s" % (idlen-1, "subid", "start", "dur", "baz", "waz", "bel", "roll"))
+		for row in info:
+			# Format our output
+			date  = datetime.datetime.fromtimestamp(row["start_time"], tz=datetime.UTC)
+			dfmt  = date.strftime("%Y-%m-%d %H:%M:%S")
+			baz   = (row["az_center"]+180)%360-180
+			print("%s %19s %6.2f %7.1f %6.1f %6.1f %6.1f %s,%s" % (row["subobs_id"], dfmt, row["duration"]/60, baz, 2*row["az_throw"], row["el_center"], row["roll_center"], row["type"], row["subtype"]))
+		if not args.quiet:
+			print("%d matches" % len(info))

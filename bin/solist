@@ -6,21 +6,19 @@ parser.add_argument("-C", "--context", type=str, default="lat")
 parser.add_argument("-q", "--quiet",   action="store_true")
 parser.add_argument(      "--nopre",   action="store_true")
 args = parser.parse_args()
-from sogma.loaders import soquery, socommon
+from sogma.loaders import socommon
 from pixell import sqlite
 import yaml, datetime
 
 # Get our obsdb
-cpath = socommon.find_context(args.context)
-with open(cpath, "r") as ifile:
-	cdata = yaml.safe_load(ifile)
-obsdb_path = cdata["obsdb"].format(**cdata["tags"])
-predb_path = socommon.cmeta_lookup(cdata, "preprocess") if not args.nopre else None
+context = socommon.get_expanded_context(args.context)
+obsdb_path = context["obsdb"]
+predb_path = socommon.cmeta_lookup(context, "preprocess") if not args.nopre else None
 
 with sqlite.open(obsdb_path) as db:
 	with sqlite.open(predb_path) if predb_path else contextlib.nullcontext() as pdb:
-		res_db, pycode = soquery.eval_query(db, args.query, predb=pdb)
-		info = socommon.finish_query(res_db, pycode, sweeps=True, output="resultset")
+		res_db, pycode, slices = socommon.eval_query(db, args.query, predb=pdb)
+		info = socommon.finish_query(res_db, pycode, slices, sweeps=True, output="resultset")
 		if len(info) == 0:
 			if not args.quiet: print("0 matches")
 		else:

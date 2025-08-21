@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("obsinfo")
 parser.add_argument("area")
 parser.add_argument("odir")
+parser.add_argument("-C", "--context", type=str, default="lat", help="Either a config.yaml, context.yaml or a telescope name, like lat, satp1, etc.. The most general is config.yaml, which works with both the sofast and soslow loaders. Using just a context only works with sofast, and must be a context that includes the preprocess database. Telescope names expand to the default preprocess context.")
 parser.add_argument("-Q", "--query",   type=str, default=None)
 parser.add_argument("-p", "--prefix",  type=str, default=None)
 parser.add_argument("-v", "--verbose", action="count", default=1)
@@ -48,7 +48,7 @@ L.print("Init", level=0, id=0, color=colors.lgreen)
 # the interface a bit nicer
 dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
 # Set up our data loader
-loader  = loading.Loader(args.obsinfo, type=args.loader, dev=dev)
+loader  = loading.Loader(args.context, type=args.loader, dev=dev)
 obsinfo = loader.query(args.query)
 if args.tods: obsinfo = eval("obsinfo["+args.tods+"]").reshape(-1).view(np.recarray)
 nfile   = len(obsinfo)

@@ -1,8 +1,8 @@
-import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast
+import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
 from pixell import utils, bunch, bench, sqlite
 from .. import device, gutils
-from . import soquery, socommon
-from socommon import cmeta_lookup
+from . import socommon
+from .socommon import cmeta_lookup
 
 # We have a "sweeps" member of obsinfo, which encapsulates the
 # area hit by each observation on the sky, in equatorial coordinates.
@@ -42,20 +42,20 @@ from socommon import cmeta_lookup
 
 
 class SoFastLoader:
-	def __init__(self, configfile, dev=None, mul=32):
-		from sotodlib import preprocess
-		# Set up our metadata loader
-		self.config  = yaml.safe_load(configfile)
-		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
+	def __init__(self, context_or_config_or_name, dev=None, mul=32):
+		from sotodlib import core
+		self.context   = socommon.get_expanded_context(context_or_config_or_name)
+		self.obsdb     = core.metadata.ObsDb(self.context["obsdb"])
+		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
-		self.tags   = soquery.get_tags(self.context.obsdb.conn)
-		self.fast_meta = FastMeta(self.config, self.context)
+		self.tags   = socommon.get_tags(self.obsdb.conn)
+		self.fast_meta = FastMeta(self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
 	def query(self, query=None, sweeps=True, output="sogma"):
-		res_db, pycode = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
-		return socommon.finish_query(res_db, pycode, sweeps=sweeps, output=output)
+		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
+		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
 	def load(self, subid):
 		try:
 			with bench.mark("load_meta"):
@@ -74,20 +74,22 @@ class SoFastLoader:
 		return obs
 
 class FastMeta:
-	def __init__(self, configs, context):
-		self.context = context
+	def __init__(self, context):
+		from sotodlib import core
+		self.context   = context
+		self.obsfiledb = core.metadata.ObsFileDb(context["obsfiledb"])
 		# Open the database files we need for later obs lookups
 		# 1. The preprocess archive index. Example:
 		# /global/cfs/cdirs/sobs/sat-iso/preprocessing/satp1_20250108_init/process_archive.sqlite
 		# Opening the actual file has to wait until we know what subid we have.
-		self.prep_index = sqlite.open(configs["archive"]["index"])
+		self.prep_index = sqlite.open(cmeta_lookup(context, "preprocess"))
 		# 2. The det_cal index. Example:
 		# /global/cfs/cdirs/sobs/metadata/satp1/manifests/det_cal/satp1_det_cal_240312m/det_cal_local.sqlite
 		self.dcal_index = sqlite.open(cmeta_lookup(context, "det_cal"))
 		# 3. The detector info
 		smurf_info = SmurfInfo(sqlite.open(cmeta_lookup(context, "smurf")))
 		match_info = AssignmentInfo(sqlite.open(cmeta_lookup(context, "assignment")))
-		self.det_cache  = DetCache(context.obsfiledb, smurf_info, match_info)
+		self.det_cache  = DetCache(self.obsfiledb, smurf_info, match_info)
 		# 4. Absolute calibration
 		with sqlite.open(cmeta_lookup(context, "abscal")) as index:
 			acalfile = get_acalfile(index)
@@ -97,7 +99,6 @@ class FastMeta:
 		# 5. Pointing model, which seems to be static for now
 		self.pointing_model_cache = PointingModelCache(cmeta_lookup(context, "pointing_model"))
 	def read(self, subid):
-		import h5py
 		from sotodlib import core
 		obsid, wslot, band = subid.split(":")
 		# Find which hdf files are relevant for this observation
@@ -187,7 +188,7 @@ class FastMeta:
 		with bench.mark("fm_detsets"):
 			detset = self.det_cache.get(subid).detset
 		with bench.mark("fm_getfiles"):
-			finfos = self.context.obsfiledb.get_files(obsid)[detset]
+			finfos = self.obsfiledb.get_files(obsid)[detset]
 		# Get the filter params
 		with bench.mark("fm_status"):
 			status = read_wiring_status(finfos[0][0])
@@ -839,18 +840,8 @@ def get_smurffile(indexdb, detset):
 def get_acalfile(indexdb):
 	return os.path.dirname(indexdb.fname) + "/" + list(indexdb.execute("SELECT name FROM files INNER JOIN map ON files.id = map.file_id WHERE map.dataset = 'abscal'"))[0][0]
 
-#def get_pointing_model(fname):
-#	# Looks like the pointing model doesn't support time dependence at the
-#	# moment, so we just have this simple function
-#	with sqlite.open(fname) as sfile:
-#		rows = list(sfile.execute("select name from files limit 2"))
-#		if len(rows) != 1: raise IOError("Time-dependent pointing model loading not implemented. Figure out new format and implement")
-#		hfname  = os.path.dirname(fname) + "/" + rows[0][0]
-#		with h5py.File(hfname, "r") as hfile:
-#			param_str = hfile["pointing_model"].attrs["_scalars"]
-#		return bunch.Bunch(**json.loads(param_str))
-
 def read_wiring_status(fname, parse=True):
+	import fast_g3
 	for frame in fast_g3.get_header_frames(fname)["frames"]:
 		if frame["type"] == "wiring":
 			wiring = frame

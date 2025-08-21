@@ -1,19 +1,20 @@
 import numpy as np, time
-from pixell import utils, fft, bunch, bench
+from pixell import utils, fft, bunch, bench, sqlite
 from sotodlib import core, mapmaking, preprocess
 from .. import device
-from . import soquery, socommon
+from . import socommon
 
 # Standard Sotodlib slow load
 class SotodlibLoader:
 	def __init__(self, configfile, dev=None, mul=32):
 		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
+		self.predb   = sqlite.open(self.config["archive"]["index"])
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
-		self.tags    = soquery.get_tags(self.context.obsdb.conn)
+		self.tags    = socommon.get_tags(self.context.obsdb.conn)
 	def query(self, query=None, sweeps=True, output="sogma"):
-		res_db, pycode = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
-		return socommon.finish_query(res_db, pycode, sweeps=sweeps, output=output)
+		res_db, pycode, slices = socommon.eval_query(self.context.obsdb.conn, query, tags=self.tags, predb=self.predb)
+		return socommon.finish_query(res_db, pycode, sweeps=sweeps, slices=slices, output=output)
 	def load(self, subid):
 		# Read in and calibrate all our data. This will depend on the
 		# calibration steps listed in the config file

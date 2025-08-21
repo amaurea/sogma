@@ -30,14 +30,27 @@
 # 5. expand obsids to subids
 # 6. provide a mapping from subid to the query result
 
+# How should I handle restricting to observations with valid preprocess archive
+# entries?
+# 1. Function that takes an obsdb and peprocdb, and retuns the subset of the
+#    obsdb with valid entries. Simple and fast but inflexible. Can't control
+#    preprocess selection as part of the query.
+# 2. eval_query takes both obsdb and preprocdb, and attaches them. A special
+#    "tag" expands to a join. Also simple and fast, but need to add this tag
+#    all the time even though the normal thing would be to want only the
+#    valid entries.
+# 3. As 2, but join happens *unless* another tag, e.g. "all" is present.
+#    About same complexity, but maybe more confusing?
+
 import re
+import contextlib
 import numpy as np
 from pixell import sqlite
 # only needed for split_outside and split_by_group
 # speed up loading by skipping?
 from pixell import utils
 
-def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=None):
+def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the
 	query and return a new SQL object (pointing to a temporary
 	file) containing the resulting observations."""
@@ -47,36 +60,39 @@ def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=
 	# Check if we have a subobsdb or not
 	is_subobs = "subobs_id" in cols
 	# Main parse of the simple query
-	qwhere, idfile, pycode = parse_query(simple_query, cols, tags)
+	qwhere, pjoin, idfile, pycode = parse_query(simple_query, cols, tags, pre=predb is not None, default_good=default_good)
 	qjoin = ""
 	qsort = ""
 	# Create database we will put the result in, and attach
 	# it temporarily to obsdb so we can write to it
 	res_db  = sqlite.SQL()
 	with sqlite.attach(obsdb, res_db, "res", mode="rw"):
-		if idfile:
-			# Ok, an obslist was passed. The _oblist stuff is
-			# so we can reuse an already read in obslist in the
-			# subobs pass
-			if _obslist is None: _obslist = load_obslist(idfile)
-			if is_subobs and _obslist["subobs"] is not None:
-				# Yes, obsdb, but indirectly res_db. Can't use res_db directly since
-				# we're working on a copy of it due to how attach works
-				add_list(obsdb, "res.targ", _obslist["subobs"])
-				qjoin = "join res.targ on obs.subobs_id = res.targ.id"
-			else:
-				add_list(obsdb, "res.targ", _obslist["obs"])
-				qjoin = "join res.targ on obs.obs_id = res.targ.id"
-			qsort = "order by res.targ.ind"
-		# Build the full query
-		query = "select obs.* from obs %s where %s %s" % (qjoin, qwhere, qsort)
-		# Use it to build the output table
-		obsdb.execute("create table res.obs as %s" % query)
-		# Also get the tags
-		obsdb.execute("create table res.tags as select tags.* from tags where obs_id in (select obs_id from res.obs)")
-		if idfile:
-			# Drop the obslist table we created
-			obsdb.execute("drop table res.targ")
+		# Attach preprocess db if availabl
+		with sqlite.attach(obsdb, predb, "pre", mode="r") if predb else contextlib.nullcontext():
+			if idfile:
+				# Ok, an obslist was passed. The _oblist stuff is
+				# so we can reuse an already read in obslist in the
+				# subobs pass
+				if _obslist is None: _obslist = load_obslist(idfile)
+				if is_subobs and _obslist["subobs"] is not None:
+					# Yes, obsdb, but indirectly res_db. Can't use res_db directly since
+					# we're working on a copy of it due to how attach works
+					add_list(obsdb, "res.targ", _obslist["subobs"])
+					qjoin = "join res.targ on obs.subobs_id = res.targ.id"
+				else:
+					add_list(obsdb, "res.targ", _obslist["obs"])
+					qjoin = "join res.targ on obs.obs_id = res.targ.id"
+				qsort = "order by res.targ.ind"
+			qjoin += pjoin
+			# Build the full query
+			query = "select obs.* from obs %s where %s %s" % (qjoin, qwhere, qsort)
+			# Use it to build the output table
+			obsdb.execute("create table res.obs as %s" % query)
+			# Also get the tags
+			obsdb.execute("create table res.tags as select tags.* from tags where obs_id in (select obs_id from res.obs)")
+			if idfile:
+				# Drop the obslist table we created
+				obsdb.execute("drop table res.targ")
 	# Ok, by this we're detached again, and res_db contains the
 	# resulting obs and tags tables. But we may need a second pass
 	# if we're still at the obsdb level, but need a subobs db
@@ -85,9 +101,9 @@ def eval_query(obsdb, simple_query, cols=None, tags=None, subobs=True, _obslist=
 	# Ok, do the subobs expansion
 	with subobs_expansion(res_db) as subobs_db:
 		res_db.close() # don't need this one any more
-		return eval_query(subobs_db, simple_query, tags=tags, _obslist=_obslist)
+		return eval_query(subobs_db, simple_query, predb=predb, default_good=default_good, tags=tags, _obslist=_obslist)
 
-def parse_query(simple_query, cols, tags):
+def parse_query(simple_query, cols, tags, pre=False, default_good=True):
 	"""Gven a Simple Query, return an sqlite selection for an obsdb.
 	When cols contains 'band' and wafer_slots_list only has one entry,
 	as in a subobsdb, it will fully handle selections like ws0,f090.
@@ -138,6 +154,7 @@ def parse_query(simple_query, cols, tags):
 	# 3. Loop through all referenced fields, and expand them if necessary.
 	otoks = []
 	qtags = []
+	only_good = default_good
 	for tok, isname in fieldname_iter(query):
 		# Handle our formats
 		if not isname: pass
@@ -184,6 +201,10 @@ def parse_query(simple_query, cols, tags):
 				sel = "(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)"
 				if eq == "!=": sel = "not %s" % sel
 				qtags.append(sel)
+			elif tok == "all":
+				only_good = False
+			elif tok == "good":
+				only_good = True
 			# Unknown tag
 			else:
 				raise ValueError("Name '%s' not a recognized tag or obs table column!" % str(tok))
@@ -195,7 +216,15 @@ def parse_query(simple_query, cols, tags):
 	if len(qtags) > 0:
 		# I tried exists too, but it was much slower
 		query += " and obs_id in (select obs_id from tags where " + " and ".join(qtags) + ")"
-	return query, idfile, pycode
+	# Filter on valid preprocess
+	pjoin = ""
+	if pre and only_good:
+		if "band" in cols:
+			# band is present if we have a subobsdb
+			pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id] and instr(obs.wafer_slots_list, pre.map.[dets:wafer_slot]) and obs.band = pre.map.[dets:wafer.bandpass]"
+		else:
+			query += "  and obs.obs_id in (select [obs:obs_id] from pre.map)"
+	return query, pjoin, idfile, pycode
 
 def subobs_expansion(obsdb, tags=True):
 	"""Given an obsdb SQL, return a subobsdb SQL using looping in SQL"""
@@ -279,7 +308,7 @@ def fieldname_iter(query, quote="'\""):
 				current += tok[pos:m.start()]
 				# m.start():m.end() will be either a name or a keyword
 				fieldname = m[0]
-				if fieldname.lower() in sqlite.keywords:
+				if fieldname.lower() in recognized_sql:
 					current += fieldname
 				else:
 					# Ok, we actually have a fieldname
@@ -293,6 +322,10 @@ def fieldname_iter(query, quote="'\""):
 	# Yield left-over stuff if present
 	if len(current) > 0:
 		yield current, False
+
+# all is only used in select all, which is the default, and we
+# need it for other things
+recognized_sql = sqlite.keywords - set(["all"])
 
 def add_list(db, table, vals):
 	rows = [(val,ind) for ind, val in enumerate(vals)]

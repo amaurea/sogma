@@ -483,6 +483,9 @@ class DetCache:
 	def _prepare(self, obsid, force=False):
 		"""Read in the det lists for obsid, if necessary."""
 		if obsid in self.done and not force: return
+		detsets = self.obsfiledb.get_detsets(obsid)
+		if len(detsets) == 0:
+			raise utils.DataMissing("No detsets for %s in obsfiledb" % obsid)
 		for dset in self.obsfiledb.get_detsets(obsid):
 			try:
 				sinfo = self.smurf_info.get(dset)

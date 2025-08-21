@@ -568,18 +568,23 @@ def apply_vecs2(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 	for bi, (i1,i2) in enumerate(2*bins):
 		bsize = i2-i1
 		ndet, nmode = V[bi].shape
-		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
-		# 1. divtmp = iD V      [ndet,nmode]
-		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
-		dev.lib.sdgmm("R", nmode, ndet, V[bi], nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
-		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
-		dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
-		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
-		dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, maxnmode, 0, tmp[:,:bsize], tmp.shape[1])
-		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
-		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
-		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
-		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, maxnmode, 1, out[:,i1:i2], nfreq)
+		# cublas doesn't like zero-length operations, so handle that specially
+		if nmode == 0:
+			out[:,i1:i2]  = ftod[:,i1:i2]
+			out[:,i1:i2] *= iD[bi,:,None]
+		else:
+			# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
+			# 1. divtmp = iD V      [ndet,nmode]
+			# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
+			dev.lib.sdgmm("R", nmode, ndet, V[bi], nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
+			# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
+			dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
+			# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
+			dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, maxnmode, 0, tmp[:,:bsize], tmp.shape[1])
+			# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
+			dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
+			# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
+			dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, maxnmode, 1, out[:,i1:i2], nfreq)
 
 def measure_cov(d, nmax=10000):
 	ap    = device.anypy(d)

@@ -58,6 +58,9 @@ class MLMapmaker:
 		# And apply it to the tod
 		gtod = nmat.apply(gtod)
 		t5 = time.time()
+		# This is our last chance to safely abort, so check that our data makes sense
+		if not self.dev.np.isfinite(self.dev.np.sum(gtod)):
+			raise gutils.RecoverableError(f"Invalid value in N\"tod")
 		# Add the observation to each of our signals
 		for signal in self.signals:
 			signal.add_obs(id, obs, nmat, gtod)
@@ -364,8 +367,8 @@ class SignalCutFull(Signal):
 		"""Process the added observations, determining our degrees of freedom etc.
 		Should be done before calling forward and backward."""
 		if self.ready: return
-		self.rhs = np.concatenate(self.rhs)
-		self.idiv= np.concatenate(self.idiv)
+		self.rhs = np.concatenate(self.rhs)  if len(self.rhs) > 0 else np.zeros(0, self.dtype)
+		self.idiv= np.concatenate(self.idiv) if len(self.rhs) > 0 else np.zeros(0, self.dtype)
 		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
 		self.ready = True
 	def forward(self, id, gtod, gjunk):
@@ -468,7 +471,7 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 	# Set up memory pools. Setting these up before-hand is
 	# actually more memory-efficient, as long as our estimate is
 	# good.
-	if prealloc:
+	if prealloc and len(inds) > 0:
 		ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
 		setup_buffers(dev, ntot_max)
 	# Start map from scartch

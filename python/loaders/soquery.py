@@ -50,17 +50,18 @@ from pixell import sqlite
 # speed up loading by skipping?
 from pixell import utils
 
-def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, subobs=True, _obslist=None):
+def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, pre_cols=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the
 	query and return a new SQL object (pointing to a temporary
 	file) containing the resulting observations."""
 	if cols is None: cols = sqlite.columns(obsdb, "obs")
 	if tags is None: tags = get_tags(obsdb)
+	if pre_cols is None and predb is not None: pre_cols = sqlite.columns(predb, "map")
 	if not simple_query: simple_query = "1"
 	# Check if we have a subobsdb or not
 	is_subobs = "subobs_id" in cols
 	# Main parse of the simple query
-	qwhere, pjoin, idfile, pycode = parse_query(simple_query, cols, tags, pre=predb is not None, default_good=default_good)
+	qwhere, pjoin, idfile, pycode = parse_query(simple_query, cols, tags, pre_cols=pre_cols, default_good=default_good)
 	qjoin = ""
 	qsort = ""
 	# Create database we will put the result in, and attach
@@ -101,9 +102,9 @@ def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, ta
 	# Ok, do the subobs expansion
 	with subobs_expansion(res_db) as subobs_db:
 		res_db.close() # don't need this one any more
-		return eval_query(subobs_db, simple_query, predb=predb, default_good=default_good, tags=tags, _obslist=_obslist)
+		return eval_query(subobs_db, simple_query, predb=predb, default_good=default_good, tags=tags, pre_cols=pre_cols, _obslist=_obslist)
 
-def parse_query(simple_query, cols, tags, pre=False, default_good=True):
+def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 	"""Gven a Simple Query, return an sqlite selection for an obsdb.
 	When cols contains 'band' and wafer_slots_list only has one entry,
 	as in a subobsdb, it will fully handle selections like ws0,f090.
@@ -218,10 +219,14 @@ def parse_query(simple_query, cols, tags, pre=False, default_good=True):
 		query += " and obs_id in (select obs_id from tags where " + " and ".join(qtags) + ")"
 	# Filter on valid preprocess
 	pjoin = ""
-	if pre and only_good:
+	if pre_cols is not None and only_good:
 		if "band" in cols:
 			# band is present if we have a subobsdb
-			pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id] and instr(obs.wafer_slots_list, pre.map.[dets:wafer_slot]) and obs.band = pre.map.[dets:wafer.bandpass]"
+			pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id]"
+			if "dets:wafer_slot" in pre_cols:
+				pjoin += " and instr(obs.wafer_slots_list, pre.map.[dets:wafer_slot])"
+			if "dets:wafer.bandpass" in pre_cols:
+				pjoin += " and obs.band = pre.map.[dets:wafer.bandpass]"
 		else:
 			query += "  and obs.obs_id in (select [obs:obs_id] from pre.map)"
 	return query, pjoin, idfile, pycode

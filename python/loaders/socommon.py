@@ -1,5 +1,5 @@
 # Things used by both sofast and soslow
-import re, numpy as np, warnings
+import re, numpy as np, warnings, os
 from sotodlib import core
 from pixell import utils
 from .. import device
@@ -254,4 +254,27 @@ def planet_pos(name, obsinfo):
 def resultset_subset(resultset, inds):
 	return core.metadata.resultset.ResultSet(resultset.keys, [resultset.rows[ind] for ind in inds])
 
+########################
+# Contexts and configs #
+########################
 
+def find_so(): return os.environ["SOPATH"]
+def find_cdir(telescope): return find_so() + "/metadata/%s/contexts" % telescope
+def find_context(path_or_name, type="preprocess"):
+	if not re.match(r"^\w+$", path_or_name):
+		# Treat it as a path if it contains non-word characters
+		return path_or_name
+	else:
+		# Otherwise, treat it as a telescope name
+		cdir = find_cdir(path_or_name)
+		for name in [type, type + "_local"]:
+			path = "%s/%s.yaml" % (cdir, name)
+			if os.path.exists(path): return path
+		raise FileNotFoundError
+def find_label(cmeta, name):
+	for entry in cmeta:
+		for key in ["label", "name"]: # both not standardized?
+			if key in entry and entry[key] == name:
+				return entry["db"]
+def cmeta_lookup(context, name):
+	return find_label(context["metadata"], name).format(**context["tags"])

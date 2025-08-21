@@ -587,7 +587,7 @@ def resultset_subset(resultset, inds):
 	return core.metadata.resultset.ResultSet(resultset.keys, [resultset.rows[ind] for ind in inds])
 
 def is_slice(s):
-	return re.match(r"^[+-]?\d*:[+-]?\d*:?[+-]\d*$", s) is not None
+	return re.match(r"^[+-]?\d*:[+-]?\d*:?[+-]?\d*$", s) is not None
 
 ########################
 # Contexts and configs #

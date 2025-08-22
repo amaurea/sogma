@@ -547,7 +547,7 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dum
 	# even if 
 	from pixell import bench
 	if prefix   is None: prefix = ""
-	if fullinfo is None: fullinfo = loader.query("type='obs'")
+	if fullinfo is None: fullinfo = loader.query("obs,all")
 	periods = gutils.find_scan_periods(fullinfo)
 	# Which period each obs belongs to
 	pinds   = utils.find_range(periods, obsinfo.ctime+obsinfo.dur/2)

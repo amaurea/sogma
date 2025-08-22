@@ -72,6 +72,71 @@ class SoFastLoader:
 		# Add timing info
 		obs.timing = [("meta",bench.t.load_meta),("data",bench.t.load_data),("calib",bench.t.load_calib)]
 		return obs
+	def load_multi(self, subids):
+		"""Load multiple concurrent subids into a single obs"""
+		# Read all the metadata
+		metas,     mids = [], []
+		exceptions,eids = [], []
+		for si, subid in enumerate(subids):
+			try:
+				metas.append(self.fast_meta.read(subid))
+				mids .append(subid)
+			except Exception as e:
+				exceptions.append(e)
+				eids      .append(subid)
+		if len(metas) == 0:
+			raise utils.DataMissing(format_multi_exception(exceptions, eids))
+		# Restrict them to a common sample range
+		ndet, nsamp = make_metas_compatible(metas)
+		# Set up total obs
+		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None)
+		append_fields = [("dets",0),("point_offset",0),("polangle",0),("response",1),("cuts",1)]
+		for field, axis in append_fields: otot[field] = []
+		dcum = 0
+		try:
+			# We want the final output tod in the "tod" buffer, but this buffer will be
+			# used in calibrate(). The big "pointing" buffer is free at this point, though,
+			# so we can trick calibrate() into using that one instead by swapping the
+			# "pointing" and "tod" pools. By swapping back in the end, the result will end
+			# up where we want it. We also need to swap back in the end to keep our total
+			# allocations low, since "pointing" is supposed to be a 3x as large buffer
+			self.dev.pools.swap("pointing", "tod")
+			for si, (subid, meta) in enumerate(zip(mids, metas)):
+				try:
+					# read in and calibrate each
+					data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
+					# This uses buffers "tod" and "ft"
+					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
+				except Exception as e:
+					exceptions.append(e)
+					eids      .append(subid)
+					continue
+				# Initial otot setup
+				if si == 0:
+					otot.ctime     = obs.ctime
+					otot.boresight = obs.boresight
+					otot.hwp       = obs.hwp
+					otot.tod       = self.dev.pools["pointing"].zeros((ndet,nsamp), obs.tod.dtype)
+				# Cuts needs to have the detector offsets modified, after which it's simple
+				obs.cuts[0] += dcum
+				# Handle the simple append cases
+				for field, axis in append_fields:
+					otot[field].append(obs[field])
+				# Copy tod over to the right part of the output buffer
+				otot.tod[dcum:dcum+len(obs.tod)] = obs.tod
+				dcum += len(obs.tod)
+			# Were we left with anything at all?
+			if dcum == 0:
+				raise utils.DataMissing(format_multi_exception(exceptions, eids))
+			# Concatenate the work-lists into the final arrays
+			for field, axis in append_field:
+				otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
+			# Trim tod in case we lost some detectors
+			otot.tod = otot.tod[:dcum]
+		finally:
+			# Finally, move tod to the tod-buffer, where it's expected to be
+			self.dev.pools.swap("pointing","tod")
+	return otot
 
 class FastMeta:
 	def __init__(self, context):
@@ -151,10 +216,6 @@ class FastMeta:
 			# A bit awkward to time the time taken in the initialization
 			bench.add("fm_prep_loader", time.time()-t1)
 
-			#print("FIXME skipping relcal read")
-			#with bench.mark("fm_relcal"):
-			#	paman.wrap("relcal", pl.read("lpf_sig_run1/relcal","d"), [(0,"dets")])
-
 			# Need a better way to determine if hwp should be present or not
 			has_hwp = "hwp_angle" in pl.group
 			if has_hwp:
@@ -173,13 +234,6 @@ class FastMeta:
 		# Eventually we will need to be able to read in sample-ranges.
 		# Easiest to handle that with paman.restrict("samps", ...) here.
 		# The rest should follow automatically
-
-		#i = utils.find(paman.dets.vals, "sch_ufm_mv20_1740684471_3_294")
-		#p = paman.cuts_glitch
-		#print("i", i)
-		#print(paman.dets.vals[i])
-		#print(p.ranges[p.bins[i,0]:p.bins[i,1]])
-		#1/0
 
 		with bench.mark("fm_merge2"):
 			aman.merge(paman)
@@ -344,7 +398,7 @@ def calibrate(data, meta, mul=32, dev=None):
 		# I can't find an efficient way to do this. BLAS can't
 		# do it since it's a triple multiplication. Hopefully the
 		# gpu won't have trouble with it
-		with dev.pools["pointing"].as_allocator():
+		with dev.pools["tod"].as_allocator(): # tod buffer not in use atm
 			#ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
 			# Writing it this way saves some memroy
 			tfact = dev.np.full(ftod.shape, 2j*np.pi, ftod.dtype)
@@ -937,27 +991,6 @@ def apply_pointing_model(az, el, roll, model):
 	else: raise ValueError("Unrecognized model '%s'" % str(model.version))
 	return az, el, roll
 
-def common_mode_calibrate(signal, bsize=80, down=20, dev=None):
-	ndet, nsamp = signal.shape
-	if dev is None: dev = device.get_device()
-	with dev.pools["pointing"].as_allocator():
-		# downgrade to reduce noise, then median to reduce impact of glitches
-		dsig = dev.np.median(dev.np.mean(signal[:,:nsamp//bsize//down*bsize*down].reshape(ndet,-1,bsize,down),-1),-1)
-		# Find the strongest eigenmode
-		cov  = dev.np.cov(dev.np.diff(dsig,axis=-1))
-		# Initial normalization, to avoid single detectors dominating
-		g1   = dev.np.diag(cov)**0.5
-		cov /= g1[:,None]
-		cov /= g1[None,:]
-		# Find the strongest eigenvector
-		E, V = dev.np.linalg.eigh(cov)
-		g2   = V[:,-1]
-		# Normalize to be mostly positive and have a mean of 1
-		g2  /= dev.np.mean(g2)
-	# We want to be able to apply the calibration by multiplying
-	gtot = 1/g2
-	return gtot
-
 # This isn't robust to glitches. Should use a block-median or something
 # if that's a problem
 def deproject_cosel(signal, el, nmode=2, dev=None):
@@ -1047,3 +1080,43 @@ def merge_det_cuts(cuts):
 	# 2. Merge them into a single cut
 	ocuts = merge_cuts(dcuts)
 	return ocuts
+
+def format_multi_exception(exceptions, subids):
+	msgs   = [str(e) for ex in exceptions]
+	uvals, order, inds = utils.find_equal_groups_fast(msgs)
+	omsgs  = []
+	for ui, uval in enumerate(uvals):
+		mysubs = [subids[o] for o in order[inds[ui]:inds[ui+1]]]
+		omsgs.append(",".join(mysubs) + ": " + uval)
+	return ", ".join(omsgs)
+
+def make_metas_compatible(metas, tol=0.1):
+	# Find t1, t2 and dt for each
+	tranges = []
+	for meta in metas:
+		ctime = meta.aman.timestamps
+		dt    = (ctime[-1]-ctime[0])/(len(ctime)-1)
+		tranges.append((ctime[0],ctime[-1],dt))
+	t1s, t2s, dts = np.array(tranges).T
+	# Find the narrowest range
+	t1 = np.max(t1s)
+	t2 = np.min(t2s)
+	dur = t2-t1
+	if dur <= 0: raise ValueError("no sample overlap")
+	# Offset of t1 from each
+	i1s = (t1-t1s)/dts
+	i2s = (t2-t1s)/dts
+	# Duration in samples should be the same, to within the tolerance
+	idurs = i2s-i1s
+	if np.max(np.abs(i1s-i1s[0])) > tol or np.max(np.abs(idurs-idurs[0])) > tol:
+		raise ValueError("incompatible timestamps")
+	# Restrict sample ranges
+	i1s = utils.nint(i1s)
+	i2s = utils.nint(i2s)
+	for mi, meta in enumerate(metas):
+		meta.aman.restrict("samps", slice(i1s[mi], i2s[mi]), in_place=True)
+	# Could check that detector names are unique here, but it's not really necessary
+	# Return the final sample and detector count
+	ndet  = sum([meta.aman.dets.count for meta in metas])
+	nsamp = metas[0].aman.samps.count
+	return ndet, nsamp

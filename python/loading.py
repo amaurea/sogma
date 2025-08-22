@@ -20,8 +20,8 @@ from . import device
 
 def Loader(dbfile, type="auto", dev=None, mul=32):
 	if type == "auto":
-		if dbfile.endswith(".yaml"): type = "sofast"
-		else: type = "simple"
+		if dbfile.endswith(".txt"): type = "simple"
+		else: type = "sofast"
 	if type == "simple":
 		from .loaders.simple import SimpleLoader
 		return SimpleLoader(dbfile, dev=dev, mul=mul)

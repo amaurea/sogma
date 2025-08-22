@@ -1,10 +1,8 @@
-import numpy as np, contextlib, json, time, os, scipy, re
-from pixell import utils, fft, bunch, bench, sqlite
-from sotodlib import preprocess, core
-import fast_g3, h5py, yaml, ast
-from so3g.proj import quat
+import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
+from pixell import utils, bunch, bench, sqlite
 from .. import device, gutils
-from . import soquery, socommon
+from . import socommon
+from .socommon import cmeta_lookup
 
 # We have a "sweeps" member of obsinfo, which encapsulates the
 # area hit by each observation on the sky, in equatorial coordinates.
@@ -44,19 +42,20 @@ from . import soquery, socommon
 
 
 class SoFastLoader:
-	def __init__(self, configfile, dev=None, mul=32):
-		# Set up our metadata loader
-		self.config  = yaml.safe_load(configfile)
-		self.config, self.context = preprocess.preprocess_util.get_preprocess_context(configfile)
+	def __init__(self, context_or_config_or_name, dev=None, mul=32):
+		from sotodlib import core
+		self.context   = socommon.get_expanded_context(context_or_config_or_name)
+		self.obsdb     = core.metadata.ObsDb(self.context["obsdb"])
+		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
-		self.tags   = soquery.get_tags(self.context.obsdb.conn)
-		self.fast_meta = FastMeta(self.config, self.context)
+		self.tags   = socommon.get_tags(self.obsdb.conn)
+		self.fast_meta = FastMeta(self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
 	def query(self, query=None, sweeps=True, output="sogma"):
-		res_db, pycode = soquery.eval_query(self.context.obsdb.conn, query, tags=self.tags)
-		return socommon.finish_query(res_db, pycode, sweeps=sweeps, output=output)
+		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
+		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
 	def load(self, subid):
 		try:
 			with bench.mark("load_meta"):
@@ -75,29 +74,32 @@ class SoFastLoader:
 		return obs
 
 class FastMeta:
-	def __init__(self, configs, context):
-		self.context = context
+	def __init__(self, context):
+		from sotodlib import core
+		self.context   = context
+		self.obsfiledb = core.metadata.ObsFileDb(context["obsfiledb"])
 		# Open the database files we need for later obs lookups
 		# 1. The preprocess archive index. Example:
 		# /global/cfs/cdirs/sobs/sat-iso/preprocessing/satp1_20250108_init/process_archive.sqlite
 		# Opening the actual file has to wait until we know what subid we have.
-		self.prep_index = sqlite.open(configs["archive"]["index"])
+		self.prep_index = sqlite.open(cmeta_lookup(context, "preprocess"))
 		# 2. The det_cal index. Example:
 		# /global/cfs/cdirs/sobs/metadata/satp1/manifests/det_cal/satp1_det_cal_240312m/det_cal_local.sqlite
-		self.dcal_index = sqlite.open(cmeta_lookup(context["metadata"], "det_cal"))
+		self.dcal_index = sqlite.open(cmeta_lookup(context, "det_cal"))
 		# 3. The detector info
-		smurf_info = SmurfInfo(sqlite.open(cmeta_lookup(context["metadata"], "smurf")))
-		match_info = AssignmentInfo(sqlite.open(cmeta_lookup(context["metadata"], "assignment")))
-		self.det_cache  = DetCache(context.obsfiledb, smurf_info, match_info)
+		smurf_info = SmurfInfo(sqlite.open(cmeta_lookup(context, "smurf")))
+		match_info = AssignmentInfo(sqlite.open(cmeta_lookup(context, "assignment")))
+		self.det_cache  = DetCache(self.obsfiledb, smurf_info, match_info)
 		# 4. Absolute calibration
-		with sqlite.open(cmeta_lookup(context["metadata"], "abscal")) as index:
+		with sqlite.open(cmeta_lookup(context, "abscal")) as index:
 			acalfile = get_acalfile(index)
 		self.acal_cache = AcalCache(acalfile)
 		# 4. Focal plane
-		self.fp_cache   = FplaneCache(cmeta_lookup(context["metadata"], "focal_plane"))
+		self.fp_cache   = FplaneCache(cmeta_lookup(context, "focal_plane"))
 		# 5. Pointing model, which seems to be static for now
-		self.pointing_model_cache = PointingModelCache(cmeta_lookup(context["metadata"], "pointing_model"))
+		self.pointing_model_cache = PointingModelCache(cmeta_lookup(context, "pointing_model"))
 	def read(self, subid):
+		from sotodlib import core
 		obsid, wslot, band = subid.split(":")
 		# Find which hdf files are relevant for this observation
 		try:
@@ -186,7 +188,7 @@ class FastMeta:
 		with bench.mark("fm_detsets"):
 			detset = self.det_cache.get(subid).detset
 		with bench.mark("fm_getfiles"):
-			finfos = self.context.obsfiledb.get_files(obsid)[detset]
+			finfos = self.obsfiledb.get_files(obsid)[detset]
 		# Get the filter params
 		with bench.mark("fm_status"):
 			status = read_wiring_status(finfos[0][0])
@@ -230,6 +232,7 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 		("brot",      "ancil/boresight_enc", "?"),
 		("corot",     "ancil/corotator_enc", "?")]):
 	import fast_g3
+	from sotodlib import core
 	if alloc is None: alloc = fast_g3.DummyAlloc()
 	# Add "!", for mandatory field, to any field that doesn't have
 	# the third entry present
@@ -260,6 +263,7 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 	return aman
 
 def calibrate(data, meta, mul=32, dev=None):
+	from pixell import fft
 	if dev is None: dev = device.get_device()
 	# Merge the cuts. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
@@ -296,41 +300,11 @@ def calibrate(data, meta, mul=32, dev=None):
 		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] # * meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
 
-	#bunch.write("test_tod.hdf", bunch.Bunch(tod=dev.get(dev.np.mean(signal,0))))
-	#1/0
-
-	#print("FIXME doing manual relcal")
-	#with bench.mark("calibrate_manual", tfun=dev.time):
-	#	# Calibrate to CMB µK
-	#	phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None]
-	#	signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
-	#	relcal  = common_mode_calibrate(signal, dev=dev)
-	#	signal *= relcal[:,None]
-
 	with bench.mark("deproject cosel", tfun=dev.time):
 		elrange = utils.minmax(el[::100])
 		if elrange[1]-elrange[0] > 1*utils.arcmin:
 			print("FIXME deprojecting el")
 			deproject_cosel(signal, el, dev=dev)
-
-	#print("FIXME common mode deprojection")
-	#cmode = dev.np.median(signal,0)[None]
-	## Smooth it
-	#utils.deslope(cmode, inplace=True)
-	#fmode = dev.lib.rfft(cmode)
-	#fmode[:,fmode.shape[-1]//10:] = 0
-	#dev.lib.irfft(fmode, cmode)
-	#cmode /= cmode.shape[-1]
-	#def nmath(a): return np.diff(utils.block_reduce(a, 100))
-	#def deproj(a, B, nmath):
-	#	hNa = nmath(a)
-	#	hNB = nmath(B)
-	#	rhs = np.sum(hNa[:,None,:]*hNB[None,:,:],-1)
-	#	div = np.sum(hNB[:,None,:]*hNB[None,:,:],-1)
-	#	idiv = np.linalg.inv(div)
-	#	amp = np.einsum("ab,db->da",idiv,rhs)
-	#	return a - amp.dot(B)
-	#signal[:] = deproj(signal, cmode, nmath)
 
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
@@ -483,6 +457,9 @@ class DetCache:
 	def _prepare(self, obsid, force=False):
 		"""Read in the det lists for obsid, if necessary."""
 		if obsid in self.done and not force: return
+		detsets = self.obsfiledb.get_detsets(obsid)
+		if len(detsets) == 0:
+			raise utils.DataMissing("No detsets for %s in obsfiledb" % obsid)
 		for dset in self.obsfiledb.get_detsets(obsid):
 			try:
 				sinfo = self.smurf_info.get(dset)
@@ -863,24 +840,8 @@ def get_smurffile(indexdb, detset):
 def get_acalfile(indexdb):
 	return os.path.dirname(indexdb.fname) + "/" + list(indexdb.execute("SELECT name FROM files INNER JOIN map ON files.id = map.file_id WHERE map.dataset = 'abscal'"))[0][0]
 
-#def get_pointing_model(fname):
-#	# Looks like the pointing model doesn't support time dependence at the
-#	# moment, so we just have this simple function
-#	with sqlite.open(fname) as sfile:
-#		rows = list(sfile.execute("select name from files limit 2"))
-#		if len(rows) != 1: raise IOError("Time-dependent pointing model loading not implemented. Figure out new format and implement")
-#		hfname  = os.path.dirname(fname) + "/" + rows[0][0]
-#		with h5py.File(hfname, "r") as hfile:
-#			param_str = hfile["pointing_model"].attrs["_scalars"]
-#		return bunch.Bunch(**json.loads(param_str))
-
-def cmeta_lookup(cmeta, name):
-	for entry in cmeta:
-		for key in ["label", "name"]: # both not standardized?
-			if key in entry and entry[key] == name:
-				return entry["db"]
-
 def read_wiring_status(fname, parse=True):
+	import fast_g3
 	for frame in fast_g3.get_header_frames(fname)["frames"]:
 		if frame["type"] == "wiring":
 			wiring = frame
@@ -918,6 +879,7 @@ def polar_2d(x, y):
 # This takes 250 ms! And the quaternion stuff would be tedious
 # (but not difficult as such) to implement on the gpu
 def apply_pointing_model(az, el, roll, model):
+	from so3g.proj import quat
 	# Ensure they're arrays, and avoid overwriting. These are
 	# small arrays anyways
 	[az, el, roll] = [np.array(a) for a in [az,el,roll]]

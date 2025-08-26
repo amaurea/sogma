@@ -47,28 +47,28 @@ class MLMapmaker:
 		# Build the noise model from the obs unless a fully
 		# initialized noise model was passed
 		if noise_model.ready:
-			nmat = noise_model
+			iN = noise_model
 		else:
 			try:
-				nmat = noise_model.build(gtod, srate=srate)
+				iN = noise_model.build(gtod, srate=srate)
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise gutils.RecoverableError(msg)
 		t4 = time.time()
 		# And apply it to the tod
-		gtod = nmat.apply(gtod)
+		gtod = iN.apply(gtod)
 		t5 = time.time()
 		# This is our last chance to safely abort, so check that our data makes sense
 		if not self.dev.np.isfinite(self.dev.np.sum(gtod)):
 			raise gutils.RecoverableError(f"Invalid value in N\"tod")
 		# Add the observation to each of our signals
 		for signal in self.signals:
-			signal.add_obs(id, obs, nmat, gtod)
+			signal.add_obs(id, obs, iN, gtod)
 		t6 = time.time()
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
 		self.data.append(bunch.Bunch(id=id, ndet=len(obs.dets), nsamp=len(ctime),
-			dets=obs.dets, nmat=nmat))
+			dets=obs.dets, iN=iN))
 	def prepare(self):
 		if self.ready: return
 		t1 = time.time()
@@ -92,7 +92,7 @@ class MLMapmaker:
 				signal.precalc_setup(data.id)
 				signal.forward(data.id, gtod, iwork[si])
 			ta3 = self.dev.time()
-			data.nmat.apply(gtod)
+			data.iN.apply(gtod)
 			ta4 = self.dev.time()
 			for si, signal in enumerate(self.signals):
 				signal.backward(data.id, gtod, owork[si])
@@ -102,20 +102,20 @@ class MLMapmaker:
 			ta6 = self.dev.time()
 			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f gc %6.4f %s %4d %6d" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, ta6-ta5, data.id, *gtod.shape), level=2)
 		t3 = self.dev.time()
-		result = self.dof.zip(*[signal.from_work(w) for signal,w in zip(self.signals,owork)])
+		result = self.dof.zip([signal.from_work(w) for signal,w in zip(self.signals,owork)])
 		t4 = self.dev.time()
 		L.print("A prep %6.3f PNP %6.3f finish %6.3f" % (t2-t1, t3-t2, t4-t3), level=2)
 		return result
 	def M(self, x):
 		t1 = self.dev.time()
 		iwork = self.dof.unzip(x)
-		result = self.dof.zip(*[signal.precon(w) for signal, w in zip(self.signals, iwork)])
+		result = self.dof.zip([signal.precon(w) for signal, w in zip(self.signals, iwork)])
 		t2 = self.dev.time()
 		L.print("M %6.3f" % (t2-t1), level=2)
 		return result
 	def solve(self, maxiter=500, maxerr=1e-6):
 		self.prepare()
-		rhs    = self.dof.zip(*[signal.rhs for signal in self.signals])
+		rhs    = self.dof.zip([signal.rhs for signal in self.signals])
 		solver = utils.CG(self.A, rhs, M=self.M, dot=self.dof.dot)
 		#solver = utils.Minres(self.A, rhs, dot=self.dof.dot)
 		while solver.i < maxiter and solver.err > maxerr:
@@ -145,7 +145,7 @@ class Signal:
 	def reset(self):
 		self.dof   = None
 		self.ready = False
-	def add_obs(self, id, obs, nmat, Nd): pass
+	def add_obs(self, id, obs, iN, iNd): pass
 	def prepare(self): self.ready = True
 	def forward (self, id, tod, x): pass
 	def backward(self, id, tod, x): pass
@@ -174,7 +174,7 @@ class Signal:
 #  * dmap:  dynamic map on gpu
 
 class SignalMap(Signal):
-	"""Signal describing a non-distributed sky map."""
+	"""Signal describing a sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}", output=True,
 			ext="fits", dtype=np.float32, ibuf=None, obuf=None, recenter=None,
 			sys=None, interpol=None, autocrop=False):
@@ -211,34 +211,31 @@ class SignalMap(Signal):
 		self.ids      = []
 		self.tiledist = None
 		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, self.dtype)
-	def add_obs(self, id, obs, nmat, Nd, pmap=None):
+	def add_obs(self, id, obs, iN, iNd, pmap=None):
 		"""Add and process an observation, building the pointing matrix
 		and our part of the RHS. "obs" should be an Observation axis manager,
-		nmat a noise model, representing the inverse noise covariance matrix,
-		and Nd the result of applying the noise model to the detector time-ordered data.
+		iN a noise model, representing the inverse noise covariance matrix,
+		and iNd the result of applying the noise model to the detector time-ordered data.
 		"""
-		#Nd     = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		#iNd    = iNd.copy() # This copy can be avoided if build_obs is split into two parts
 		ctime  = obs.ctime
 		t1     = time.time()
 		# could pass this in, but fast to construct. Should ideally match what's used in
 		# signal_cut to be safest, but only uses .clear which should be the same for all
 		# of them anyway
-		print("FIXME: Figure out if I'm handling cuts consistently")
-		pcut   = pmat.PmatCutFull(obs.cuts, dev=self.dev)
 		if pmap is None:
-			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=Nd.dtype)
+			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=iNd.dtype)
 			self.dev.garbage_collect()
 		# Precompute pointing for the upcoming pmap observations
 		# Accumulate local rhs
 		t2 = time.time()
-		pcut.clear(Nd)
-		pmap.backward(Nd, self.drhs)
+		pmap.backward(iNd, self.drhs)
 		self.dev.garbage_collect()
 		t3 = time.time()
 		L.print("Init map pmat %6.3f rhs %6.3f %s" % (t2-t1,t3-t2,id), level=2)
 		# Save the per-obs things we need. Just the pointing matrix in our case.
 		# Nmat and other non-Signal-specific things are handled in the mapmaker itself.
-		self.data[id] = bunch.Bunch(pmap=pmap, pcut=pcut, nmat=nmat, tod_shape=Nd.shape, tod_dtype=Nd.dtype)
+		self.data[id] = bunch.Bunch(pmap=pmap, iN=iN, tod_shape=iNd.shape, tod_dtype=iNd.dtype)
 		self.ids.append(id)
 	def calc_hits(self, weight=False):
 		"""Calculate the local div or hits map. Tiling must be
@@ -250,7 +247,7 @@ class SignalMap(Signal):
 			d   = self.data[id]
 			t1  = time.time()
 			tod = self.dev.pools["tod"].full(d.tod_shape, 1, d.tod_dtype)
-			if weight: d.nmat.white(tod)
+			if weight: d.iN.white(tod)
 			d.pmap.backward(tod, glhits)
 			t2  = time.time()
 			L.print("Init map hits %d %6.3f %s" % (weight, t2-t1,id), level=2)
@@ -282,11 +279,8 @@ class SignalMap(Signal):
 		t7 = time.time()
 		# Set up our degrees of freedom
 		self.dof   = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
-		self.idiv  = gutils.safe_inv(self.div)
-		## FIXME
-		#print("div", self.div.shape, self.dev.np.max(self.div), self.dev.np.min(self.div))
-		#self.idiv  = gutils.safe_invert_ivar(self.div)
-		#print("idiv", self.idiv.shape, self.dev.np.max(self.idiv), self.dev.np.min(self.idiv))
+		#self.idiv  = gutils.safe_inv(self.div)
+		self.idiv  = gutils.safe_invert_ivar(self.div)
 		t8 = time.time()
 		L.print("Prep fin %6.3f div %6.3f red %6.3f prec %6.3f" % (t2-t1, t4-t3+t6-t5, t3-t2+t5-t4+t7-t6, t8-t7), level=2)
 		self.ready = True
@@ -302,7 +296,7 @@ class SignalMap(Signal):
 		if id not in self.data: return
 		if mmul != 1: glmap *= mmul
 		self.data[id].pmap.backward(gtod, glmap)
-	def precalc_setup(self, id): self.data[id].pmap.precalc_setup()
+	def precalc_setup(self, id, reset_buffer=True): self.data[id].pmap.precalc_setup(reset_buffer=reset_buffer)
 	def precalc_free (self, id): self.data[id].pmap.precalc_free()
 	def precon(self, gmap):
 		return self.idiv * gmap
@@ -321,6 +315,113 @@ class SignalMap(Signal):
 		self.write(prefix, "ivar", self.div[:,0])
 		self.write(prefix, "hits", self.hits[:,0])
 		self.write(prefix, "bin",  self.idiv*self.rhs)
+
+# What do we need for multi-band mapmaking?
+# Just loop over SignalMaps, but override their TileDistribution
+# ompi to a new one built from their pixbox union
+
+class SignalMapMulti(Signal):
+	"""Signal describing a multiband sky map."""
+	def __init__(self, shape, wcs, bands, comm, dev=None, name="sky", ofmt="{name}", output=True,
+			ext="fits", dtype=np.float32, ibuf=None, obuf=None, recenter=None,
+			sys=None, interpol=None, autocrop=False):
+		self.mapsigs = [
+			SignalMap(shape, wcs, comm, dev=dev, name=band + "_" + name, ofmt=ofmt, output=output,
+				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, recenter=recenter,
+				sys=sys, interpol=interpol, autocrop=autocrop)
+			for band in bands]
+		self.bands = bands
+		self.dev   = dev or device.get_device()
+		self.output= output
+		self.data  = {}
+		self.ids   = []
+		self.ready = False
+	def reset(self):
+		for mapsig in self.mapsigs: mapsig.reset()
+	def add_obs(self, id, obs, iN, iNd):
+		# Find the det-ranges for each of our bands in obs
+		band_info = []
+		for bi, band in enumerate(self.bands):
+			inds   = np.where(obs.bands == band)[0]
+			# Skip band that's not present
+			if len(inds) == 0: continue
+			d1, d2 = inds[0], inds[-1]+1
+			# Ensure that they're contiguous!
+			assert d2-d1 == len(inds), "Detectors must be sorted by band!"
+			# Make obs for the band subset
+			bobs = obs.copy()
+			bobs.point_offset = obs.point_offset[d1:d2]
+			bobs.polangle     = obs.polangle[d1:d2]
+			bobs.response     = obs.response[:,d1:d2] if obs.response is not None else None
+			# Also need to restrict iN. iN is only used for the precondtioner, so
+			# only need to handle this part. This is a bit hacky though, as theoretically
+			# a future preconditioner could use more of iN...
+			biN = nmat.NmatWhite(ivar=iN.ivar[d1:d2], nwin=iN.nwin, dev=self.dev)
+			# And finally forward to our band signals
+			self.mapsigs[bi].add_obs(id, bobs, biN, iNd[d1:d2])
+			band_info.append((bi,band,d1,d2))
+		self.data[id] = bunch.Bunch(band_info=band_info)
+		self.ids.append(id)
+	def prepare(self):
+		"""Called when we're done adding everything. Sets up the map distribution,
+		degrees of freedom and preconditioner."""
+		# Make all our children prepare, and build up the total degrees of freedom
+		self.dof = MultiZipper()
+		for mapsig in self.mapsigs:
+			mapsig.prepare()
+			self.dof.add(mapsig.dof)
+		self.rhs = [mapsig.rhs for mapsig in self.mapsigs]
+		# Harmonize the output pixelization, so all bands cover the same pixels.
+		# This makes plotting easier, but also means we can't have different
+		# resolution for the different band maps. But to allow that, we would need
+		# to pass in multiple geometries anyway, which we don't do. So this doesn't
+		# make us less general than we already area.
+		# This is a bit hacky, since it messes with the internals of TileDistribution.
+		pixboxes = np.array([mapsig.tiledist.pixbox for mapsig in self.mapsigs])
+		pixbox   = np.array([np.min(pixboxes[:,0,:],0),np.max(pixboxes[:,1,:],0)])
+		for mi, mapsig in enumerate(self.mapsigs):
+			td = mapsig.tiledist
+			mapsig.pixbox = pixbox
+			_, mapsig.tiledist.pwcs = enmap.crop_geometry(mapsig.shape, mapsig.wcs, pixbox=pixbox, recenter=True)
+			td.ompi = tiling.build_omap_mpi(mapsig.shape, mapsig.wcs, td.tshape, td.dist.cell_inds, mapsig.comm, pixbox=pixbox)
+		self.ready = True
+	def forward(self, id, gtod, glmap, tmul=1):
+		"""map2tod operation. For tiled maps, the map should be in work distribution,
+		as returned by unzip. Adds into tod."""
+		if id not in self.data: return # Should this really skip silently like this?
+		for bi, band, d1, d2 in self.data[id].band_info:
+			self.mapsigs[bi].forward(id, gtod[d1:d2], glmap[bi], tmul=tmul)
+	def backward(self, id, gtod, glmap, mmul=1):
+		"""tod2map operation. For tiled maps, the map should be in work distribution,
+		as returned by unzip. Adds into map"""
+		if id not in self.data: return
+		for bi, band, d1, d2 in self.data[id].band_info:
+			self.mapsigs[bi].backward(id, gtod[d1:d2], glmap[bi], mmul=mmul)
+	def precalc_setup(self, id):
+		self.dev.pools["pointing"].reset()
+		self.dev.pools["plan"].reset()
+		for bi, band, d1, d2 in self.data[id].band_info:
+			self.mapsigs[bi].precalc_setup(id, reset_buffer=False)
+	def precalc_free (self, id):
+		for bi, band, d1, d2 in self.data[id].band_info:
+			self.mapsigs[bi].precalc_free(id)
+	def precon(self, gmap):
+		return [mapsig.precon(m) for mapsig,m in zip(self.mapsigs, gmap)]
+	def to_work(self, gmap):
+		return [mapsig.to_work(m) for mapsig, m in zip(self.mapsigs, gmap)]
+	def from_work(self, glmap):
+		return [mapsig.from_work(m) for mapsig, m in zip(self.mapsigs, glmap)]
+	def owork(self):
+		return [mapsig.owork() for mapsig in self.mapsigs]
+	def write(self, prefix, tag, m):
+		onames = []
+		for bi, band in enumerate(self.bands):
+			oname = self.mapsigs[bi].write(prefix, tag, m[bi])
+			onames.append(oname)
+		return ", ".join(onames)
+	def write_misc(self, prefix):
+		for bi, band in enumerate(self.bands):
+			self.mapsigs[bi].write_misc(prefix)
 
 class SignalCutFull(Signal):
 	# Placeholder for when we have a gpu implementation
@@ -341,22 +442,22 @@ class SignalCutFull(Signal):
 		self.rhs   = []
 		self.idiv  = []
 		self.data  = {}
-	def add_obs(self, id, obs, nmat, Nd):
+	def add_obs(self, id, obs, iN, iNd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
-		nmat a noise model, representing the inverse noise covariance matrix,
-		and Nd the result of applying the noise model to the detector time-ordered data."""
-		Nd      = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		iN a noise model, representing the inverse noise covariance matrix,
+		and iNd the result of applying the noise model to the detector time-ordered data."""
+		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
 		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
 		# Build our RHS
 		obs_rhs = self.dev.np.zeros(pcut.ndof, self.dtype)
-		pcut.backward(Nd, obs_rhs)
+		pcut.backward(iNd, obs_rhs)
 		obs_rhs = obs_rhs.get()
 		# Build our preconditioner.
 		obs_div = self.dev.np.ones(pcut.ndof, self.dtype)
-		Nd[:]   = 0
-		pcut.forward(Nd, obs_div)
-		nmat.white(Nd)
-		pcut.backward(Nd, obs_div)
+		iNd[:]   = 0
+		pcut.forward(iNd, obs_div)
+		iN.white(iNd)
+		pcut.backward(iNd, obs_div)
 		obs_idiv = 1/self.dev.get(obs_div) # back to the cpu
 		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.ndof)
 		self.off += pcut.ndof
@@ -378,6 +479,10 @@ class SignalCutFull(Signal):
 	def precon(self, junk):
 		return junk*self.idiv
 	def backward(self, id, gtod, gjunk):
+		# This function doesn't just accumulate into junk, it also
+		# zeros out the cut samples from tod. This lets all the other signals
+		# not have to deal with the cuts, as long as the cuts are the first
+		# in the signal list (so first backwards, last forwards)
 		if id not in self.data: return
 		d = self.data[id]
 		d.pcut.backward(gtod, gjunk[d.i1:d.i2])
@@ -409,15 +514,15 @@ class SignalCutPoly(SignalCutFull):
 			raise NotImplementedError("SignalCutPoly precons other than 'none' currently don't work")
 		if precon == "leginv":
 			self.ibases = gutils.leginverses(self.basis)
-	def add_obs(self, id, obs, nmat, Nd):
+	def add_obs(self, id, obs, iN, iNd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
-		nmat a noise model, representing the inverse noise covariance matrix,
-		and Nd the result of applying the noise model to the detector time-ordered data."""
-		Nd      = Nd.copy() # This copy can be avoided if build_obs is split into two parts
+		iN a noise model, representing the inverse noise covariance matrix,
+		and iNd the result of applying the noise model to the detector time-ordered data."""
+		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
 		pcut    = pmat.PmatCutPoly(obs.cuts, basis=self.basis, dev=self.dev)
 		# Build our RHS
 		obs_rhs = self.dev.np.zeros(pcut.ndof, self.dtype)
-		pcut.backward(Nd, obs_rhs)
+		pcut.backward(iNd, obs_rhs)
 		obs_rhs = self.dev.get(obs_rhs)
 		# Build our preconditioner. We have precomputed the basis.dot(basis.T) inverse for
 		# all block lengths, so we just read out the appropriate one for each block.
@@ -426,9 +531,9 @@ class SignalCutPoly(SignalCutFull):
 		# 1/ivar in them, otherwise they don't hurt but also don't beat none. Very
 		# strange.
 		if self.prec == "leginv":
-			obs_idiv = self.ibases[self.dev.get(pcut.lens)-1] / self.dev.get(nmat.ivar[pcut.dets])[:,None,None]
+			obs_idiv = self.ibases[self.dev.get(pcut.lens)-1] / self.dev.get(iN.ivar[pcut.dets])[:,None,None]
 		elif self.prec == "var":
-			obs_idiv = 1/self.dev.get(nmat.ivar[pcut.dets])
+			obs_idiv = 1/self.dev.get(iN.ivar[pcut.dets])
 		elif self.prec == "none":
 			obs_idiv = [1]
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
@@ -453,10 +558,17 @@ class SignalCutPoly(SignalCutFull):
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
 
 # Mapmaking function
-def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
+def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
 	if prefix is None: prefix = ""
+	# Groups is a list of obsinfo entries that should be mapped jointly
+	# (as a big super-tod with full noise correlations)
+	if joint is None: joint = trivial_joint(obsinfo)
+	# Inds is a list of indices into joint groups, giving which groups this mpi task
+	# should care about
 	if inds is None:
-		dist = tiling.distribute_tods_semibrute(obsinfo, comm.size)
+		# Use the first entry in groups as representative
+		gfirst = np.array([g[0] for g in joint.groups])
+		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
 		inds = np.where(dist.owner == comm.rank)[0]
 	# Set up exception types we will ignore
 	if   ignore == "all":     etypes = (Exception,)
@@ -470,35 +582,39 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 	dev = mapmaker.dev
 	# Set up memory pools. Setting these up before-hand is
 	# actually more memory-efficient, as long as our estimate is
-	# good.
+	# good. Yuck, looping
 	if prealloc and len(inds) > 0:
-		ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
+		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
 		setup_buffers(dev, ntot_max)
 	# Start map from scartch
 	mapmaker.reset()
 	# Add our observations
 	for i, ind in enumerate(inds):
-		id    = obsinfo.id[ind]
-		t1    = time.time()
+		name   = joint.names[ind]
+		subids = obsinfo.id[joint.groups[ind]]
+		t1     = time.time()
 		try:
-			data  = loader.load(id)
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind])
 		except etypes as e:
-			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
+			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue
+		if len(data.errors) > 0:
+			# Partial skip
+			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
 		t2    = time.time()
 
 		print("FIXME handle empty cuts")
 		if data.cuts.size == 0: data.cuts = np.array([[0],[10],[1]],np.int32)
 
 		try:
-			mapmaker.add_obs(id, data, deslope=False)
+			mapmaker.add_obs(name, data, deslope=False)
 		except etypes as e:
-			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
+			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue
 		dev.garbage_collect()
 		del data
 		t3    = time.time()
-		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (id, t3-t1, t2-t1, t3-t2), level=2)
+		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (name, t3-t1, t2-t1, t3-t2), level=2)
 
 	nobs = comm.allreduce(len(mapmaker.data))
 	if nobs == 0:
@@ -524,39 +640,46 @@ def make_map(mapmaker, loader, obsinfo, comm, inds=None, prefix=None, dump=[], m
 		if signal.output:
 			signal.write(prefix, "map", val)
 
-def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
+def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
+	if joint is None:
+		joint = trivial_joint(obsinfo)
 	if inds is None:
-		inds = list(range(comm.rank, len(obsinfo), comm.size))
+		inds = list(range(comm.rank, len(joint.groups), comm.size))
 	if prefix is None:
 		prefix = ""
-	ntot_max = np.max(obsinfo.ndet[inds]*obsinfo.nsamp[inds])
-	if prealloc: setup_buffers(mapmaker.dev, ntot_max)
+	if prealloc:
+		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
+		setup_buffers(mapmaker.dev, ntot_max)
 	# Map indivdual tods
 	for ind in inds:
-		subinfo = obsinfo[ind:ind+1]
-		id      = subinfo.id[0]
-		subpre  = prefix + id.replace(":","_") + "_"
-		L.print("Mapping %s" % id)
+		subinfo = obsinfo[joint.groups[ind]]
+		name    = joint.names[ind]
+		subpre  = prefix + name.replace(":","_") + "_"
+		L.print("Mapping %s" % name)
+		# FIXME: group entries need names
 		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
 
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover"):
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover"):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
 	from pixell import bench
 	if prefix   is None: prefix = ""
+	if joint    is None: joint = trivial_joint(obsinfo)
 	if fullinfo is None: fullinfo = loader.query("obs,all")
 	periods = gutils.find_scan_periods(fullinfo)
 	# Which period each obs belongs to
-	pinds   = utils.find_range(periods, obsinfo.ctime+obsinfo.dur/2)
+	gfirst  = np.array([g[0] for g in joint.groups])
+	pinds   = utils.find_range(periods, obsinfo.ctime[gfirst]+obsinfo.dur[gfirst]/2)
 	# Get rid of observations that don't belong to a period. This shouldn't happen
 	bad = pinds<0
 	if np.any(bad):
-		L.print("Warning: %d obs with no period! %s" % (np.sum(bad), ", ".join(obsinfo.id[bad])), color=colors.red, id=0)
-		obsinfo = obsinfo[~bad]
-		pinds   = pinds  [~bad]
+		L.print("Warning: %d obs with no period! %s" % (np.sum(bad), ", ".join(obsinfo.id[gfirst[bad]])), color=colors.red, id=0)
+	inds  = np.where(~bad)[0]
+	pinds = pinds[inds]
+
 	# * We could split by band, tube, wafer etc. here, but for now, we will
 	# keep things simple by requiring the user to run the mapmaker separately
 	# for things they want to keep separate. E.g. one run for f090 and one for f150,
@@ -571,18 +694,19 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, prefix=None, dum
 	# Set up buffers. We get all the tods we will process to calculate how big
 	# buffers we will need
 	my_pinds   = list(range(comm.rank, len(pids), comm.size))
-	my_obsinds = np.concatenate([order[edges[pind]:edges[pind+1]] for pind in my_pinds])
+	my_obsinds = inds[np.concatenate([order[edges[pind]:edges[pind+1]] for pind in my_pinds])]
 	ntot_max   = np.max(obsinfo.ndet[my_obsinds]*obsinfo.nsamp[my_obsinds])
-	if prealloc: setup_buffers(mapmaker.dev, ntot_max)
+	if prealloc:
+		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=my_obsinds, sampranges=joint.sampranges))
+		setup_buffers(mapmaker.dev, ntot_max)
 	# Finally map each period
 	for pind in my_pinds:
 		pid    = pids[pind]
-		subinfo= obsinfo[order[edges[pind]:edges[pind+1]]]
 		# Name period after starting ctime for now
 		name   = "%10.0f" % periods[pid][0]
 		subpre = prefix + name + "_"
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(subinfo)))
-		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
+		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_obsinds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
 
 
 def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
@@ -611,6 +735,11 @@ def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 	# We don't have good estimates for these, so we don't pre-allocate them.
 	# But they should be small
 
+def trivial_joint(obsids):
+	"""Make a group-info corresponding to a no grouping"""
+	groups=[[i] for i in range(len(obsids))]
+	return bunch.Bunch(groups=groups, names=obsids.id)
+
 # Zippers
 # These package our degrees of freedomf or the CG solver
 
@@ -628,13 +757,13 @@ class ArrayZipper:
 class MultiZipper:
 	def __init__(self):
 		self.zippers = []
-		self.ndof	= 0
-		self.bins	= []
+		self.ndof    = 0
+		self.bins    = []
 	def add(self, zipper):
 		self.zippers.append(zipper)
 		self.bins.append([self.ndof, self.ndof+zipper.ndof])
 		self.ndof += zipper.ndof
-	def zip(self, *objs):
+	def zip(self, objs):
 		return np.concatenate([zipper.zip(obj) for zipper, obj in zip(self.zippers, objs)])
 	def unzip(self, x):
 		res = []
@@ -646,3 +775,9 @@ class MultiZipper:
 		for (b1,b2), dof in zip(self.bins, self.zippers):
 			res += dof.dot(a[b1:b2],b[b1:b2])
 		return res
+
+def extend_prefix(prefix, extra):
+	if len(prefix) == 0 or prefix.endswith("/"):
+		return prefix + extra
+	else:
+		return prefix + "_" + extra

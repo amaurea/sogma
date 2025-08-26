@@ -660,3 +660,24 @@ def get_expanded_context(context_or_config_or_name):
 	if not find_label(context["metadata"], "preprocess"):
 		raise ValueError("Could not infer preprocess archive from '%s'" % (context_or_config_or_name))
 	return context
+
+def group_obs(subids, mode="obs"):
+	subids = np.asarray(subids)
+	if mode == "obs":
+		# Group by the obs-id. For the LAT, this will group the 3 wafers in a tube,
+		# but keep the tubes separate
+		key = np.char.partition(subids, ":")[:,0]
+	elif mode == "wafer":
+		key = np.char.rpartition(subids, ":")[:,0]
+	elif mode == "none":
+		key = subids
+	elif mode == "full":
+		# Group all concurrent observations. For the LAT, this would group
+		# across optics tubes. Not sure if the sampling will be consistent
+		raise NotImplementedError
+	else: raise ValueError("Unrecognized subid grouping mode '%s'" % str(mode))
+	names, order, edges = utils.find_equal_groups_fast(key)
+	groups = [order[edges[i]:edges[i+1]] for i in range(len(edges)-1)]
+	bands  = np.unique(np.char.rpartition(subids, ":")[:,2])
+	joint  = bunch.Bunch(names=names, groups=groups, bands=bands, joint=mode!="none", sampranges=None)
+	return joint

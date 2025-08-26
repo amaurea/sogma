@@ -1,6 +1,6 @@
 import time, contextlib
 import numpy as np
-from pixell import utils, colors
+from pixell import utils, colors, bunch
 from . import device
 from .logging import L
 
@@ -95,7 +95,7 @@ def safe_inv(a):
 		res[~np.isfinite(res)] = 0
 	return res
 
-def safe_invert_ivar(ivar, tol=1e-3):
+def safe_invert_ivar(ivar, tol=1e-6):
 	vals = ivar[ivar!=0]
 	ref  = np.mean(vals[::100])
 	iivar= ivar*0
@@ -495,3 +495,39 @@ def logint(arr, x):
 	rx   = (ap.log(x+1)-ap.log(ix+1))/(ap.log(ix+2)-ap.log(ix+1))
 	larr = ap.log(arr)
 	return ap.exp(larr[...,ix]*(1-rx) + larr[...,ix+1]*rx)
+
+def obs_group_size(obsinfo, groups, inds=None, sampranges=None):
+	if inds is None: inds = np.arange(len(groups))
+	if sampranges is None:
+		return np.array([np.sum(obsinfo.ndet[groups[i]]*obsinfo.nsamp[groups[i]]) for i in inds])
+	else:
+		nsamps = sampranges[:,1]-sampranges[:,0]
+		return np.array([np.sum(obsinfo.ndet[groups[i]])*nsamps[i] for i in inds])
+
+def time_split(obsinfo, joint, maxsize=500e6):
+	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
+	into subranges so that the total ndet*nsamp size of each is no larger than
+	maxsize. This can be needed due to memory constraints."""
+	# calculate the total size of each group
+	sizes  = obs_group_size(obsinfo, joint.groups, sampranges=joint.sampranges)
+	# number of time splits for each
+	nsplits= utils.floor(sizes/maxsize)+1
+	# Do the split
+	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[], bands=joint.bands, joint=joint.joint)
+	for gi, (group, name, nsplit) in enumerate(zip(joint.groups, joint.names, nsplits)):
+		# Need the number of samples the group covers. Will assume good time alignment
+		if joint.sampranges is None:
+			i0    = 0
+			nsamp = np.max(obsinfo.nsamp[group])
+		else:
+			i0    = joint.sampranges[gi,0]
+			nsamp = joint.sampranges[gi,1]-joint.sampranges[gi,0]
+		for si in range(nsplit):
+			i1 = i0 + si*nsamp//nsplit
+			i2 = i0 + (si+1)*nsamp//nsplit
+			oname = "%s:split%d" % (name,si)
+			ojoint.groups.append(group)
+			ojoint.names.append(oname)
+			ojoint.sampranges.append((i1,i2))
+	ojoint.sampranges = np.array(ojoint.sampranges)
+	return ojoint

@@ -71,9 +71,18 @@ class SoFastLoader:
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Add timing info
 		obs.timing = [("meta",bench.t.load_meta),("data",bench.t.load_data),("calib",bench.t.load_calib)]
+		# Record which obs it is. A bit useless for load, but very useful for load_multi
+		obs.subids = [subid]
+		# Record any non-fatal errors
+		obs.errors = []
 		return obs
-	def load_multi(self, subids):
+	def load_multi(self, subids, order="band", samprange=None):
 		"""Load multiple concurrent subids into a single obs"""
+		# With multi-band mapping we will need the bands to be contiguous in memory.
+		# The other argument supports this
+		if   order == "raw":  pass
+		elif order == "band": subids = sorted(subids, key=lambda subid:subid.split(":")[2])
+		else: raise ValueError("Unrecognized subid ordering '%s'" % str(order))
 		# Read all the metadata
 		metas,     mids = [], []
 		exceptions,eids = [], []
@@ -82,15 +91,21 @@ class SoFastLoader:
 				metas.append(self.fast_meta.read(subid))
 				mids .append(subid)
 			except Exception as e:
+			#except () as e:
 				exceptions.append(e)
 				eids      .append(subid)
 		if len(metas) == 0:
 			raise utils.DataMissing(format_multi_exception(exceptions, eids))
 		# Restrict them to a common sample range
-		ndet, nsamp = make_metas_compatible(metas)
+		sinfo = get_obs_sampinfo(self.obsdb.conn, mids)
+		ndet, nsamp = make_metas_compatible(metas, sinfo)
+		# Restrict to target sample range
+		if samprange is not None:
+			for meta in metas:
+				meta.aman.restrict("samps", slice(samprange[0],samprange[1]), in_place=True)
 		# Set up total obs
-		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None)
-		append_fields = [("dets",0),("point_offset",0),("polangle",0),("response",1),("cuts",1)]
+		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[])
+		append_fields = [("dets",0),("bands",0),("point_offset",0),("polangle",0),("response",1),("cuts",1)]
 		for field, axis in append_fields: otot[field] = []
 		dcum = 0
 		try:
@@ -100,6 +115,7 @@ class SoFastLoader:
 			# "pointing" and "tod" pools. By swapping back in the end, the result will end
 			# up where we want it. We also need to swap back in the end to keep our total
 			# allocations low, since "pointing" is supposed to be a 3x as large buffer
+			self.dev.pools.want("pointing", "tod")
 			self.dev.pools.swap("pointing", "tod")
 			for si, (subid, meta) in enumerate(zip(mids, metas)):
 				try:
@@ -107,7 +123,10 @@ class SoFastLoader:
 					data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 					# This uses buffers "tod" and "ft"
 					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
+					obs.subids = [subid]
+					obs.errors = []
 				except Exception as e:
+				#except () as e:
 					exceptions.append(e)
 					eids      .append(subid)
 					continue
@@ -116,12 +135,14 @@ class SoFastLoader:
 					otot.ctime     = obs.ctime
 					otot.boresight = obs.boresight
 					otot.hwp       = obs.hwp
-					otot.tod       = self.dev.pools["pointing"].zeros((ndet,nsamp), obs.tod.dtype)
+					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
 				# Cuts needs to have the detector offsets modified, after which it's simple
 				obs.cuts[0] += dcum
 				# Handle the simple append cases
 				for field, axis in append_fields:
 					otot[field].append(obs[field])
+				otot.subids += obs.subids
+				otot.errors += obs.errors
 				# Copy tod over to the right part of the output buffer
 				otot.tod[dcum:dcum+len(obs.tod)] = obs.tod
 				dcum += len(obs.tod)
@@ -129,14 +150,19 @@ class SoFastLoader:
 			if dcum == 0:
 				raise utils.DataMissing(format_multi_exception(exceptions, eids))
 			# Concatenate the work-lists into the final arrays
-			for field, axis in append_field:
+			for field, axis in append_fields:
 				otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
 			# Trim tod in case we lost some detectors
 			otot.tod = otot.tod[:dcum]
 		finally:
 			# Finally, move tod to the tod-buffer, where it's expected to be
 			self.dev.pools.swap("pointing","tod")
-	return otot
+		# Non-fatal errors
+		if len(exceptions) > 0:
+			otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
+		return otot
+	def group_obs(self, obsinfo, mode="obs"):
+		return socommon.group_obs(obsinfo.id, mode=mode)
 
 class FastMeta:
 	def __init__(self, context):
@@ -178,6 +204,7 @@ class FastMeta:
 			except sqlite.sqlite3.OperationalError as e: raise errors.DataMissing(str(e))
 			aman = core.AxisManager(core.LabelAxis("dets", detinfo.channels))
 			aman.wrap("det_ids", detinfo.dets, [(0,"dets")])
+			aman.wrap("bands",   detname2band(detinfo.dets), [(0,"dets")])
 		# 2. Load the necessary info from det_cal
 		with bench.mark("fm_detcal"):
 			with h5py.File(dcalfile, "r") as hfile:
@@ -210,6 +237,7 @@ class FastMeta:
 		# way to read only those needed, so just read all of them and merge
 		t1 = time.time()
 		with PrepLoader(prepfile, prepgroup) as pl:
+			if pl.samps[1] != 0: print("Nonzero pl offset for %s. Chance to investigate cuts alignment" % subid)
 			paman = core.AxisManager(
 					core.LabelAxis("dets", pl.dets),
 					core.OffsetAxis("samps", count=pl.samps[0], offset=pl.samps[1]))
@@ -433,6 +461,7 @@ def calibrate(data, meta, mul=32, dev=None):
 	# Our goal is to output what sogma needs. Sogma works on these fields:
 	res  = bunch.Bunch()
 	res.dets         = meta.aman.dets.vals[good]
+	res.bands        = meta.aman.bands[good]
 	res.point_offset = meta.aman.focal_plane[good,1::-1]
 	res.polangle     = meta.aman.focal_plane[good,2]
 	res.ctime        = ctime
@@ -497,6 +526,21 @@ class AssignmentInfo:
 			self.dets    [detset] = np.char.decode(data["dets:det_id"])
 		return self
 
+# Should extend DetCache to also include wafer_info. wafer_info
+# is what officially lets us get the detector bandpass and type.
+# One can try to infer these from the detector name (e.g.
+# Mv12_f090_Cr00c06A would be an f090 detector and Mv21_DARK_Mp13b55D
+# would be a dark detector. But apparently this isn't reliable.
+#
+# wafer_info has a list of the detector names (not channels!),
+# band and type for each wafer name. Dark detectors are actually
+# associated with a band, which is needed for abscal. This information
+# is lost if one just uses the second field of the detector name.
+# On ther other hand, abscal for dark detectors is pretty meaningless...
+#
+# It's tempting to just ignore this for now, and instead hack the
+# handling of DARK in abscal.
+
 class DetCache:
 	def __init__(self, obsfiledb, smurf_info, ass_info):
 		self.obsfiledb = obsfiledb
@@ -522,9 +566,11 @@ class DetCache:
 				print("warning: dset %s missing" % dset)
 				# Some wafers may be missing
 				continue
-			# split dets into bands
-			# TODO: Should split cache into
+			# Could consider splitting the cache into
 			# (obsid,wslot) → detset and (detset,band) → detinfo
+			# This would give easier access to the wslot → detset mapping,
+			# at the cost of more complexity
+			# split dets into bands
 			for band, inds in split_bands(ainfo.dets):
 				subid = "%s:%s:%s" % (obsid, sinfo.wslot, band)
 				self.cache[subid] = bunch.Bunch(
@@ -710,32 +756,38 @@ def simplify_cuts(bins, ranges):
 
 def merge_cuts(cuts):
 	"""Get the union of the given list of Sampcuts"""
-	# 1. Flatten each cut
+	# 1. Flatten each cut. After this, franges will contain
+	# a concatenated but not sorted set of flattened cuts.
 	ndet = len(cuts[0].bins)
 	nsamp= cuts[0].nsamp
 	N    = nsamp+1 # +1 to avoid merging across dets
 	franges = []
 	for ci, cut in enumerate(cuts):
+		# Get the det each range belongs to
 		bind    = get_range_dets(cut.bins, cut.ranges).astype(np.int64) # avoid overflow
-		franges.append(cut.ranges + bind[:,None]*N)
+		franges.append(np.clip(cut.ranges,0,nsamp) + bind[:,None]*N)
 	# 3. Merge overlapping ranges. We count how many times
 	# we enter and exit a cut region across all, and look for places
-	# where this is nonzero
+	# where this is nonzero. We flatten franges because we will
+	# make a running tally of how many cut starts/ends we have encountred.
 	franges = np.concatenate(franges).reshape(-1)
 	if franges.size == 0: return Sampcut(nsamp=nsamp)
 	# FIXME: Handle everything cut-case
 	vals    = np.zeros(franges.shape,np.int32)
 	vals[0::2] =  1
 	vals[1::2] = -1
-	order   = np.argsort(franges)
+	# For starts and ends that happen at the same point, results could
+	# be ambiguous, resulting in a variable amount of merging. We can
+	# avoid this by making sure starts sort before ends, which will give
+	# maximum merging
+	sortkey = 2*franges + (np.arange(len(franges))&1) # even=start, odd=end, before sort
+	order   = np.argsort(sortkey)
 	franges = franges[order]
 	vals    = vals   [order]
+	# We're in a cut wherever the running tally is positive.
+	# incut[0] will always be True, incut[-1] will always be False
 	incut   = np.cumsum(vals)>0
-	# Use this to build the output cuts
-	changes = np.diff(incut.astype(np.int32))
-	starts  = np.where(changes>0)[0]+1
-	starts  = np.concatenate([[0],starts])
-	ends    = np.where(changes<0)[0]+1
+	starts, ends = utils.mask2range(incut).T
 	oranges = np.array([franges[starts],franges[ends]]).T
 	# Unflatten into per-detector
 	bind     = oranges[:,0]//N
@@ -764,8 +816,9 @@ def get_cut_borders(cuts, n=1):
 # TODO: Consider using just [{det,start,len},:] or its transpose as
 # the cuts format. This is what sogma uses directly, and may be easier
 # to work with overall.
-# TODO: Remember to check whether the way we use ranges is consistent with
-# it using absolute sample numbers, not ones relatve to the current tod start
+# This class represents cut ranges relative to the tod start, after
+# any offsets in the OffsetAxis in the axismanager have been applied.
+# So it's directly compatible with the signal array
 class Sampcut:
 	def __init__(self, bins=None, ranges=None, nsamp=0, simplify=False):
 		if bins   is None: bins   = np.zeros((0,2),np.int32)
@@ -793,7 +846,7 @@ class Sampcut:
 		if start < 0: start += self.nsamp
 		if stop  < 0: stop  += self.nsamp
 		if step != 1: raise ValueError("stride != 1 not supported")
-		ranges = np.clip(self.ranges, start, stop)
+		ranges = np.clip(self.ranges-start, 0, stop-start)
 		return Sampcut(bins, ranges, stop-start, simplify=True)
 	@property
 	def shape(self): return (len(self.bins),self.nsamp)
@@ -815,14 +868,6 @@ def read_cuts(pl, path):
 	edges     = pl.read(path + "/ends")
 	intervals = pl.read(path + "/intervals")
 	return expand_cuts_sampcut(shape, edges, intervals, inds = pl.inds)
-
-def read_jumps(pl, path):
-	shape = pl.read(path + "/shape")
-	edges = pl.read(path + "/indptr")
-	samps = pl.read(path + "/indices")
-	data  = pl.read(path + "/data")
-	edges, samps, data = unpad_jumps(edges, samps, data)
-	return sparse.csr_matrix((data,samps,edges),shape=shape)
 
 # This thing should basically be a lazy-loading axis-manager,
 # but let's wait with that until we have something that works
@@ -1082,7 +1127,7 @@ def merge_det_cuts(cuts):
 	return ocuts
 
 def format_multi_exception(exceptions, subids):
-	msgs   = [str(e) for ex in exceptions]
+	msgs   = np.array([str(ex) for ex in exceptions])
 	uvals, order, inds = utils.find_equal_groups_fast(msgs)
 	omsgs  = []
 	for ui, uval in enumerate(uvals):
@@ -1090,14 +1135,15 @@ def format_multi_exception(exceptions, subids):
 		omsgs.append(",".join(mysubs) + ": " + uval)
 	return ", ".join(omsgs)
 
-def make_metas_compatible(metas, tol=0.1):
-	# Find t1, t2 and dt for each
-	tranges = []
-	for meta in metas:
-		ctime = meta.aman.timestamps
-		dt    = (ctime[-1]-ctime[0])/(len(ctime)-1)
-		tranges.append((ctime[0],ctime[-1],dt))
-	t1s, t2s, dts = np.array(tranges).T
+def make_metas_compatible(metas, sinfo, tol=0.1):
+	# sinfo gives us the start and end time of the raw tods,
+	# but we want the ones after any offsets or truncation
+	t1s_raw, t2s_raw, nsamps_raw = sinfo.T
+	dts    = (t2s_raw-t1s_raw)/(nsamps_raw-1)
+	offs   = np.array([meta.aman.samps.offset for meta in metas])
+	nsamps = np.array([meta.aman.samps.count  for meta in metas])
+	t1s  = t1s_raw + dts*offs
+	t2s  = t1s_raw + dts*(offs+nsamps)
 	# Find the narrowest range
 	t1 = np.max(t1s)
 	t2 = np.min(t2s)
@@ -1120,3 +1166,13 @@ def make_metas_compatible(metas, tol=0.1):
 	ndet  = sum([meta.aman.dets.count for meta in metas])
 	nsamp = metas[0].aman.samps.count
 	return ndet, nsamp
+
+def get_obs_sampinfo(obsdb, subids):
+	sinfo = np.zeros((len(subids),3))
+	for i, subid in enumerate(subids):
+		obsid, wafer, band = subid.split(":")
+		sinfo[i] = next(obsdb.execute("select start_time, stop_time, n_samples from obs where obs_id = ?", [obsid]))
+	return sinfo
+
+def detname2band(detnames):
+	return np.char.partition(np.char.partition(detnames, "_")[:,2],"_")[:,0]

@@ -134,22 +134,28 @@ class NmatUncorr(Nmat):
 		return NmatUncorr(spacing=data.spacing, nbin=data.nbin, nmin=data.nmin, bins=data.bins, ips_binned=data.ips_binned, ivar=data.ivar, window=window, nwin=nwin, dev=dev)
 
 class NmatWhite(Nmat):
-	def __init__(self, ivar=None, bsize=256, dev=None):
+	def __init__(self, ivar=None, nwin=0, bsize=256, window=2, dev=None):
 		self.dev   = dev or device.get_device()
 		self.bsize = bsize
+		self.window= window
 		self.ivar  = ivar
+		self.nwin  = nwin
 		self.ready = ivar is not None
-	def build(self, tod, **kwargs):
+	def build(self, tod, srate, **kwargs):
 		nsamp  = tod.shape[1]
 		nblock = nsamp//self.bsize
+		nwin   = utils.nint(self.window*srate)
 		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
 		with utils.nowarn():
 			ivar = utils.without_nan(1/var)
-		return NmatWhite(ivar=ivar, bsize=self.bsize, dev=self.dev)
-	def apply(self, tod, inplace=True):
-		if not inplace: tod = tod.copy()
-		tod *= self.ivar[:,None]
-		return tod
+		return NmatWhite(ivar=ivar, nwin=nwin, bsize=self.bsize, window=self.window, dev=self.dev)
+	def apply(self, gtod, inplace=True):
+		self.check_ready()
+		if not inplace: gtod.copy()
+		gutils.apply_window(gtod, self.nwin)
+		gtod *= self.ivar[:,None]
+		gutils.apply_window(gtod, self.nwin)
+		return gtod
 	def white(self, tod, inplace=True): return self.apply(tod, inplace=inplace)
 	def write(self, fname):
 		bunch.write(fname, bunch.Bunch(type="NmatWhite"))

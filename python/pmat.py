@@ -7,7 +7,15 @@ from .logging import L
 class PmatMap:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, response=None, ncomp=3, recenter=None, dev=None, dtype=np.float32):
 		"""shape, wcs should be for a fullsky geometry, since we assume
-		x wrapping and no negative y pixels"""
+		x wrapping and no negative y pixels
+
+		* shape, wcs: geometry
+		* ctime[nsamp]
+		* bore[{ra,dec},nsamp]
+		* offs[ndet,{eta,xi}]
+		* polang[ndet]
+		* response[{T,P},ndet] or None
+		"""
 		self.ctime = ctime
 		self.bore  = bore
 		self.offs  = offs
@@ -44,17 +52,17 @@ class PmatMap:
 		t3 = self.dev.time()
 		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return glmap
-	def precalc_setup(self):
+	def precalc_setup(self, reset_buffer=True):
 		t1 = self.dev.time()
-		self.pointing = self.pfit.eval()
-		self.plan     = self._make_plan(self.pointing)
+		self.pointing = self.pfit.eval(reset_buffer=reset_buffer)
+		self.plan     = self._make_plan(self.pointing, reset_buffer=reset_buffer)
 		t2 = self.dev.time()
 		L.print("Pprep %6.4f" % (t2-t1), level=3)
 	def precalc_free (self):
 		self.pointing = None
 		self.plan     = None
-	def _make_plan(self, pointing):
-		with self.dev.pools["plan"].as_allocator():
+	def _make_plan(self, pointing, reset_buffer=True):
+		with self.dev.pools["plan"].as_allocator(reset=reset_buffer):
 			return self.dev.lib.PointingPlan(self.preplan, pointing)
 
 # Cuts
@@ -150,6 +158,8 @@ class PmatCutPoly:
 		with self.dev.pools["cut"].as_allocator():
 			blocks = self.dev.np.zeros((self.nrange, self.basis.shape[1]), np.float32)
 			self.dev.lib.extract_ranges(tod, blocks, self.offs, self.dets, self.starts, self.lens)
+			# Zero-out the samples we used, so the other signals (e.g. the map)
+			# don't need to care about them
 			self.clear(tod)
 			bjunk   = blocks.dot(self.basis.T)
 			junk[:] = bjunk.reshape(-1)
@@ -200,7 +210,14 @@ class PointingFit:
 		1. Build everything into this class
 		2. Make the interpolator more general, so it takes a function that provides
 		pointing as an argument.
-		For now I'll stick with the simple #1"""
+		For now I'll stick with the simple #1
+
+		* shape, wcs: geometry
+		* ctime[nsamp]
+		* bore[{ra,dec},nsamp]
+		* offs[ndet,{eta,xi}]
+		* polang[ndet]
+		"""
 		self.shape, self.wcs = shape, wcs
 		self.nt, self.nx, self.ny = nt, nx, ny
 		self.dev   = dev or device.get_device()
@@ -274,14 +291,14 @@ class PointingFit:
 		coeffs = v64.dot(B64.T).dot(idiv)
 		coeffs = coeffs.astype(self.dtype)
 		return coeffs # [{y,x,psi},ndet,ndof]
-	def eval(self, coeffs=None, B=None):
+	def eval(self, coeffs=None, B=None, reset_buffer=True):
 		t1 = self.dev.time()
 		if B is None:
 			B = self.B if self.store_basis else self.basis(self.ref_pixs)
 		if coeffs is None:
 			coeffs = self.coeffs
 		t2 = self.dev.time()
-		pointing = self.dev.pools["pointing"].empty(coeffs.shape[:-1]+B.shape[1:], B.dtype)
+		pointing = self.dev.pools["pointing"].empty(coeffs.shape[:-1]+B.shape[1:], B.dtype, reset=reset_buffer)
 		t3 = self.dev.time()
 		#coeffs.dot(B, out=pointing)
 		# coeffs[{y,x,psi},ndet,ndof]*B[ndof,nsamp] => pointing[{y,x,psi},ndet,nsamp]

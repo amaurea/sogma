@@ -18,6 +18,8 @@ parser.add_argument("-a", "--autocrop",   action="store_true")
 parser.add_argument("-N", "--nmat",    type=str, default="new")
 parser.add_argument(      "--ignore",  type=str, default="recover")
 parser.add_argument("-d", "--dump",    type=str, default="10,20,50,100")
+parser.add_argument("-j", "--joint",   type=str, default="none")
+parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -49,14 +51,27 @@ dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
 # Set up our data loader
 loader  = loading.Loader(args.context, type=args.loader, dev=dev)
 obsinfo = loader.query(args.query)
-nfile   = len(obsinfo)
-L.print("Mapping %d tods with %d mpi tasks" % (nfile, comm_all.size), level=0, id=0, color=colors.lgreen)
+# joint gives subobs to map jointly. It has entries
+# .names[ngroup]     Name of each group
+# .groups[ngroup][:] Indices into obsinfo for ach group member
+# .bands[nband]      List of bands involved
+# .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
+joint   = loader.group_obs(obsinfo, mode=args.joint)
+joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9)
+ngroup  = len(joint.groups)
+if joint.joint:
+	L.print("Mapping %d tod-groups across %s with %d mpi tasks" % (ngroup, ",".join(joint.bands), comm_all.size), level=0, id=0, color=colors.lgreen)
+else:
+	L.print("Mapping %d tods with %d mpi tasks" % (ngroup, comm_all.size), level=0, id=0, color=colors.lgreen)
 prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
 utils.mkdir(args.odir)
 # Set up the signals we will solve for
 recenter = gutils.parse_recentering(args.center_at) if args.center_at else None
-signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=np.float32, recenter=recenter, autocrop=args.autocrop)
+if joint.joint:
+	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=np.float32, recenter=recenter, autocrop=args.autocrop)
+else:
+	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=np.float32, recenter=recenter, autocrop=args.autocrop)
 signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev)
 signals    = [signal_cut, signal_map]
 # Set up the noise model
@@ -72,9 +87,9 @@ else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev)
 
 if   args.mode == "full":
-	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
+	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 elif args.mode == "individual":
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 elif args.mode == "depth1":
-	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
+	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

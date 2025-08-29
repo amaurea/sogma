@@ -371,19 +371,19 @@ class SignalMapMulti(Signal):
 			mapsig.prepare()
 			self.dof.add(mapsig.dof)
 		self.rhs = [mapsig.rhs for mapsig in self.mapsigs]
-		# Harmonize the output pixelization, so all bands cover the same pixels.
-		# This makes plotting easier, but also means we can't have different
-		# resolution for the different band maps. But to allow that, we would need
-		# to pass in multiple geometries anyway, which we don't do. So this doesn't
-		# make us less general than we already area.
-		# This is a bit hacky, since it messes with the internals of TileDistribution.
-		pixboxes = np.array([mapsig.tiledist.pixbox for mapsig in self.mapsigs])
-		pixbox   = np.array([np.min(pixboxes[:,0,:],0),np.max(pixboxes[:,1,:],0)])
-		for mi, mapsig in enumerate(self.mapsigs):
-			td = mapsig.tiledist
-			mapsig.pixbox = pixbox
-			_, mapsig.tiledist.pwcs = enmap.crop_geometry(mapsig.shape, mapsig.wcs, pixbox=pixbox, recenter=True)
-			td.ompi = tiling.build_omap_mpi(mapsig.shape, mapsig.wcs, td.tshape, td.dist.cell_inds, mapsig.comm, pixbox=pixbox)
+		## Harmonize the output pixelization, so all bands cover the same pixels.
+		## This makes plotting easier, but also means we can't have different
+		## resolution for the different band maps. But to allow that, we would need
+		## to pass in multiple geometries anyway, which we don't do. So this doesn't
+		## make us less general than we already area.
+		## This is a bit hacky, since it messes with the internals of TileDistribution.
+		#pixboxes = np.array([mapsig.tiledist.pixbox for mapsig in self.mapsigs])
+		#pixbox   = np.array([np.min(pixboxes[:,0,:],0),np.max(pixboxes[:,1,:],0)])
+		#for mi, mapsig in enumerate(self.mapsigs):
+		#	td = mapsig.tiledist
+		#	mapsig.pixbox = pixbox
+		#	_, mapsig.tiledist.pwcs = enmap.crop_geometry(mapsig.shape, mapsig.wcs, pixbox=pixbox, recenter=True)
+		#	td.ompi = tiling.build_omap_mpi(mapsig.shape, mapsig.wcs, td.tshape, td.dist.cell_inds, mapsig.comm, pixbox=pixbox)
 		self.ready = True
 	def forward(self, id, gtod, glmap, tmul=1):
 		"""map2tod operation. For tiled maps, the map should be in work distribution,

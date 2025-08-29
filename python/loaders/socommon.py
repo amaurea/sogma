@@ -394,7 +394,7 @@ wafer_pos_lat = {
 
 # Lowest possible sensitivity per detector in µK√s. Used for sanity checks.
 # These are about half our forecast goal sensitivity
-sens_limits = {"f030":120, "f040":80, "f090":100, "f150":140, "f220":300, "f750":750}
+sens_limits = {"f030":120, "f040":80, "f090":100, "f150":140, "f220":300, "f280":750}
 
 def wafer_info(tube_slot, wafer):
 	# Allow both 0 and ws0
@@ -661,23 +661,31 @@ def get_expanded_context(context_or_config_or_name):
 		raise ValueError("Could not infer preprocess archive from '%s'" % (context_or_config_or_name))
 	return context
 
-def group_obs(subids, mode="obs"):
-	subids = np.asarray(subids)
+def group_obs(obsinfo, mode="obs"):
 	if mode == "obs":
 		# Group by the obs-id. For the LAT, this will group the 3 wafers in a tube,
 		# but keep the tubes separate
-		key = np.char.partition(subids, ":")[:,0]
+		key = np.char.partition(obsinfo.id, ":")[:,0]
+		groups, names = _group_obs_simple(key)
 	elif mode == "wafer":
-		key = np.char.rpartition(subids, ":")[:,0]
+		key = np.char.rpartition(obsinfo.id, ":")[:,0]
+		groups, names = _group_obs_simple(key)
 	elif mode == "none":
-		key = subids
+		key = obsinfo.id
+		groups, names = _group_obs_simple(key)
 	elif mode == "full":
-		# Group all concurrent observations. For the LAT, this would group
-		# across optics tubes. Not sure if the sampling will be consistent
-		raise NotImplementedError
+		groups, names = _group_obs_tol(obsinfo)
 	else: raise ValueError("Unrecognized subid grouping mode '%s'" % str(mode))
-	names, order, edges = utils.find_equal_groups_fast(key)
-	groups = [order[edges[i]:edges[i+1]] for i in range(len(edges)-1)]
-	bands  = np.unique(np.char.rpartition(subids, ":")[:,2])
+	bands  = np.unique(np.char.rpartition(obsinfo.id, ":")[:,2])
 	joint  = bunch.Bunch(names=names, groups=groups, bands=bands, joint=mode!="none", sampranges=None)
 	return joint
+
+def _group_obs_simple(key):
+	names, order, edges = utils.find_equal_groups_fast(key)
+	groups = [order[edges[i]:edges[i+1]] for i in range(len(edges)-1)]
+	return groups, names
+
+def _group_obs_tol(obsinfo, tol=100):
+	groups = utils.find_equal_groups(obsinfo.ctime, tol=tol)
+	names  = np.array(["_".join(obsinfo.id[g[0]].split("_")[:2]) for g in groups])
+	return groups, names

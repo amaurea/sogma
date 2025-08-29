@@ -773,7 +773,7 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 		cov  = project_out_from_matrix(cov, V)
 		D    = ap.diag(cov)
 		# Disallow unrealistically low per-detector noise. This can happen if we
-		# have overfitted the vectors. That shouldn't happen, an I try to avoid it above,
+		# have overfitted the vectors. That shouldn't happen, and I try to avoid it above,
 		# but if it does happen, we don't want things to break
 		D    = ap.maximum(D, ap.median(D[D>0])*D_tol)
 		# budget_V = max(0,utils.floor((ndof/nper-ndet)/(ndet+1)))

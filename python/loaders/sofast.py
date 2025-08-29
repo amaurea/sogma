@@ -53,6 +53,7 @@ class SoFastLoader:
 		self.fast_meta = FastMeta(self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
+		self.catch_list = (Exception,)
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
@@ -66,7 +67,7 @@ class SoFastLoader:
 			# Calibrate the data
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
-		except Exception as e:
+		except self.catch_list as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Add timing info
@@ -90,8 +91,7 @@ class SoFastLoader:
 			try:
 				metas.append(self.fast_meta.read(subid))
 				mids .append(subid)
-			except Exception as e:
-			#except () as e:
+			except self.catch_list as e:
 				exceptions.append(e)
 				eids      .append(subid)
 		if len(metas) == 0:
@@ -102,7 +102,8 @@ class SoFastLoader:
 		# Restrict to target sample range
 		if samprange is not None:
 			for meta in metas:
-				meta.aman.restrict("samps", slice(samprange[0],samprange[1]), in_place=True)
+				off = meta.aman.samps.offset
+				meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
 		# Set up total obs
 		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[])
 		append_fields = [("dets",0),("bands",0),("point_offset",0),("polangle",0),("response",1),("cuts",1)]
@@ -125,8 +126,7 @@ class SoFastLoader:
 					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
 					obs.subids = [subid]
 					obs.errors = []
-				except Exception as e:
-				#except () as e:
+				except self.catch_list as e:
 					exceptions.append(e)
 					eids      .append(subid)
 					continue
@@ -162,7 +162,7 @@ class SoFastLoader:
 			otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
 		return otot
 	def group_obs(self, obsinfo, mode="obs"):
-		return socommon.group_obs(obsinfo.id, mode=mode)
+		return socommon.group_obs(obsinfo, mode=mode)
 
 class FastMeta:
 	def __init__(self, context):
@@ -1142,21 +1142,26 @@ def make_metas_compatible(metas, sinfo, tol=0.1):
 	dts    = (t2s_raw-t1s_raw)/(nsamps_raw-1)
 	offs   = np.array([meta.aman.samps.offset for meta in metas])
 	nsamps = np.array([meta.aman.samps.count  for meta in metas])
+	# t1s and t2s are absolute timestamps of start/end of current samples
 	t1s  = t1s_raw + dts*offs
 	t2s  = t1s_raw + dts*(offs+nsamps)
-	# Find the narrowest range
+	# Find the narrowest ctime range. This is what we want to restrict to
 	t1 = np.max(t1s)
 	t2 = np.min(t2s)
 	dur = t2-t1
 	if dur <= 0: raise ValueError("no sample overlap")
-	# Offset of t1 from each
-	i1s = (t1-t1s)/dts
-	i2s = (t2-t1s)/dts
+	# i1s and i2s are the sample offsets of the target start/end from the absolute start.
+	# These are the offsets axismanager will want
+	i1s = (t1-t1s_raw)/dts
+	i2s = (t2-t1s_raw)/dts
 	# Duration in samples should be the same, to within the tolerance
+	# Sample phase should also be the same
 	idurs = i2s-i1s
-	if np.max(np.abs(i1s-i1s[0])) > tol or np.max(np.abs(idurs-idurs[0])) > tol:
+	isubs = utils.rewind(i1s-i1s[0], ref=0, period=1)
+	if np.max(np.abs(isubs)) > tol or np.max(np.abs(idurs-idurs[0])) > tol:
 		raise ValueError("incompatible timestamps")
 	# Restrict sample ranges
+	# i1 is offset relative to our absolute start
 	i1s = utils.nint(i1s)
 	i2s = utils.nint(i2s)
 	for mi, meta in enumerate(metas):

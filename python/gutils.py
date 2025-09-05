@@ -513,7 +513,8 @@ def time_split(obsinfo, joint, maxsize=500e6):
 	# number of time splits for each
 	nsplits= utils.floor(sizes/maxsize)+1
 	# Do the split
-	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[], bands=joint.bands, joint=joint.joint)
+	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
+		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
 	for gi, (group, name, nsplit) in enumerate(zip(joint.groups, joint.names, nsplits)):
 		# Need the number of samples the group covers. Will assume good time alignment
 		if joint.sampranges is None:

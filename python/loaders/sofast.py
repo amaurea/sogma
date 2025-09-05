@@ -40,6 +40,10 @@ from .socommon import cmeta_lookup
 #    for the tod? This may be good in any case, as we don't need
 #    the read-in buffer later.
 
+# FIXME: fourier-truncation can lose a significant amount of samples, it seems
+# Probably best to switch to fourier-padding instead. Will be some work though,
+# since one needs to keep track of the logical length separately from the full
+# length.
 
 class SoFastLoader:
 	def __init__(self, context_or_config_or_name, dev=None, mul=32):
@@ -54,6 +58,7 @@ class SoFastLoader:
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
 		self.catch_list = (Exception,)
+		#self.catch_list = ()
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
@@ -79,10 +84,22 @@ class SoFastLoader:
 		return obs
 	def load_multi(self, subids, order="band", samprange=None):
 		"""Load multiple concurrent subids into a single obs"""
+		# FIXME: This is inefficient:
+		# * bands and dark detectors for the same wafer are stored in the same files,
+		#   which are read redundantly
+		# * The first g3 file must always be read, even when we just want a higher samprange
+		# Should group the subids by the ones that live in the same files, and issue a single
+		# fast_data and calibrate for each group. This will require a reorder afterwards, to
+		# get the bands in contiguous order.
+		# -
 		# With multi-band mapping we will need the bands to be contiguous in memory.
 		# The other argument supports this
 		if   order == "raw":  pass
-		elif order == "band": subids = sorted(subids, key=lambda subid:subid.split(":")[2])
+		elif order == "band":
+			def srtfun(subid):
+				toks = split_subid(subid)
+				return toks.band + ":" + toks.type
+			subids = sorted(subids, key=srtfun)
 		else: raise ValueError("Unrecognized subid ordering '%s'" % str(order))
 		# Read all the metadata
 		metas,     mids = [], []
@@ -131,7 +148,7 @@ class SoFastLoader:
 					eids      .append(subid)
 					continue
 				# Initial otot setup
-				if si == 0:
+				if otot.tod is None:
 					otot.ctime     = obs.ctime
 					otot.boresight = obs.boresight
 					otot.hwp       = obs.hwp
@@ -180,7 +197,8 @@ class FastMeta:
 		# 3. The detector info
 		smurf_info = SmurfInfo(sqlite.open(cmeta_lookup(context, "smurf")))
 		match_info = AssignmentInfo(sqlite.open(cmeta_lookup(context, "assignment")))
-		self.det_cache  = DetCache(self.obsfiledb, smurf_info, match_info)
+		wafer_info = WaferInfo(sqlite.open(cmeta_lookup(context, "wafer_info")))
+		self.det_cache  = DetCache(self.obsfiledb, smurf_info, match_info, wafer_info)
 		# 4. Absolute calibration
 		with sqlite.open(cmeta_lookup(context, "abscal")) as index:
 			acalfile = get_acalfile(index)
@@ -191,7 +209,7 @@ class FastMeta:
 		self.pointing_model_cache = PointingModelCache(cmeta_lookup(context, "pointing_model"))
 	def read(self, subid):
 		from sotodlib import core
-		obsid, wslot, band = subid.split(":")
+		obsid, wslot, band, det_type = split_subid(subid)
 		# Find which hdf files are relevant for this observation
 		try:
 			with bench.mark("fm_prepfile"):
@@ -200,7 +218,7 @@ class FastMeta:
 		except KeyError as e: raise utils.DataMissing(str(e))
 		# 1. Get our starting set of detectors
 		with bench.mark("fm_dets"):
-			try: detinfo = self.det_cache.get(subid)
+			try: detinfo = self.det_cache.get_dets(subid)
 			except sqlite.sqlite3.OperationalError as e: raise errors.DataMissing(str(e))
 			aman = core.AxisManager(core.LabelAxis("dets", detinfo.channels))
 			aman.wrap("det_ids", detinfo.dets, [(0,"dets")])
@@ -226,10 +244,10 @@ class FastMeta:
 			# Match detectors
 			det_ids = np.char.decode(fp_info["dets:det_id"])
 			ainds, finds = utils.common_inds([aman.det_ids, det_ids])
-			# Set up the focal plane
+			# Set up the focal plane. We don't need valid values for dark detectors
 			fp_info = fp_info[finds]
 			focal_plane = np.array([fp_info["xi"], fp_info["eta"], fp_info["gamma"]]).T
-			good    = np.all(np.isfinite(focal_plane),1)
+			good    = np.all(np.isfinite(focal_plane),1) | (det_type == "DARK")
 			aman.restrict("dets", aman.dets.vals[ainds[good]])
 			aman.wrap("focal_plane", focal_plane[good], [(0,"dets")])
 		# 4. Load what we need from the preprocess archive. There aren't that many
@@ -268,7 +286,7 @@ class FastMeta:
 
 		# 4. Get stuff from the data file header
 		with bench.mark("fm_detsets"):
-			detset = self.det_cache.get(subid).detset
+			detset = self.det_cache.get_dets(subid).detset
 		with bench.mark("fm_getfiles"):
 			finfos = self.obsfiledb.get_files(obsid)[detset]
 		# Get the filter params
@@ -503,7 +521,6 @@ class SmurfInfo:
 			data = hfile[group][()]
 			self.channels[detset] = np.char.decode(data["dets:readout_id"])
 			self.wslot   [detset] = data["dets:wafer_slot"][0].decode()
-		return self
 
 class AssignmentInfo:
 	"""Provides mapping from channel to detector for each detset"""
@@ -524,7 +541,25 @@ class AssignmentInfo:
 			data = hfile[group][()]
 			self.channels[detset] = np.char.decode(data["dets:readout_id"])
 			self.dets    [detset] = np.char.decode(data["dets:det_id"])
-		return self
+
+class WaferInfo:
+	"""Provides information about detector types"""
+	def __init__(self, wafer_index):
+		self.wafer_index = wafer_index
+		self.info = {}
+	def get(self, wafer_name):
+		self._prepare(wafer_name)
+		return self.info[wafer_name]
+	def _prepare(self, wafer_name):
+		if wafer_name in self.info: return
+		hfname, group = get_wafer_file(self.wafer_index, wafer_name)
+		with h5py.File(hfname, "r") as hfile:
+			data = hfile[group][()]
+			self.info[wafer_name] = bunch.Bunch(
+				dets  = np.char.decode(data["dets:det_id"]),
+				bands = np.char.decode(data["dets:wafer.bandpass"]),
+				types = np.char.decode(data["dets:wafer.type"]),
+				raw   = data)
 
 # Should extend DetCache to also include wafer_info. wafer_info
 # is what officially lets us get the detector bandpass and type.
@@ -539,57 +574,95 @@ class AssignmentInfo:
 # On ther other hand, abscal for dark detectors is pretty meaningless...
 #
 # It's tempting to just ignore this for now, and instead hack the
-# handling of DARK in abscal.
+# handling of DARK in abscal. Preprocess archive also needs the
+# band, though, and that's where we get our cuts from. With a hack,
+# we would need to translate DARK to another band, and hope that
+# captures all the dark detectors. One would also need to know
+# which band to replace DARK by for each wafer/tube, which isn't
+# obvious. Probably best to do this properly.
+#
+# If so, darkness is separate from band.
+# 1. Extend subids to obs:slot:band:type, with type defaulting to optc.
+#    Would then use type for special casing in FastMeta. Probably the
+#    best approach.
 
 class DetCache:
-	def __init__(self, obsfiledb, smurf_info, ass_info):
-		self.obsfiledb = obsfiledb
-		self.smurf_info= smurf_info
-		self.ass_info  = ass_info
-		self.cache     = {}
+	def __init__(self, obsfiledb, smurf_info, ass_info, wafer_info):
+		self.obsfiledb  = obsfiledb
+		self.smurf_info = smurf_info
+		self.ass_info   = ass_info
+		self.wafer_info = wafer_info
+		self.det_cache    = {}
+		self.detset_cache = {}
 		self.done      = set()
-	def get(self, subid):
-		obsid, wslot, band = subid.split(":")
+	def get_dets(self, subid):
+		toks = split_subid(subid)
+		self._prepare(toks.obsid)
+		return self.det_cache[toks.subid]
+	def get_detsets(self, obsid):
 		self._prepare(obsid)
-		return self.cache[subid]
+		return self.detset_cache[obsid]
 	def _prepare(self, obsid, force=False):
 		"""Read in the det lists for obsid, if necessary."""
 		if obsid in self.done and not force: return
 		detsets = self.obsfiledb.get_detsets(obsid)
 		if len(detsets) == 0:
 			raise utils.DataMissing("No detsets for %s in obsfiledb" % obsid)
-		for dset in self.obsfiledb.get_detsets(obsid):
+		self.detset_cache[obsid] = {}
+		for dset in detsets:
+			wafer_name = detset2wafer_name(dset)
 			try:
 				sinfo = self.smurf_info.get(dset)
 				ainfo = self.ass_info  .get(dset)
+				winfo = self.wafer_info.get(wafer_name)
 			except KeyError:
 				print("warning: dset %s missing" % dset)
 				# Some wafers may be missing
 				continue
-			# Could consider splitting the cache into
-			# (obsid,wslot) → detset and (detset,band) → detinfo
-			# This would give easier access to the wslot → detset mapping,
-			# at the cost of more complexity
-			# split dets into bands
-			for band, inds in split_bands(ainfo.dets):
-				subid = "%s:%s:%s" % (obsid, sinfo.wslot, band)
-				self.cache[subid] = bunch.Bunch(
-						channels=ainfo.channels[inds],
-						dets=ainfo.dets[inds],
-						detset=dset,
+			# Match ainfo to winfo
+			ainds, winds = utils.common_inds([ainfo.dets, winfo.dets])
+			# Group by band:type
+			band_type = np.char.add(np.char.add(winfo.bands[winds],":"),winfo.types[winds])
+			bts, order, edges = utils.find_equal_groups_fast(band_type)
+			for bti, bt in enumerate(bts):
+				band, type = bt.split(":")
+				subid = "%s:%s:%s:%s" % (obsid, sinfo.wslot, band, type)
+				inds  = ainds[order[edges[bti]:edges[bti+1]]]
+				self.det_cache[subid] = bunch.Bunch(
+						channels = ainfo.channels[inds],
+						dets     = ainfo.dets[inds],
+						detset   = dset,
+						band     = band,
+						type     = type,
 				)
+			self.detset_cache[obsid][sinfo.wslot] = dset
 		self.done.add(obsid)
 
-def split_bands(dets):
-	bdets = {}
-	for di, det in enumerate(dets):
-		m = re.match(r"^\w+_(f\d\d\d|DARK)_.*$", det)
-		if not m: continue
-		band = m.group(1)
-		if band not in bdets:
-			bdets[band] = []
-		bdets[band].append(di)
-	return [(band, np.array(bdets[band])) for band in bdets]
+#def split_bands(dets):
+#	bdets = {}
+#	for di, det in enumerate(dets):
+#		m = re.match(r"^\w+_(f\d\d\d|DARK)_.*$", det)
+#		if not m: continue
+#		band = m.group(1)
+#		if band not in bdets:
+#			bdets[band] = []
+#		bdets[band].append(di)
+#	return [(band, np.array(bdets[band])) for band in bdets]
+
+class Subid:
+	def __init__(self, obsid, wslot, band, type="OPTC"):
+		self.obsid, self.wslot, self.band, self.type = obsid, wslot, band, type
+		self.subid = ":".join(self)
+	def __len__(self): return 4
+	def __iter__(self):
+		yield self.obsid
+		yield self.wslot
+		yield self.band
+		yield self.type
+
+def split_subid(subid): return Subid(*subid.split(":"))
+
+def detset2wafer_name(detset): return "_".join(detset.split("_")[:2])
 
 def trange_fmt(sfile, query_fmt):
 	if "obs:timestamp__lo" in sfile.columns("map"):
@@ -634,9 +707,9 @@ class FplaneCache:
 		return self.fp_cache[key]
 	def get_by_subid(self, subid, det_cache):
 		"""returns array with [('dets:det_id', 'S18'), ('xi', '<f4'), ('eta', '<f4'), ('gamma', '<f4')]"""
-		obs_id, wafer_slot, band = subid.split(":")
-		ctime      = float(obs_id.split("_")[1])
-		wafer_name = "_".join(det_cache.get(subid).detset.split("_")[:2])
+		toks = split_subid(subid)
+		ctime      = float(toks.obsid.split("_")[1])
+		wafer_name = detset2wafer_name(det_cache.get_detsets(toks.obsid)[toks.wslot])
 		return self.get_by_wafer(wafer_name, ctime)
 
 class PointingModelCache:
@@ -665,8 +738,8 @@ class PointingModelCache:
 				self.cache[key] = params
 		return self.cache[key]
 	def get_by_subid(self, subid):
-		obs_id, wafer_slot, band = subid.split(":")
-		ctime      = float(obs_id.split("_")[1])
+		toks  = split_subid(subid)
+		ctime = float(toks.obsid.split("_")[1])
 		return self.get_by_time(ctime)
 
 class AcalCache:
@@ -907,19 +980,19 @@ class PrepLoader:
 		return res
 
 def get_prepfile(indexdb, subid):
-	obsid, wslot, band = subid.split(":")
+	toks = split_subid(subid)
 	# Inconsistent format here too
 	if "dets:wafer.bandpass" in indexdb.columns("map"):
-		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot], [dets:wafer.bandpass] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' AND [dets:wafer.bandpass] = '%s' LIMIT 1;" % (obsid, wslot, band)
+		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot], [dets:wafer.bandpass] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' AND [dets:wafer.bandpass] = '%s' LIMIT 1;" % (toks.obsid, toks.wslot, toks.band)
 	else:
-		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' LIMIT 1;" % (obsid, wslot)
+		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' LIMIT 1;" % (toks.obsid, toks.wslot)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in preprocess index" % subid)
 	return os.path.dirname(indexdb.fname) + "/" + fname, gname
 
 def get_dcalfile(indexdb, subid):
-	obsid, wslot, band = subid.split(":")
-	query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' LIMIT 1;" % (obsid)
+	toks = split_subid(subid)
+	query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' LIMIT 1;" % (toks.obsid)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in det_cal index" % subid)
 	return os.path.dirname(indexdb.fname) + "/" + fname, gname
@@ -935,6 +1008,12 @@ def get_smurffile(indexdb, detset):
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in smurf index" % subid)
 	return os.path.dirname(indexdb.fname) + "/" + fname, gname
+
+def get_wafer_file(waferdb, wafer_name):
+	query  = "SELECT files.name, dataset, file_id, files.id, [dets:stream_id] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:stream_id] = '%s' LIMIT 1;" % (wafer_name)
+	try: fname, gname = next(waferdb.execute(query))[:2]
+	except StopIteration: raise KeyError("%s not found in wafer index" % wafer_name)
+	return os.path.dirname(waferdb.fname) + "/" + fname, gname
 
 def get_acalfile(indexdb):
 	return os.path.dirname(indexdb.fname) + "/" + list(indexdb.execute("SELECT name FROM files INNER JOIN map ON files.id = map.file_id WHERE map.dataset = 'abscal'"))[0][0]
@@ -1175,8 +1254,8 @@ def make_metas_compatible(metas, sinfo, tol=0.1):
 def get_obs_sampinfo(obsdb, subids):
 	sinfo = np.zeros((len(subids),3))
 	for i, subid in enumerate(subids):
-		obsid, wafer, band = subid.split(":")
-		sinfo[i] = next(obsdb.execute("select start_time, stop_time, n_samples from obs where obs_id = ?", [obsid]))
+		toks = split_subid(subid)
+		sinfo[i] = next(obsdb.execute("select start_time, stop_time, n_samples from obs where obs_id = ?", [toks.obsid]))
 	return sinfo
 
 def detname2band(detnames):

@@ -482,7 +482,8 @@ class NmatAdaptive(Nmat):
 			self.dev.lib.rfft(tod, ft)
 		else: ft = tod
 		# If we don't cast to real here, we get the same result but much slower
-		rft = ft.view(tod.dtype)
+		# real_dtype needed for the nofft case
+		rft = ft.view(utils.real_dtype(tod.dtype))
 		t3  = self.dev.time()
 		# Apply the high-resolution, non-detector-correlated part of the model.
 		# The *2 compensates for the cast to real
@@ -519,6 +520,79 @@ class NmatAdaptive(Nmat):
 		gtod *= self.ivar[:,None]
 		gutils.apply_window(gtod, self.nwin)
 		return gtod
+	# Debug functions below. These are not part of the
+	# Nmat interface.
+	def eval_cov(self, d1=None, d2=None, finds=None):
+		"""This debug function evaluates the covariance between detector sets d1 and d2
+		at the given frequency indices."""
+		self.check_ready()
+		nbin, ndet = self.iD.shape
+		nfreq      = self.bins[-1,1]
+		if d1    is None: d1 = self.dev.np.arange(ndet)
+		if d2    is None: d2 = self.dev.np.arange(ndet)
+		if finds is None: fidns = self.dev.np.arange(nfreq)
+		# Evaluate the core cov = D+VEV' for each bin. Our model is
+		C = self.dev.np.zeros((len(d1),len(d2),nbin), self.iD.dtype)
+		for bi, b in enumerate(self.bins):
+			D  = self.dev.np.diag(1/self.iD[bi])[d1][:,d2]
+			V1 = self.V[bi][d1]
+			V2 = self.V[bi][d2]
+			C[:,:,bi] = D + V1.dot(1/self.iE[bi][:,None]*V2.T)
+		# Read this off at the requested indices
+		binds = np.searchsorted(self.bins[:,1], finds, side="right")
+		C = C[:,:,binds]
+		# Modify by the high-res scale
+		C *= self.hbmps[finds//self.bsize_mean]**-2
+		return C
+	def eval_var(self, d=None, finds=None):
+		"""This debug function evaluates the variance for det set d
+		at the given frequency indices."""
+		self.check_ready()
+		nbin, ndet = self.iD.shape
+		nfreq      = self.bins[-1,1]
+		if d     is None: d  = self.dev.np.arange(ndet)
+		if finds is None: fidns = self.dev.np.arange(nfreq)
+		# Evaluate the core cov = D+VEV' for each bin. Our model is
+		ps = self.dev.np.zeros((len(d),nbin), self.iD.dtype)
+		for bi, b in enumerate(self.bins):
+			ps[:,bi] = 1/self.iD[bi,d] + self.dev.np.sum(self.V[bi][d]**2/self.iE[bi],-1)
+		# Read this off at the requested indices
+		binds = np.searchsorted(self.bins[:,1], finds, side="right")
+		ps  = ps[:,binds]
+		# Modify by the high-res scale
+		ps *= self.hbmps[finds//self.bsize_mean]**-2
+		return ps
+	def det_slice(self, sel):
+		ivar = self.ivar[sel]
+		iD   = self.iD[:,sel]
+		V    = [v[sel] for v in self.V]
+		Kh   = []
+		for bi, b in enumerate(self.bins):
+			iK = self.dev.np.diag(self.iE[bi]) + V[bi].T.dot(iD[bi,:,None] * V[bi])
+			Kh.append(np.linalg.cholesky(self.dev.np.linalg.inv(iK)))
+		return NmatAdaptive(
+			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
+			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
+			maxmodes=self.maxmodes, dev=self.dev, hbmps=self.hbmps,
+			bsize_mean=self.bsize_mean, bsize_per=self.bsize_per,
+			bins=self.bins, iD=iD, iE=self.iE, V=V,
+			Kh=Kh, ivar=ivar, nwin=self.nwin, normexp=self.normexp)
+	def inv(self):
+		iE = [1/ie for ie in self.iE]
+		iD = 1/self.iD
+		Kh = []
+		for bi, b in enumerate(self.bins):
+			iK = self.dev.np.diag(iE[bi]) + self.V[bi].T.dot(iD[bi,:,None] * self.V[bi])
+			Kh.append(np.linalg.cholesky(self.dev.np.linalg.inv(iK)))
+		ivar  = 1/self.ivar
+		hbmps = 1/self.hbmps
+		return NmatAdaptive(
+			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
+			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
+			maxmodes=self.maxmodes, dev=self.dev, hbmps=hbmps,
+			bsize_mean=self.bsize_mean, bsize_per=self.bsize_per,
+			bins=self.bins, iD=iD, iE=iE, V=self.V,
+			Kh=Kh, ivar=ivar, nwin=self.nwin, normexp=self.normexp)
 
 
 #################

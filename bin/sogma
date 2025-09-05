@@ -18,7 +18,7 @@ parser.add_argument("-a", "--autocrop",   action="store_true")
 parser.add_argument("-N", "--nmat",    type=str, default="new")
 parser.add_argument(      "--ignore",  type=str, default="recover")
 parser.add_argument("-d", "--dump",    type=str, default="10,20,50,100")
-parser.add_argument("-j", "--joint",   type=str, default="none")
+parser.add_argument("-j", "--joint",   type=str, default="wafer")
 parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
 args = parser.parse_args()
 
@@ -30,7 +30,7 @@ from pixell import enmap, utils, mpi, colors, bench
 from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
 
 if   args.mode in ["individual","depth1"]: separate = True
-elif args.mode in ["full"]:                separate = False
+elif args.mode in ["full", "dump"]:        separate = False
 else: raise ValueError("Unknown mode '%s'" % (str(args.mode)))
 comm_all   = mpi.COMM_WORLD
 comm_per   = mpi.COMM_SELF if separate else mpi.COMM_WORLD
@@ -51,6 +51,9 @@ dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
 # Set up our data loader
 loader  = loading.Loader(args.context, type=args.loader, dev=dev)
 obsinfo = loader.query(args.query)
+if len(obsinfo) == 0:
+	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
+	sys.exit(1)
 # joint gives subobs to map jointly. It has entries
 # .names[ngroup]     Name of each group
 # .groups[ngroup][:] Indices into obsinfo for ach group member
@@ -60,7 +63,10 @@ joint   = loader.group_obs(obsinfo, mode=args.joint)
 joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9)
 ngroup  = len(joint.groups)
 if joint.joint:
-	L.print("Mapping %d tod-groups across %s with %d mpi tasks" % (ngroup, ",".join(joint.bands), comm_all.size), level=0, id=0, color=colors.lgreen)
+	bandmsg = ",".join(joint.bands)
+	if len(joint.nullbands) > 0:
+		bandmsg += " null " + ",".join(joint.nullbands)
+	L.print("Mapping %d tod-groups across %s with %d mpi tasks" % (ngroup, bandmsg, comm_all.size), level=0, id=0, color=colors.lgreen)
 else:
 	L.print("Mapping %d tods with %d mpi tasks" % (ngroup, comm_all.size), level=0, id=0, color=colors.lgreen)
 prefix = args.odir + "/"
@@ -92,4 +98,6 @@ elif args.mode == "individual":
 	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
 elif args.mode == "depth1":
 	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore)
+elif args.mode == "dump":
+	mapmaking.dump_tod(loader, obsinfo, noise_model, comm_all, dev=dev, joint=joint, prefix=prefix, ignore=args.ignore)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

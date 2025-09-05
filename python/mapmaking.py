@@ -1,6 +1,6 @@
 import numpy as np
 import time
-from pixell import utils, bunch, enmap, colors
+from pixell import utils, bunch, enmap, colors, wcsutils
 from . import nmat, pmat, tiling, gutils, device
 from .logging import L
 
@@ -582,7 +582,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 	dev = mapmaker.dev
 	# Set up memory pools. Setting these up before-hand is
 	# actually more memory-efficient, as long as our estimate is
-	# good. Yuck, looping
+	# good.
 	if prealloc and len(inds) > 0:
 		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
 		setup_buffers(dev, ntot_max)
@@ -708,6 +708,156 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, pref
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(subinfo)))
 		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_obsinds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
 
+# Mapmaking function
+def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
+		tdown=500, fdown=250, fdown_lowf=10, fmax_lowf=4, prealloc=True, dev=None, ignore="recover"):
+	if prefix is None: prefix = ""
+	# Groups is a list of obsinfo entries that should be mapped jointly
+	# (as a big super-tod with full noise correlations)
+	if joint is None: joint = trivial_joint(obsinfo)
+	# Inds is a list of indices into joint groups, giving which groups this mpi task
+	# should care about
+	if inds is None:
+		# Use the first entry in groups as representative
+		gfirst = np.array([g[0] for g in joint.groups])
+		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
+		inds = np.where(dist.owner == comm.rank)[0]
+	# Set up exception types we will ignore
+	if   ignore == "all":     etypes = (Exception,)
+	elif ignore == "missing": etypes = (utils.DataMissing,)
+	elif ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
+	elif ignore == "none":    etypes = ()
+	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
+	if dev is None: dev = device.get_device()
+	# Set up memory pools. Setting these up before-hand is
+	# actually more memory-efficient, as long as our estimate is
+	# good.
+	if prealloc and len(inds) > 0:
+		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
+		setup_buffers(dev, ntot_max)
+	# Process our observations
+	for i, ind in enumerate(inds):
+		name   = joint.names[ind]
+		subids = obsinfo.id[joint.groups[ind]]
+		subpre = prefix + name.replace(":","_") + "_"
+		t1     = time.time()
+		try:
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind])
+		except etypes as e:
+			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
+			continue
+		if len(data.errors) > 0:
+			# Partial skip
+			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
+		t2    = time.time()
+
+		# Output tod
+		otod = dev.get(gutils.downgrade(data.tod, tdown))
+		dt   = (data.ctime[-1]-data.ctime[0])/(len(data.ctime)-1)
+		twcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[dt*tdown,1])
+		enmap.write_map(subpre + "tod.fits", enmap.enmap(otod, twcs))
+
+		# Output ps
+		ft   = dev.lib.rfft(data.tod)
+		nsamp= data.tod.shape[1]
+		normexp = -1
+		ft  *= nsamp**normexp
+
+		ps   = dev.np.abs(ft)**2
+		ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
+		df   = 1/(dt*data.tod.shape[1])
+		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
+		enmap.write_map(subpre + "ps.fits", enmap.enmap(ops, fwcs))
+
+		# Output high-res ps for low freq
+		ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
+		nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		ops  = ops[:,:nbin]
+		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		enmap.write_map(subpre + "ps_lowf.fits", enmap.enmap(ops, fwcs))
+		del ps
+
+		# Output freq corrmat. Uses same resolution as coarse ps
+		ndet, nfreq = ft.shape
+		nbin = utils.floor(fmax_lowf/(df*fdown))
+		bft  = ft[:,:nbin*fdown].reshape(ndet,nbin,fdown)
+		cbft = dev.np.conj(bft)
+		fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
+		v    = dev.np.einsum("ddb->db", fcov)**-0.5
+		fcorr= fcov*v[:,None,:]*v[None,:,:]
+		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
+		enmap.write_map(subpre + "corr_lowf.fits", enmap.enmap(fcorr, fwcs))
+		del bft, cbft
+
+		# Same, but high resolution, for a subset of detectors
+		ndet, nfreq = ft.shape
+		thin = 100
+		nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		bft  = ft[:,:nbin*fdown_lowf].reshape(ndet,nbin,fdown_lowf)
+		cbft = dev.np.conj(bft[::thin])
+		fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
+		v    = dev.np.sum(dev.np.abs(bft)**2,-1)**-0.5
+		fcorr= fcov*v[::thin,None,:]*v[None,:,:]
+		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		enmap.write_map(subpre + "corr_lowf2.fits", enmap.enmap(fcorr, fwcs))
+		del bft, cbft
+
+		## Build the noise model
+		#ft2  = ft.copy()
+		#iN   = noise_model.build_fourier(ft2, srate=1/dt, nsamp=data.tod.shape[1])
+		#d2   = dev.np.arange(ndet)
+		#d1   = d2[::thin]
+		#finds= dev.np.arange(nbin*fdown_lowf)
+		#fcov = iN.eval_cov(d1=d1, d2=d2, finds=finds)
+		## Same averaging as we do with the data
+		#fcov = dev.np.sum(fcov.reshape(fcov.shape[:2]+(nbin,fdown_lowf)),-1)
+		## Need the diagonal for normalization
+		#v    = iN.eval_var(d=d2, finds=finds)
+		#v    = dev.np.sum(v.reshape(v.shape[:1]+(nbin,fdown_lowf)),-1)**-0.5
+		#fcorr= fcov*v[::thin,None,:]*v[None,:,:]
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		#enmap.write_map(subpre + "corrmodel_lowf2.fits", enmap.enmap(fcorr, fwcs))
+
+		## Choose a single nmat bin and see what happens there.
+		## Let's try a bin that's wider than the number of detectors to be safe
+		#bi = np.where(iN.bins[:,1]-iN.bins[:,0] > ndet//8)[0][0]
+		#b1, b2 = iN.bins[bi]
+		#debug = bunch.Bunch(bi=bi, bin=iN.bins[bi], freqs=iN.bins[bi]*df,
+		#	V=iN.V[bi], iD=iN.iD[bi], iE=iN.iE[bi], dpre=ft2[:,b1:b2].copy())
+
+		## Try to manually project out the dark modes
+		#dark  = np.array(["DARK" in band for band in data.bands])
+		#light = ~dark
+		#iiN11 = iN.det_slice(light).inv()
+		#d2    = ft2.copy(); d2[light] = 0
+		#ft2[light] += iiN11.apply(iN.apply(d2, nofft=True)[light], nofft=True)
+
+		#debug.dark  = dark
+		#debug.dpost = ft2[:,b1:b2]
+		#bunch.write(subpre + "debug.hdf", debug)
+
+		## Output high-res ps for low freq
+		#ps   = dev.np.abs(ft)**2
+		#ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
+		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		#ops  = ops[:,:nbin]
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		#enmap.write_map(subpre + "ps_deproj.fits", enmap.enmap(ops, fwcs))
+		#del ps
+
+		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		#bft  = ft[:,:nbin*fdown_lowf].reshape(ndet,nbin,fdown_lowf)
+		#cbft = dev.np.conj(bft[::thin])
+		#fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
+		#v    = dev.np.sum(dev.np.abs(bft)**2,-1)**-0.5
+		#fcorr= fcov*v[::thin,None,:]*v[None,:,:]
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		#enmap.write_map(subpre + "corr_deproj.fits", enmap.enmap(fcorr, fwcs))
+
+		dev.garbage_collect()
+		del data
+		t3    = time.time()
+		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (name, t3-t1, t2-t1, t3-t2), level=2)
 
 def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case

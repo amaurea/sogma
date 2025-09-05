@@ -16,7 +16,9 @@ def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, ta
 	# Main parse of the simple query
 	qinfo = parse_query(simple_query, cols, tags, pre_cols=pre_cols, default_good=default_good)
 	qjoin = ""
-	qsort = ""
+	# By default, order by obs_id or subobs id
+	if is_subobs: qsort = "order by subobs_id"
+	else:         qsort = "order by obs_id"
 	# Create database we will put the result in, and attach
 	# it temporarily to obsdb so we can write to it
 	res_db  = sqlite.SQL()
@@ -79,6 +81,7 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 	otoks  = []
 	pycode = []
 	slices = []
+	det_type_set = False
 	for tok in toks:
 		# Direct tod list. Can be combined with other constraints, but
 		# only to further restrict. Multiple @ per query not supported -
@@ -90,6 +93,12 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		# not in the database will be silently discarded.
 		if tok.startswith("@"):
 			idfile = tok[1:]
+			# Hack: Count det type to be set if we read in from a file, since
+			# the det type is part of the obs-db. If we don't do this, then
+			# dark detectors will be ignored in the idfile unless +dark is given,
+			# which is confusing. Ideally this would be handled separately for the
+			# file and any other constraints, but this will do for now.
+			det_type_set = True
 		elif is_slice(tok):
 			slices.append(utils.parse_slice("["+tok+"]"))
 		# Very hacky! (See notes above on future directions)
@@ -111,24 +120,32 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 	# 3. Loop through all referenced fields, and expand them if necessary.
 	otoks = []
 	qtags = []
-	only_good = default_good
+	prep_sel = {"set": False, "good": True, "bad": False}
 	for tok, isname in fieldname_iter(query):
+		# Split out unary op
+		if len(tok) > 0 and tok[0] in "+-~":
+			op, tok = tok[0], tok[1:]
+		else: op = " "
 		# Handle our formats
 		if not isname: pass
 		# Restrict as much as we can given any subobs constraints.
 		# This isn't very much, since obsdb doesn't operate on the subobs level
 		elif re.match(r"ws\d", tok):
-			tok = "instr(wafer_slots_list, '%s')" % tok
-		elif tok in ["f030","f040"]: tok = bandsel(tok, 'lf')
-		elif tok in ["f090","f150"]: tok = bandsel(tok, 'mf')
-		elif tok in ["f220","f280"]: tok = bandsel(tok, 'uhf')
+			tok = tag_op("instr(wafer_slots_list, '%s')" % tok, op)
+		elif tok in ["f030","f040"]: tok = tag_op(bandsel(tok, 'lf'),  op)
+		elif tok in ["f090","f150"]: tok = tag_op(bandsel(tok, 'mf'),  op)
+		elif tok in ["f220","f280"]: tok = tag_op(bandsel(tok, 'uhf'), op)
 		# Optics tube
 		elif tok in ["c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6"]:
-			tok = "(tube_slot = '%s')" % tok
+			tok = tag_op("(tube_slot = '%s')" % tok, op)
 		# Pseudo-tags
-		elif tok == "cmb": tok = "(type='obs' and subtype='cmb')"
-		elif tok == "night": tok = "(mod(timestamp/3600,24) not between 11 and 23)"
-		elif tok == "day": tok = "(mod(timestamp/3600,24) between 11 and 23)"
+		elif tok == "cmb": tok = tag_op("(type='obs' and subtype='cmb')", op)
+		elif tok == "night": tok = tag_op("(mod(timestamp/3600,24) not between 11 and 23)", op)
+		elif tok == "day": tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
+		elif tok.upper() in ["DARK","OPTC"]:
+			if "det_type" in cols: tok = tag_op("(det_type = '%s')" % tok.upper(), op)
+			else:                  tok = "1"
+			det_type_set = True
 		# Aliases
 		elif tok == "t":   tok = "timestamp"
 		elif tok == "baz": tok = "az_center"
@@ -147,21 +164,27 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		else:
 			# negation. This required a hack in the fieldname iterator,
 			# making it treat the ~ as part of the name itself. Ugly.
-			if tok.startswith("~"): tok, eq = tok[1:], "!="
-			else: eq = "="
+			eq = "!=" if op in "-~" else "="
 			# Handle normal tags
 			if tok in tags:
-				qtags.append("tag %s '%s'" % (eq, tok))
+				qtags.append(tag_op("(tag = '%s')" % tok, op))
 			# Handle some pseudo-tags
 			elif tok == "planet":
 				# The or 0 handles the case where there are no planets defined
-				sel = "(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)"
-				if eq == "!=": sel = "not %s" % sel
+				sel = tag_op("(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)", op)
 				qtags.append(sel)
-			elif tok == "all":
-				only_good = False
 			elif tok == "good":
-				only_good = True
+				if   op == " ": prep_sel["good"], prep_sel["bad"] = True, False
+				elif op == "+": prep_sel["good"] = True
+				elif op == "-": prep_sel["good"] = False
+				elif op == "~": prep_sel["good"], prep_sel["bad"] = False, True
+				prep_sel["set"]   = True
+			elif tok == "bad":
+				if   op == " ": prep_sel["bad"], prep_sel["good"] = True, False
+				elif op == "+": prep_sel["bad"] = True
+				elif op == "-": prep_sel["bad"] = False
+				elif op == "~": prep_sel["bad"], prep_sel["good"] = False, True
+				prep_sel["set"]   = True
 			# Unknown tag
 			else:
 				raise ValueError("Name '%s' not a recognized tag or obs table column!" % str(tok))
@@ -173,9 +196,16 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 	if len(qtags) > 0:
 		# I tried exists too, but it was much slower
 		query += " and obs_id in (select obs_id from tags where " + " and ".join(qtags) + ")"
+	# Add default OPTC (non-dark) detector selection
+	if not det_type_set and "det_type" in cols:
+		query += " and (det_type = 'OPTC')"
 	# Filter on valid preprocess
 	pjoin = ""
-	if pre_cols is not None and only_good:
+	if not prep_sel["set"]: prep_sel["good"] = True
+	if prep_sel["good"] and prep_sel["bad"]:
+		# Want both good and bad, so no prep restriction required
+		pass
+	elif prep_sel["good"] and not prep_sel["bad"]:
 		if "band" in cols:
 			# band is present if we have a subobsdb
 			pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id]"
@@ -185,7 +215,23 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 				pjoin += " and obs.band = pre.map.[dets:wafer.bandpass]"
 		else:
 			query += "  and obs.obs_id in (select [obs:obs_id] from pre.map)"
+	elif prep_sel["bad"] and not prep_sel["good"]:
+		# Selecting only bad was cumbersome to implement...
+		raise ValueError("Selecting only bad observations not supported yet")
+	else:
+		# Neither good nor bad. So disqalify all obs
+		query += " and 0"
 	return bunch.Bunch(where=query, join=pjoin, idfile=idfile, pycode=pycode, slices=slices)
+
+def tag_op(expr, op):
+	if   op in " ": return expr # standard
+	elif op in "+": return "1"  # + enables, but everything enabled by default
+	elif op in "-~": return "not " + expr # - removes from set, ~ complements. Same for boolean
+	else: raise ValueError("Invalid tag op '%s'" % str(op))
+
+# FIXME: when splitting bands, we must remember that this
+# also reduces ndet. Otherwise we will end up overestimating
+# memory use later
 
 def subobs_expansion(obsdb, tags=True):
 	"""Given an obsdb SQL, return a subobsdb SQL using looping in SQL"""
@@ -236,10 +282,18 @@ split_bands(obs_id, band, bands) as (
 	from split_bands
 	where bands <> ''
 )""" % case
+	# dark expansion. Want "" and ":DARK" for each entry. Could do ":OPTC" instead of "",
+	# but that makes the common case needlessly verbose and confusing. "" is slightly
+	# confusing too, though, since one might think that "" would mean "all types".
+	# But we don't support wildcard subids. A subid refers to a specific set of detectors.
 	# the rest
-	query += """
-select obs.obs_id || ':' || slot || ':' || band as subobs_id, %s, slot as wafer_slots_list, band from obs join split on obs.obs_id = split.obs_id join split_bands on split_bands.obs_id = obs.obs_id where slot <> '' and band <> ''
-""" % ", ".join(["obs.%s" % col for col in cols])
+	det_types = ["OPTC", "DARK"]
+	for i, det_type in enumerate(det_types):
+		idsuf = "" if det_type == "OPTC" else " || ':%s'" % det_type
+		union = " union all " if i > 0 else ""
+		query += """
+%s select obs.obs_id || ':' || slot || ':' || band%s as subobs_id, '%s' as det_type, %s, slot as wafer_slots_list, band from obs join split on obs.obs_id = split.obs_id join split_bands on split_bands.obs_id = obs.obs_id where slot <> '' and band <> ''
+""" % (union, idsuf, det_type, ", ".join(["obs.%s" % col for col in cols]))
 	subobsdb = sqlite.SQL()
 	with obsdb.attach(subobsdb, mode="rw"):
 		obsdb.execute("create table other.obs as %s" % query)
@@ -247,7 +301,7 @@ select obs.obs_id || ':' || slot || ':' || band as subobs_id, %s, slot as wafer_
 	return subobsdb
 
 # Have to hard-code this, I think
-flavor_bands = {"lf":["f030","f040"], "mf":["f090","f150"], "uhf":["f220","f280"]}
+flavor_bands = {"lf":["f030","f040","DARK"], "mf":["f090","f150","DARK"], "uhf":["f220","f280","DARK"]}
 planets = ["mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune", "moon", "sun"]
 
 ##### Helpers #####
@@ -256,7 +310,11 @@ def get_tags(db): return [row[0] for row in db.execute("select distinct tag from
 
 def fieldname_iter(query, quote="'\""):
 	toks = utils.split_by_group(query, start=quote, end=quote)
-	fmt  = re.compile(r"~?\b[a-zA-Z]\w*\b")
+	#fmt  = re.compile(r"~?\b[a-zA-Z]\w*\b")
+	# word optionally preceded by ~, or +/-, but only if the latter can't be interpreted
+	# as a binary operation. I had to use two groups to capture what amounts to the same
+	# thin here because of limitations with lookbehind length variability
+	fmt = re.compile(r"(?:(?:^|[\[({,])([+-]?\b[a-zA-Z]\w*\b))|(~?\b[a-zA-Z]\w*\b)") # urk
 	current = ""
 	for tok in toks:
 		if len(tok) == 0: continue
@@ -265,10 +323,12 @@ def fieldname_iter(query, quote="'\""):
 			# Ok, we're in a non-quoted section. Look for identifiers
 			pos = 0
 			while m := fmt.search(tok, pos):
+				# Find which of the groups matched
+				mind = [i for i,g in enumerate(m.groups()) if g is not None][0]+1 # yuck
 				# pos:m.start() will be new, non-matching stuff
-				current += tok[pos:m.start()]
+				current += tok[pos:m.start(mind)]
 				# m.start():m.end() will be either a name or a keyword
-				fieldname = m[0]
+				fieldname = m[mind]
 				if fieldname.lower() in recognized_sql:
 					current += fieldname
 				else:
@@ -276,8 +336,8 @@ def fieldname_iter(query, quote="'\""):
 					if len(current) > 0:
 						yield current, False
 						current = ""
-					yield m[0], True
-				pos = m.end()
+					yield m[mind], True
+				pos = m.end(mind)
 			# Handle what's left of the token
 			current += tok[pos:]
 	# Yield left-over stuff if present
@@ -337,10 +397,17 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 		# Skip obsinfo construction if we don't need pycode
 		for sel in slices: info = info[sel]
 		return info
+	# Estimate number of detectors. This will be an overestimate,
+	# since some detectors will be cut. This assumes optc and dark
+	# are the only possibilities, and uses hardcoded values.
+	ndet = np.where(info["det_type"] == "OPTC",
+		utils.dict_lookup(flavor_noptc_per_band, info["tube_flavor"]),
+		utils.dict_lookup(flavor_ndark_per_band, info["tube_flavor"]),
+	)
 	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(6,2))]
 	obsinfo = np.zeros(len(info), dtype).view(np.recarray)
 	obsinfo.id    = info["subobs_id"]
-	obsinfo.ndet  = utils.dict_lookup(flavor_ndets_per_band, info["tube_flavor"])
+	obsinfo.ndet  = ndet
 	obsinfo.nsamp = info["n_samples"]
 	obsinfo.ctime = info["start_time"]
 	obsinfo.dur   = info["stop_time"]-info["start_time"]
@@ -363,7 +430,8 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 
 # Hard-coded raw wafer detector counts per band. Independent of
 # telescope type, etc.
-flavor_ndets_per_band = {"lf":118, "mf": 864, "uhf": 864}
+flavor_noptc_per_band = {"lf":118, "mf": 864, "uhf": 864}
+flavor_ndark_per_band = {"lf":  4, "mf":  18, "uhf":  18}
 
 wafer_pos_sat = [
 	#      xi,      eta
@@ -661,24 +729,38 @@ def get_expanded_context(context_or_config_or_name):
 		raise ValueError("Could not infer preprocess archive from '%s'" % (context_or_config_or_name))
 	return context
 
-def group_obs(obsinfo, mode="obs"):
+def group_obs(obsinfo, mode="wafer"):
+	if len(obsinfo) == 0:
+		return bunch.Bunch(names=[], groups=[], bands=[], nullbands=[], joint=mode!="none", sampranges=None)
 	if mode == "obs":
 		# Group by the obs-id. For the LAT, this will group the 3 wafers in a tube,
 		# but keep the tubes separate
 		key = np.char.partition(obsinfo.id, ":")[:,0]
 		groups, names = _group_obs_simple(key)
 	elif mode == "wafer":
-		key = np.char.rpartition(obsinfo.id, ":")[:,0]
+		key = astr_tok_range(obsinfo.id, ":", 0, 2)
 		groups, names = _group_obs_simple(key)
 	elif mode == "none":
 		key = obsinfo.id
 		groups, names = _group_obs_simple(key)
+	elif mode == "wband":
+		# Group by wafer-band. Usually not necessary, as one
+		# usually either selects a single band or splits by band anyway
+		key = astr_tok_range(obsinfo.id, ":", 0, 3)
+		groups, names = _group_obs_simple(key)
 	elif mode == "full":
 		groups, names = _group_obs_tol(obsinfo)
 	else: raise ValueError("Unrecognized subid grouping mode '%s'" % str(mode))
-	bands  = np.unique(np.char.rpartition(obsinfo.id, ":")[:,2])
-	joint  = bunch.Bunch(names=names, groups=groups, bands=bands, joint=mode!="none", sampranges=None)
+	full_bands = np.unique(astr_tok_range(obsinfo.id, ":", 2, 4))
+	is_null    = np.array([(":" in band and not band.endswith(":OPTC")) for band in full_bands])
+	joint = bunch.Bunch(names=names, groups=groups,
+		bands=full_bands[~is_null], nullbands=full_bands[is_null],
+		joint=mode!="none", sampranges=None)
 	return joint
+
+def astr_tok_range(astr, sep, start, end):
+	# np.char lacks substr, so just loop
+	return np.array([sep.join(word.split(sep)[start:end]) for word in astr])
 
 def _group_obs_simple(key):
 	names, order, edges = utils.find_equal_groups_fast(key)

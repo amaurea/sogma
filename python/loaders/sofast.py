@@ -66,6 +66,8 @@ class SoFastLoader:
 		try:
 			with bench.mark("load_meta"):
 				meta = self.fast_meta.read(subid)
+				if meta.aman.dets.count == 0:
+					raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
 			# Load the raw data
 			with bench.mark("load_data"):
 				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
@@ -90,7 +92,10 @@ class SoFastLoader:
 		# * The first g3 file must always be read, even when we just want a higher samprange
 		# Should group the subids by the ones that live in the same files, and issue a single
 		# fast_data and calibrate for each group. This will require a reorder afterwards, to
-		# get the bands in contiguous order.
+		# get the bands in contiguous order. Reorder will require data copying. Easiest and
+		# most flexible to just copy from one buffer to another. So instead of doing
+		# write to ptbuf (single obs) → append to todbuf, like we do now, we would do
+		# write to todbuf (obs-group) → append to sections in ptbuf → compact into todbuf.
 		# -
 		# With multi-band mapping we will need the bands to be contiguous in memory.
 		# The other argument supports this
@@ -106,7 +111,10 @@ class SoFastLoader:
 		exceptions,eids = [], []
 		for si, subid in enumerate(subids):
 			try:
-				metas.append(self.fast_meta.read(subid))
+				with bench.mark("load_meta"):
+					meta = self.fast_meta.read(subid)
+					if meta.aman.dets.count == 0: raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
+					metas.append(meta)
 				mids .append(subid)
 			except self.catch_list as e:
 				exceptions.append(e)
@@ -138,9 +146,11 @@ class SoFastLoader:
 			for si, (subid, meta) in enumerate(zip(mids, metas)):
 				try:
 					# read in and calibrate each
-					data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
+					with bench.mark("load_data"):
+						data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 					# This uses buffers "tod" and "ft"
-					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
+					with bench.mark("load_calib"):
+						obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
 					obs.subids = [subid]
 					obs.errors = []
 				except self.catch_list as e:
@@ -178,6 +188,110 @@ class SoFastLoader:
 		if len(exceptions) > 0:
 			otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
 		return otot
+	# In theory this was supposed to be faster. In practice I didn't see any
+	# difference. And it's more complicated.
+	#def load_multi2(self, subids, order="band", samprange=None):
+	#	"""Load multiple concurrent subids into a single obs"""
+	#	if   order == "raw":  pass
+	#	elif order == "band":
+	#		def srtfun(subid):
+	#			toks = split_subid(subid)
+	#			return toks.band + ":" + toks.type
+	#		subids = sorted(subids, key=srtfun)
+	#	else: raise ValueError("Unrecognized subid ordering '%s'" % str(order))
+	#	# Read all the metadata
+	#	metas,     mids = [], []
+	#	exceptions,eids = [], []
+	#	for si, subid in enumerate(subids):
+	#		try:
+	#			with bench.mark("load_meta"):
+	#				metas.append(self.fast_meta.read(subid))
+	#			mids .append(subid)
+	#		except self.catch_list as e:
+	#			exceptions.append(e)
+	#			eids      .append(subid)
+	#	if len(metas) == 0:
+	#		raise utils.DataMissing(format_multi_exception(exceptions, eids))
+	#	# Restrict them to a common sample range
+	#	sinfo = get_obs_sampinfo(self.obsdb.conn, mids)
+	#	ndet, nsamp = make_metas_compatible(metas, sinfo)
+	#	# Restrict to target sample range
+	#	if samprange is not None:
+	#		for meta in metas:
+	#			off = meta.aman.samps.offset
+	#			meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
+	#	# Set up total obs
+	#	otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[])
+	#	append_fields = [("dets",0),("bands",0),("point_offset",0),("polangle",0),("response",1),("cuts",1)]
+	#	for field, axis in append_fields: otot[field] = []
+	#	# Loading e.g. f090 and f150 separately when we want to analyse
+	#	# both is inefficient, since we will end up reading the same files
+	#	# twice. Will therefore find groups of subids we can load with the same read operation
+	#	finfo_groups = find_finfo_groups(metas)
+	#	# Store prev obs, so we can avoid some redundant calculations
+	#	obs  = None
+	#	dcum = 0
+	#	try:
+	#		# We want the final output tod in the "tod" buffer, but this buffer will be
+	#		# used in calibrate(). The big "pointing" buffer is free at this point, though,
+	#		# so we can trick calibrate() into using that one instead by swapping the
+	#		# "pointing" and "tod" pools. By swapping back in the end, the result will end
+	#		# up where we want it. We also need to swap back in the end to keep our total
+	#		# allocations low, since "pointing" is supposed to be a 3x as large buffer
+	#		self.dev.pools.want("pointing", "tod")
+	#		self.dev.pools.swap("pointing", "tod")
+	#		for gi, finfo_group in enumerate(finfo_groups):
+	#			try:
+	#				with bench.mark("load_data"):
+	#					gdata = fast_data(finfo_group.finfos, finfo_group.dets, finfo_group.samps)
+	#			except self.catch_list as e:
+	#				exceptions.append(e)
+	#				eids      .append(",".join([mids[i] for i in finfo_group.inds]))
+	#				continue
+	#			for si in finfo_group.inds:
+	#				subid = mids[si]
+	#				meta  = metas[si]
+	#				data  = gdata.restrict("dets", meta.aman.dets.vals, in_place=False)
+	#				try:
+	#					with bench.mark("load_calib"):
+	#						obs = calibrate(data, meta, mul=self.mul, dev=self.dev, prev_obs=obs)
+	#					obs.subids = [subid]
+	#					obs.errors = []
+	#				except self.catch_list as e:
+	#					exceptions.append(e)
+	#					eids      .append(subid)
+	#					continue
+	#				# Initial otot setup
+	#				if otot.tod is None:
+	#					otot.ctime     = obs.ctime
+	#					otot.boresight = obs.boresight
+	#					otot.hwp       = obs.hwp
+	#					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
+	#				# Cuts needs to have the detector offsets modified, after which it's simple
+	#				obs.cuts[0] += dcum
+	#				# Handle the simple append cases
+	#				for field, axis in append_fields:
+	#					otot[field].append(obs[field])
+	#				otot.subids += obs.subids
+	#				otot.errors += obs.errors
+	#				# Copy tod over to the right part of the output buffer
+	#				otot.tod[dcum:dcum+len(obs.tod)] = obs.tod
+	#				dcum += len(obs.tod)
+	#		# Were we left with anything at all?
+	#		if dcum == 0:
+	#			raise utils.DataMissing(format_multi_exception(exceptions, eids))
+	#		# Concatenate the work-lists into the final arrays
+	#		for field, axis in append_fields:
+	#			otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
+	#		# Trim tod in case we lost some detectors
+	#		otot.tod = otot.tod[:dcum]
+	#	finally:
+	#		# Finally, move tod to the tod-buffer, where it's expected to be
+	#		self.dev.pools.swap("pointing","tod")
+	#	# Non-fatal errors
+	#	if len(exceptions) > 0:
+	#		otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
+	#	return otot
 	def group_obs(self, obsinfo, mode="obs"):
 		return socommon.group_obs(obsinfo, mode=mode)
 
@@ -207,6 +321,15 @@ class FastMeta:
 		self.fp_cache   = FplaneCache(cmeta_lookup(context, "focal_plane"))
 		# 5. Pointing model, which seems to be static for now
 		self.pointing_model_cache = PointingModelCache(cmeta_lookup(context, "pointing_model"))
+		# 6. Wiring status cache
+		self.wiring_cache = WiringCache(fields=[
+			"AMCc.SmurfProcessor.Filter.A",
+			"AMCc.SmurfProcessor.Filter.B",
+			"AMCc.SmurfProcessor.Filter.Gain",
+			"AMCc.SmurfProcessor.Filter.Order",
+			"AMCc.SmurfProcessor.Filter.Disable",
+			"AMCc.FpgaTopLevel.AppTop.AppCore.RtmCryoDet.RampMaxCnt",
+		])
 	def read(self, subid):
 		from sotodlib import core
 		obsid, wslot, band, det_type = split_subid(subid)
@@ -223,12 +346,18 @@ class FastMeta:
 			aman = core.AxisManager(core.LabelAxis("dets", detinfo.channels))
 			aman.wrap("det_ids", detinfo.dets, [(0,"dets")])
 			aman.wrap("bands",   detname2band(detinfo.dets), [(0,"dets")])
+		ndet_full = aman.dets.count
 		# 2. Load the necessary info from det_cal
 		with bench.mark("fm_detcal"):
 			with h5py.File(dcalfile, "r") as hfile:
 				det_cal = hfile[dcalgroup][()]
 			daman = core.AxisManager(core.LabelAxis("dets",np.char.decode(det_cal["dets:readout_id"])))
 			good  = np.full(daman.dets.count, True)
+		# Apply bias step cuts
+		good &= det_cal["bg"] >= 0
+		good &= det_cal["r_tes"] > 0
+		good &= (det_cal["r_frac"] >= 0.05) & (det_cal["r_frac"] <= 0.8)
+		good &= np.isfinite(det_cal["s_i"])
 		with bench.mark("fm_pW"):
 			daman.wrap("phase_to_pW", det_cal["phase_to_pW"], [(0,"dets")])
 			good &= np.isfinite(daman.phase_to_pW)
@@ -277,6 +406,13 @@ class FastMeta:
 				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag"), [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds"), [(0,"dets"),(1,"samps")])
 
+			# Hack: Get the valid detectors. This isn't stored in an
+			# easy-to-access way, but it will be in the "vald" entry
+			# for the last thing to be processed, which we'll just have to
+			# hardcode here for now.
+			good = np.diff(np.concatenate([[0],pl.read("noise_mapmaking/valid/ends")])) > 0
+			paman.restrict("dets", paman.dets.vals[good])
+
 		# Eventually we will need to be able to read in sample-ranges.
 		# Easiest to handle that with paman.restrict("samps", ...) here.
 		# The rest should follow automatically
@@ -291,7 +427,8 @@ class FastMeta:
 			finfos = self.obsfiledb.get_files(obsid)[detset]
 		# Get the filter params
 		with bench.mark("fm_status"):
-			status = read_wiring_status(finfos[0][0])
+			#status = read_wiring_status(finfos[0][0])
+			status = self.wiring_cache.get(finfos[0][0])
 		with bench.mark("fm_iir"):
 			iir_params = bunch.Bunch()
 			pre = "AMCc.SmurfProcessor.Filter."
@@ -318,7 +455,7 @@ class FastMeta:
 		return bunch.Bunch(aman=aman, iir_params=iir_params, finfos=finfos,
 			dac_to_phase = np.pi/2**15, timestamp_to_ctime=1e-8,
 			abscal_cmb = abscal_cmb, pointing_model=pointing_model,
-			sens_lim=sens_lim)
+			sens_lim=sens_lim, ndet_full=ndet_full)
 
 # This doesn't really belong here, unless we rename the module
 def fast_data(finfos, detax, sampax, alloc=None, fields=[
@@ -362,7 +499,7 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 			i += chunk.shape[-1]
 	return aman
 
-def calibrate(data, meta, mul=32, dev=None):
+def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	from pixell import fft
 	if dev is None: dev = device.get_device()
 	# Merge the cuts. Easier to deal with just a single cuts object
@@ -374,20 +511,29 @@ def calibrate(data, meta, mul=32, dev=None):
 	timestamps, signal, cuts, az, el = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None
 
-	with bench.mark("ctime"):
-		ctime   = timestamps * meta.timestamp_to_ctime
-	# Calibrate the pointing
-	with bench.mark("boresight"):
-		az      = az   * utils.degree
-		el      = el   * utils.degree
-		if "brot" in data:
-			# SAT: boresight angle → roll
-			roll = -data.brot [:nsamp]*utils.degree
-		else:
-			# LAT: corotator angle → roll
-			roll = -data.corot[:nsamp]*utils.degree + el - 60*utils.degree
-	with bench.mark("pointing correction"):
-		az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
+	# prev_obs lets us pass in the result of calibrate run on
+	# a different set of detectors for the same observation.
+	# This is an optimization for load_multi, letting us avoid
+	# repeating the same pointing correction multiple times
+	if prev_obs is not None:
+		ctime        = prev_obs.ctime
+		el, az, roll = prev_obs.boresight
+	else:
+		with bench.mark("ctime"):
+			ctime   = timestamps * meta.timestamp_to_ctime
+		# Calibrate the pointing
+		with bench.mark("boresight"):
+			az      = az   * utils.degree
+			el      = el   * utils.degree
+			if "brot" in data:
+				# SAT: boresight angle → roll
+				roll = -data.brot [:nsamp]*utils.degree
+			else:
+				# LAT: corotator angle → roll
+				roll = -data.corot[:nsamp]*utils.degree + el - 60*utils.degree
+		with bench.mark("pointing correction"):
+			az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
+
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
 		signal_ = dev.pools["ft"].array(signal)
@@ -457,16 +603,25 @@ def calibrate(data, meta, mul=32, dev=None):
 	with bench.mark("ifft", tfun=dev.time):
 		dev.lib.irfft(ftod, signal)
 
+	# Sanity checks
 	with bench.mark("measure noise", tfun=dev.time):
 		rms = socommon.measure_rms(signal, dt=dt)
-
-	# Restrict to these detectors
 	with bench.mark("final detector prune", tfun=dev.time):
-		good   = socommon.sensitivity_cut(rms, meta.sens_lim)
+		good    = socommon.sensitivity_cut(rms, meta.sens_lim)
+		nrms    = dev.np.sum(good)
+		# Cut detectors with too big a fraction of samples cut,
+		# or cuts occuring too often.
+		cutfrac = cuts.sum()/cuts.nsamp
+		cutdens = (cuts.bins[:,1]-cuts.bins[:,0])/cuts.nsamp
+		good   &= dev.np.array((cutfrac < 0.1)&(cutdens < 1e-3))
+		ndens   = dev.np.sum(good)
+		# Cut all detectors if too large a fraction is cut
+		good   &= dev.np.sum(good)/meta.ndet_full > 0.25
+		nfinal  = dev.np.sum(good)
 		signal = dev.np.ascontiguousarray(signal[good]) # 600 ms!
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
-		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after rms cut")
+		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))
 
 	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
 
@@ -923,6 +1078,12 @@ class Sampcut:
 		return Sampcut(bins, ranges, stop-start, simplify=True)
 	@property
 	def shape(self): return (len(self.bins),self.nsamp)
+	def sum(self):
+		"""Count cut samples per detector"""
+		nper   = self.ranges[:,1]-self.ranges[:,0]
+		ncum   = utils.cumsum(nper, endpoint=True)
+		counts = ncum[self.bins[:,1]]-ncum[self.bins[:,0]]
+		return counts
 
 def expand_cuts_sampcut(shape, ends, intervals, inds=None):
 	if len(shape) != 2:
@@ -1027,6 +1188,34 @@ def read_wiring_status(fname, parse=True):
 	if parse:
 		status = yaml.safe_load(status)
 	return status
+
+class WiringCache:
+	def __init__(self, fields=None):
+		self.cache  = {}
+		self.fields = fields
+	def get(self, fname):
+		if fname not in self.cache:
+			status = read_wiring_status(fname)
+			if self.fields is not None:
+				status = {field:status[field] for field in self.fields}
+			self.cache[fname] = status
+		return self.cache[fname]
+
+def find_finfo_groups(metas):
+	from sotodlib import core
+	# convert finfos to strings, so we can easily find grups. A bit inelegant, but
+	# no that inefficient. We assume that the finfo lists are already sorted
+	# consistently
+	finfo_strs = np.array(["%s,%d,%d" % (str(meta.finfos),meta.aman.samps.count,meta.aman.samps.offset) for meta in metas])
+	uvals, order, edges = utils.find_equal_groups_fast(finfo_strs)
+	ginfos = []
+	for gi in range(len(uvals)):
+		group  = order[edges[gi]:edges[gi+1]]
+		finfos = metas[group[0]].finfos
+		samps  = metas[group[0]].aman.samps
+		dets   = core.LabelAxis("dets",np.concatenate([metas[i].aman.dets.vals for i in group]))
+		ginfos.append(bunch.Bunch(finfos=finfos, dets=dets, samps=samps, inds=group))
+	return ginfos
 
 def subtract_hwpss(signal, hwp_angle, coeffs, dev=None):
 	if signal.dtype != np.float32: raise ValueError("Only float32 supported")

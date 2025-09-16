@@ -181,8 +181,8 @@ class SignalMap(Signal):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
 		to equatorial coordinates."""
 		Signal.__init__(self, name, ofmt, output, ext)
-		self.sys   = sys
-		if sys is not None and sys not in ["cel","equ"]:
+		self.sys   = sys or "cel"
+		if self.sys not in ["cel","equ","hor"]:
 			raise NotImplementedError("Coordinate system rotation not implemented yet")
 		self.recenter = recenter
 		self.dtype = dtype
@@ -224,7 +224,7 @@ class SignalMap(Signal):
 		# signal_cut to be safest, but only uses .clear which should be the same for all
 		# of them anyway
 		if pmap is None:
-			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=iNd.dtype)
+			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=iNd.dtype)
 			self.dev.garbage_collect()
 		# Precompute pointing for the upcoming pmap observations
 		# Accumulate local rhs
@@ -629,7 +629,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 
 	# Solve the equation system
 	for step in mapmaker.solve(maxiter=maxiter, maxerr=maxerr):
-		will_dump = len(dump) > 0 and (step.i in dump or step.i % dump[-1] == 0)
+		will_dump = len(dump) > 0 and (step.i in dump or (dump[-1] != 0 and step.i % dump[-1] == 0))
 		L.print("CG %4d %15.7e  %6.3f s%s" % (step.i, step.err, step.t, " (write)" if will_dump else ""), id=0, level=1, color=colors.lgreen)
 		if will_dump:
 			for signal, val in zip(mapmaker.signals, step.x):
@@ -652,14 +652,13 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds
 	if prealloc:
 		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
 		setup_buffers(mapmaker.dev, ntot_max)
+
 	# Map indivdual tods
 	for ind in inds:
-		subinfo = obsinfo[joint.groups[ind]]
 		name    = joint.names[ind]
 		subpre  = prefix + name.replace(":","_") + "_"
 		L.print("Mapping %s" % name)
-		# FIXME: group entries need names
-		make_map(mapmaker, loader, subinfo, comm_per, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
+		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
 
 def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover"):
 	# Find scanning periods. We want to base this on the full
@@ -668,45 +667,42 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, pref
 	from pixell import bench
 	if prefix   is None: prefix = ""
 	if joint    is None: joint = trivial_joint(obsinfo)
-	if fullinfo is None: fullinfo = loader.query("obs,all")
+	# FIXME: might want obs,+bad here, to make the depth-1 periods independent
+	# of our cuts. But currently that causes a segfault in sqlite?
+	if fullinfo is None: fullinfo = loader.query("obs")
 	periods = gutils.find_scan_periods(fullinfo)
-	# Which period each obs belongs to
+	# Which period each group belongs to. So pinds is [ngroup]
 	gfirst  = np.array([g[0] for g in joint.groups])
-	pinds   = utils.find_range(periods, obsinfo.ctime[gfirst]+obsinfo.dur[gfirst]/2)
-	# Get rid of observations that don't belong to a period. This shouldn't happen
-	bad = pinds<0
+	gpids   = utils.find_range(periods, obsinfo.ctime[gfirst]+obsinfo.dur[gfirst]/2)
+	# Get rid of groups that don't belong to a period. This shouldn't happen
+	bad = gpids<0
 	if np.any(bad):
 		L.print("Warning: %d obs with no period! %s" % (np.sum(bad), ", ".join(obsinfo.id[gfirst[bad]])), color=colors.red, id=0)
+	# Indices of the groups we will map
 	inds  = np.where(~bad)[0]
-	pinds = pinds[inds]
-
-	# * We could split by band, tube, wafer etc. here, but for now, we will
-	# keep things simple by requiring the user to run the mapmaker separately
-	# for things they want to keep separate. E.g. one run for f090 and one for f150,
-	# just like with the other mapmaking modes.
-	# * How to paralellize? For big runs, there will be many more periods than
-	# obs per period, so one would want to paralellize over periods. But for small
-	# runs it's the other way around. And there's an awkward intermediate regime
-	# where one would want both. Let's do it over periods for now
-	# * period i has obsinds order[edges[i]:edges[i+1]] and trange periods[pids[i]],
-	# which should be the same as periods[i]
-	pids, order, edges = utils.find_equal_groups_fast(pinds)
-	# Set up buffers. We get all the tods we will process to calculate how big
-	# buffers we will need
-	my_pinds   = list(range(comm.rank, len(pids), comm.size))
-	my_obsinds = inds[np.concatenate([order[edges[pind]:edges[pind+1]] for pind in my_pinds])]
-	ntot_max   = np.max(obsinfo.ndet[my_obsinds]*obsinfo.nsamp[my_obsinds])
+	# Which period each of those groups belongs to
+	gpids = gpids[inds]
+	# Group the groups by period. group-group i will consist
+	# of groups inds[order[edges[i]:edges[i+1]]]
+	pids, order, edges = utils.find_equal_groups_fast(gpids)
+	my_pinds = list(range(comm.rank, len(pids), comm.size))
 	if prealloc:
-		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=my_obsinds, sampranges=joint.sampranges))
+		# Estimate the max memory a group-group needs, and preallocate
+		ntot_max  = 0
+		for pind in my_pinds:
+			my_inds = inds[order[edges[pind]:edges[pind+1]]]
+			ntot    = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=my_inds, sampranges=joint.sampranges))
+			ntot_max= max(ntot, ntot_max)
 		setup_buffers(mapmaker.dev, ntot_max)
-	# Finally map each period
+	# Now loop over and map each of our group-groups
 	for pind in my_pinds:
-		pid    = pids[pind]
-		# Name period after starting ctime for now
-		name   = "%10.0f" % periods[pid][0]
-		subpre = prefix + name + "_"
-		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(subinfo)))
-		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_obsinds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
+		pid     = pids[pind]
+		my_inds = inds[order[edges[pind]:edges[pind+1]]]
+		# Name after period
+		name    = "%10.0f" % periods[pid][0]
+		subpre  = prefix + name + "_"
+		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(my_inds)))
+		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
 
 # Mapmaking function
 def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
@@ -888,7 +884,7 @@ def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 def trivial_joint(obsids):
 	"""Make a group-info corresponding to a no grouping"""
 	groups=[[i] for i in range(len(obsids))]
-	return bunch.Bunch(groups=groups, names=obsids.id)
+	return bunch.Bunch(groups=groups, names=obsids.id, sampranges=[None for i in range(len(obsids))])
 
 # Zippers
 # These package our degrees of freedomf or the CG solver

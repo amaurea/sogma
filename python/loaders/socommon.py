@@ -139,6 +139,7 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		elif tok in ["c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6"]:
 			tok = tag_op("(tube_slot = '%s')" % tok, op)
 		# Pseudo-tags
+		elif tok == "obs": tok = tag_op("(type='obs')", op)
 		elif tok == "cmb": tok = tag_op("(type='obs' and subtype='cmb')", op)
 		elif tok == "night": tok = tag_op("(mod(timestamp/3600,24) not between 11 and 23)", op)
 		elif tok == "day": tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
@@ -428,6 +429,15 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 	if output == "resultset": return resultset_subset(info, inds)
 	else: return obsinfo[inds]
 
+def add_tags_column(idb):
+	resdb = sqlite.SQL()
+	with resdb.attach(idb):
+		# Copy over the tags table
+		resdb.execute("create table tags as select * from other.tags")
+		# Copy over obs table while adding a tags column
+		resdb.execute("create table obs as select *, grouped.tagcol as tags from other.obs left join (select obs_id, group_concat(tag,',') as tagcol from other.tags group by tags.obs_id) as grouped on obs.obs_id = grouped.obs_id")
+	return resdb
+
 # Hard-coded raw wafer detector counts per band. Independent of
 # telescope type, etc.
 flavor_noptc_per_band = {"lf":118, "mf": 864, "uhf": 864}
@@ -500,10 +510,12 @@ def wafer_info_multi(tubes, wafers, missing="warn"):
 		rads[inds] = rad
 	return poss, rads
 
-def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2):
+def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=100):
 	ap  = device.anypy(rms_uKrts)
 	# First reject detectors with unreasonably low noise
 	good     = rms_uKrts >= sens_lim
+	# Also reject far too noisy detectors
+	good    &= rms_uKrts <  sens_lim*max_lim
 	# Then reject outliers
 	if ap.sum(good) == 0: return good
 	ref      = ap.median(rms_uKrts[good])
@@ -595,6 +607,19 @@ def point_hit(point, sweep, dur, r, pad=1.0*utils.degree):
 	was_hit[good] = ra_hit & dec_hit
 	return was_hit
 
+def gal_hit(sweep, dur, r, minlat=None, pad=1*utils.degree):
+	# sweep[:,npoint,{ra,dec}]
+	if minlat is None: minlat = 5*utils.degree
+	from pixell import coordinates
+	speed= 15*utils.degree/utils.hour
+	ras, decs = sweep.T # [npoint,ntod]
+	icoord = np.array([[ras,ras+dur*speed],[decs,decs]]) # [{ra,dec},2,npoint,ntod]
+	lats   = coordinates.transform("equ", "gal", icoord)[1]
+	# We hit the galaxy if lats either crosses zero, or if min(abs(lat))+r+pad < minlat
+	lat1,lat2 = utils.minmax(lats,(0,1))
+	hits = (lat1*lat2 < 0)|(np.min(np.abs(lats),(0,1))+r+pad < minlat)
+	return hits
+
 def poly_interpol(x, xp, yp):
 	nobs, nsamp = xp.shape
 	xmin, xmax = utils.minmax(xp,-1)
@@ -618,7 +643,13 @@ def poly_interpol(x, xp, yp):
 def eval_pycode(pycode, obsinfo):
 	if not pycode: return np.ones(len(obsinfo), bool)
 	def pycode_hits(ra, dec=None):
-		if isinstance(ra, str): pos = planet_pos(ra, obsinfo)
+		if isinstance(ra, str):
+			# Special case: 'gal'. The optional second argument gives the min
+			# galactic latitude
+			if ra == "gal": return gal_hit(obsinfo.sweep, obsinfo.dur, obsinfo.r, minlat=dec)
+			# For a planet name, we look up the planet position and continue on to the
+			# standard point hit
+			else: pos = planet_pos(ra, obsinfo)
 		else: pos = np.array([ra,dec])*utils.degree
 		return point_hit(pos, obsinfo.sweep, obsinfo.dur, obsinfo.r)
 	def pycode_planet(name): return planet_pos(name, obsinfo)

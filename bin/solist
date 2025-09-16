@@ -8,7 +8,20 @@ parser.add_argument(      "--nopre",   action="store_true")
 args = parser.parse_args()
 from sogma.loaders import socommon
 from pixell import sqlite
-import yaml, datetime
+import yaml, datetime, re
+
+def filter_tags(tags):
+	# Remove less useful tags
+	otags = []
+	for tag in tags:
+		if tag.startswith("uid-"): continue
+		if "_SCAN_" in tag: continue
+		if re.match(r"^\d+-\d+$", tag): continue
+		if re.match(r"^(\w\d_)?ws\d$", tag): continue
+		if re.match(r"^[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+-[0-9a-f]+$", tag): continue
+		if tag in ["rising","setting"]: continue
+		otags.append(tag)
+	return otags
 
 # Get our obsdb
 context = socommon.get_expanded_context(args.context)
@@ -18,6 +31,8 @@ predb_path = socommon.cmeta_lookup(context, "preprocess") if not args.nopre else
 with sqlite.open(obsdb_path) as db:
 	with sqlite.open(predb_path) if predb_path else contextlib.nullcontext() as pdb:
 		res_db, pycode, slices = socommon.eval_query(db, args.query, predb=pdb)
+		# Add tags column
+		res_db = socommon.add_tags_column(res_db)
 		info = socommon.finish_query(res_db, pycode, slices, sweeps=True, output="resultset")
 		if len(info) == 0:
 			if not args.quiet: print("0 matches")
@@ -28,7 +43,10 @@ with sqlite.open(obsdb_path) as db:
 				date  = datetime.datetime.fromtimestamp(row["start_time"], tz=datetime.UTC)
 				dfmt  = date.strftime("%Y-%m-%d %H:%M:%S")
 				baz   = (row["az_center"]+180)%360-180
-				print("%-*s %19s %6.2f %7.1f %6.1f %6.1f %6.1f %s,%s" % (idlen, row["subobs_id"], dfmt, row["duration"]/60, baz, 2*row["az_throw"], row["el_center"], row["roll_center"], row["type"], row["subtype"]))
+				# Create tags column
+				tags  = [row["type"], row["subtype"]]
+				if row["tags"]: tags += filter_tags(row["tags"].split(","))
+				print("%-*s %19s %6.2f %7.1f %6.1f %6.1f %6.1f %s" % (idlen, row["subobs_id"], dfmt, row["duration"]/60, baz, 2*row["az_throw"], row["el_center"], row["roll_center"], ",".join(tags)))
 			if not args.quiet:
 				print("# %-*s %19s %6s %7s %6s %6s %6s" % (idlen-2, "subid", "start", "dur", "baz", "waz", "bel", "roll"))
 				print("# %d matches" % len(info))

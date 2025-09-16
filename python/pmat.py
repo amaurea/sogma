@@ -5,7 +5,7 @@ from . import device, gutils
 from .logging import L
 
 class PmatMap:
-	def __init__(self, shape, wcs, ctime, bore, offs, polang, response=None, ncomp=3, recenter=None, dev=None, dtype=np.float32):
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", response=None, ncomp=3, recenter=None, dev=None, dtype=np.float32):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels
 
@@ -22,9 +22,10 @@ class PmatMap:
 		self.polang= polang
 		self.dtype = dtype
 		self.ncomp = ncomp
+		self.sys   = sys
 		self.dev   = dev or device.get_device()
 		self.response = dev.np.array(response) if response is not None else None
-		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, dtype=dtype, recenter=recenter, dev=self.dev)
+		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, dtype=dtype, recenter=recenter, dev=self.dev)
 		#print("FIXME test pointing fit")
 		#pexact = self.pfit.eval_exact(ctime[::100], bore[:,::100], offs[:1], polang[:1])
 		#pinter = self.dev.get(self.pfit.eval()[:,:1,::100])
@@ -169,10 +170,14 @@ class PmatCutPoly:
 
 # Misc
 
-def calc_pointing(ctime, bore, offs, polang, site="so", weather="typical", recenter=None, dtype=np.float32):
+def calc_pointing(ctime, bore, offs, polang, sys="cel", site="so", weather="typical", recenter=None, dtype=np.float32):
 	offs, polang = np.asarray(offs), np.asarray(polang)
 	ndet, nsamp = len(offs), bore.shape[1]
-	sightline = so3g.proj.coords.CelestialSightLine.az_el(ctime, bore[1], bore[0], roll=bore[2], site="so", weather="typical")
+	if   sys in ["cel","equ"]: fun = so3g.proj.coords.CelestialSightLine.az_el
+	elif sys == "hor":         fun = so3g.proj.coords.CelestialSightLine.for_horizon
+	else: raise ValueError("sys %s not recognized" % str(sys))
+	#sightline = so3g.proj.coords.CelestialSightLine.az_el(ctime, bore[1], bore[0], roll=bore[2], site="so", weather="typical")
+	sightline = fun(ctime, bore[1], bore[0], roll=bore[2], site="so", weather="typical")
 	if recenter is not None:
 		# This assumes the object doesn't move much during the tod
 		rot = recentering_to_quat_lonlat(
@@ -195,7 +200,7 @@ def calc_pointing(ctime, bore, offs, polang, site="so", weather="typical", recen
 
 class PointingFit:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang,
-			subsamp=200, site="so", weather="typical", recenter=None, dtype=np.float64,
+			subsamp=200, sys="cel", site="so", weather="typical", recenter=None, dtype=np.float64,
 			nt=1, nx=3, ny=3, store_basis=False, positive_x=False, dev=None):
 		"""Jon's polynomial pointing fit. This predicts each detector's celestial
 		coordinates based on the array center's celestial coordinates. The model
@@ -218,6 +223,8 @@ class PointingFit:
 		* offs[ndet,{eta,xi}]
 		* polang[ndet]
 		"""
+		# TODO: Consider generalizing to more than just car
+		assert wcs.wcs.ctype[0][-3:] == "CAR", "Only CAR supported for now"
 		self.shape, self.wcs = shape, wcs
 		self.nt, self.nx, self.ny = nt, nx, ny
 		self.dev   = dev or device.get_device()
@@ -225,13 +232,16 @@ class PointingFit:
 		self.store_basis = store_basis
 		self.subsamp     = subsamp
 		self.nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
+		self.sys  = sys
 		self.site = site
 		self.recenter = recenter
 		self.weather = weather
 		# 1. Find the typical detector offset
 		off0 = np.mean(offs, 0)
 		# 2. We want to be able to calculate y,x,psi for any detector offset
-		self.p0 = enmap.pix2sky(shape, wcs, [0,0]) # [{dec,ra}]
+		# We calculate p0 mangually avoid annoying %360 that wcslib seems to do
+		self.p0 = (wcs.wcs.crval+(1-wcs.wcs.crpix)*wcs.wcs.cdelt)[::-1]*utils.degree # [{dec,ra}]
+		#self.p0 = enmap.pix2sky(shape, wcs, [0,0]) # [{dec,ra}]
 		self.dp = wcs.wcs.cdelt[::-1]*utils.degree # [{dec,ra}]
 		# 3. Calculate the full pointing for the reference pixel
 		ref_pixs = self.dev.np.array(self.eval_exact(ctime, bore, off0[None], [0])[:,0])
@@ -309,13 +319,14 @@ class PointingFit:
 		t4 = self.dev.time()
 		L.print("eval pointing %8.4f %8.4f %8.4f" % (t2-t1,t3-t2,t4-t3), level=3)
 		return pointing # [{y,x,psi},ndet,nsamp], on device
-	def eval_exact(self, ctime, bore, offs, polang, site=None, weather=None):
+	def eval_exact(self, ctime, bore, offs, polang, sys=None, site=None, weather=None):
+		if sys     is None: sys     = self.sys
 		if site    is None: site    = self.site
 		if weather is None: weather = self.weather
 		offs, polang = np.asarray(offs), np.asarray(polang)
 		ndet, nsamp  = len(offs), bore.shape[1]
 		pixs      = np.empty((3,ndet,nsamp),self.dtype) # [{y,x,psi},ndet,nsamp]
-		pos_equ   = calc_pointing(ctime, bore, offs, polang, site=site, weather=weather, recenter=self.recenter, dtype=self.dtype)
+		pos_equ   = calc_pointing(ctime, bore, offs, polang, sys=sys, site=site, weather=weather, recenter=self.recenter, dtype=self.dtype)
 		# Unwind avoids angle wraps, which are bad for interpolation
 		pos_equ[1]= utils.unwind(pos_equ[1])
 		pixs[:2]  = (pos_equ[:2]-self.p0[:,None,None])/self.dp[:,None,None]

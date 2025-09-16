@@ -20,6 +20,7 @@ parser.add_argument(      "--ignore",  type=str, default="recover")
 parser.add_argument("-d", "--dump",    type=str, default="10,20,50,100")
 parser.add_argument("-j", "--joint",   type=str, default="wafer")
 parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
+parser.add_argument(      "--sys",     type=str, default="cel")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -72,12 +73,16 @@ else:
 prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
 utils.mkdir(args.odir)
+# Write out our arguments
+if comm_all.rank == 0:
+	with open(prefix + "args.txt", "w") as ofile:
+		ofile.write(" ".join(sys.argv) + "\n")
 # Set up the signals we will solve for
 recenter = gutils.parse_recentering(args.center_at) if args.center_at else None
 if joint.joint:
-	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=np.float32, recenter=recenter, autocrop=args.autocrop)
+	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=np.float32, sys=args.sys, recenter=recenter, autocrop=args.autocrop)
 else:
-	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=np.float32, recenter=recenter, autocrop=args.autocrop)
+	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=np.float32, sys=args.sys, recenter=recenter, autocrop=args.autocrop)
 signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev)
 signals    = [signal_cut, signal_map]
 # Set up the noise model

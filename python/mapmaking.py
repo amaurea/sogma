@@ -1,6 +1,6 @@
-import numpy as np
+import numpy as np, os
 import time
-from pixell import utils, bunch, enmap, colors, wcsutils
+from pixell import utils, bunch, enmap, colors, wcsutils, bench
 from . import nmat, pmat, tiling, gutils, device
 from .logging import L
 
@@ -127,21 +127,22 @@ class MLMapmaker:
 
 class Signal:
 	"""This class represents a thing we want to solve for, e.g. the sky, ground, cut samples, etc."""
-	def __init__(self, name, ofmt, output, ext):
+	def __init__(self, name, ofmt, outputs, ext):
 		"""Initialize a Signal. It probably doesn't make sense to construct a generic signal
 		directly, though. Use one of the subclasses.
 		Arguments:
 		* name: The name of this signal, e.g. "sky", "cut", etc.
 		* ofmt: The format used when constructing output file prefix
-		* output: Whether this signal should be part of the output or not.
+		* outputs: Which of our information to output. Empty list or
+		  None to output nothing. "all" for all valid products.
 		* ext: The extension used for the files.
 		"""
 		self.name   = name
 		self.ofmt   = ofmt
-		self.output = output
 		self.ext    = ext
 		self.dof    = None
 		self.ready  = False
+		self.set_outputs(outputs)
 	def reset(self):
 		self.dof   = None
 		self.ready = False
@@ -154,33 +155,20 @@ class Signal:
 	def precon(self, x): return x
 	def to_work  (self, x): return x.copy()
 	def from_work(self, x): return x
+	def set_outputs(self, outputs):
+		self.outputs= check_outputs(outputs, self.valid_outputs, self.__class__.__name__)
 	def write   (self, prefix, tag, x): pass
 	def write_misc(self, prefix): pass
-
-# This will be updated to take a tiling instead of a shape, wcs, comm.
-# Or could build the tiling internally, hiding that detail from the user.
-# No, we need obsinfo to set up the tiling. So have to change the interface
-# anyway.
-
-# rhs, div, hits would not be preallocated, but would be left to grow
-# in the dynamic pmap.
-# During prepare, the tiling would be finalized, and we would perform
-# our first reductions
-
-# Terminology:
-#  * gmap:  global tile map on cpu
-#  * lmap:  local  tile map on cpu
-#  * glmap: local  tile map on gpu
-#  * dmap:  dynamic map on gpu
+	valid_outputs = []
 
 class SignalMap(Signal):
 	"""Signal describing a sky map."""
-	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}", output=True,
-			ext="fits", dtype=np.float32, ibuf=None, obuf=None, recenter=None,
-			sys=None, interpol=None, autocrop=False):
+	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
+			outputs=["map","ivar"], ext="fits", dtype=np.float32, ibuf=None, obuf=None,
+			recenter=None, sys=None, interpol=None, autocrop=False):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
 		to equatorial coordinates."""
-		Signal.__init__(self, name, ofmt, output, ext)
+		Signal.__init__(self, name, ofmt, outputs, ext)
 		self.sys   = sys or "cel"
 		if self.sys not in ["cel","equ","hor"]:
 			raise NotImplementedError("Coordinate system rotation not implemented yet")
@@ -206,6 +194,8 @@ class SignalMap(Signal):
 		self.tiledist = None
 		# Dynamic RHS map which we will accumulate into
 		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, self.dtype)
+		# Used as reference point for time maps
+		self.tref  = np.inf
 	def reset(self):
 		Signal.reset(self)
 		self.ids      = []
@@ -217,9 +207,9 @@ class SignalMap(Signal):
 		iN a noise model, representing the inverse noise covariance matrix,
 		and iNd the result of applying the noise model to the detector time-ordered data.
 		"""
-		#iNd    = iNd.copy() # This copy can be avoided if build_obs is split into two parts
-		ctime  = obs.ctime
-		t1     = time.time()
+		ctime     = obs.ctime
+		self.tref = min(self.tref, ctime[0])
+		t1        = time.time()
 		# could pass this in, but fast to construct. Should ideally match what's used in
 		# signal_cut to be safest, but only uses .clear which should be the same for all
 		# of them anyway
@@ -235,9 +225,9 @@ class SignalMap(Signal):
 		L.print("Init map pmat %6.3f rhs %6.3f %s" % (t2-t1,t3-t2,id), level=2)
 		# Save the per-obs things we need. Just the pointing matrix in our case.
 		# Nmat and other non-Signal-specific things are handled in the mapmaker itself.
-		self.data[id] = bunch.Bunch(pmap=pmap, iN=iN, tod_shape=iNd.shape, tod_dtype=iNd.dtype)
+		self.data[id] = bunch.Bunch(pmap=pmap, iN=iN, tod_shape=iNd.shape, tod_dtype=iNd.dtype, ctime=ctime)
 		self.ids.append(id)
-	def calc_hits(self, weight=False):
+	def calc_hits(self, weight=False, fill=1, name="hits"):
 		"""Calculate the local div or hits map. Tiling must be
 		finalized before we do this. Will need a different function for non-scalar div"""
 		# Could save one map buffer by calculating these separately,
@@ -246,43 +236,60 @@ class SignalMap(Signal):
 		for i, id in enumerate(self.ids):
 			d   = self.data[id]
 			t1  = time.time()
-			tod = self.dev.pools["tod"].full(d.tod_shape, 1, d.tod_dtype)
+			tod    = self.dev.pools["tod"].empty(d.tod_shape, d.tod_dtype)
+			if isinstance(fill, str):
+				if fill == "time": tod[:] = d.ctime-self.tref
+				else: raise ValueError("Unrecognized fill '%s'" % fill)
+			else: tod[:] = fill
 			if weight: d.iN.white(tod)
+			# Shouldn't there be a pcut.clear here?
 			d.pmap.backward(tod, glhits)
 			t2  = time.time()
-			L.print("Init map hits %d %6.3f %s" % (weight, t2-t1,id), level=2)
+			L.print("Init map %s %d %6.3f %s" % (name, weight, t2-t1,id), level=2)
 		return glhits
 	def prepare(self):
 		"""Called when we're done adding everything. Sets up the map distribution,
 		degrees of freedom and preconditioner."""
 		if self.ready: return
-		t1 = time.time()
-		# Ok, this is where we finally know enough to finish the tiledist
-		glrhs  = self.drhs.finalize(); del self.drhs
-		self.tiledist = tiling.TileDistribution(self.fshape, self.fwcs,
-				glrhs.pixelization, self.comm, pixbox=self.pixbox, dev=self.dev)
+		mybench = bench.Bench()
+		with mybench.mark("fin"):
+			self.tref = min(self.comm.allgather(self.tref))
+			# Ok, this is where we finally know enough to finish the tiledist
+			glrhs  = self.drhs.finalize(); del self.drhs
+			self.tiledist = tiling.TileDistribution(self.fshape, self.fwcs,
+					glrhs.pixelization, self.comm, pixbox=self.pixbox, dev=self.dev)
 		# Reduce to global tiles and free up the arrays on the dpu
-		t2 = time.time()
-		self.rhs   = self.tiledist.gwmap2dmap(glrhs);  del glrhs
-		t3 = time.time()
-		glhits = self.calc_hits(weight=False)
-		self.dev.garbage_collect()
-		t4 = time.time()
-		self.hits  = self.tiledist.gwmap2dmap(glhits); del glhits
-		self.hits  = self.hits[:,:1]
-		t5 = time.time()
-		gldiv = self.calc_hits(weight=True)
-		self.dev.garbage_collect()
-		t6 = time.time()
-		self.div   = self.tiledist.gwmap2dmap(gldiv); del gldiv
-		self.div   = self.div[:,:1]
-		t7 = time.time()
+		with mybench.mark("red"):
+			self.rhs   = self.tiledist.gwmap2dmap(glrhs);  del glrhs
+		with mybench.mark("misc"):
+			if "hits" in self.outputs:
+				glhits = self.calc_hits(weight=False)
+				self.dev.garbage_collect()
+		with mybench.mark("red"):
+			if "hits" in self.outputs:
+				self.hits  = self.tiledist.gwmap2dmap(glhits); del glhits
+				self.hits  = self.hits[:,:1]
+		with mybench.mark("div"):
+			gldiv = self.calc_hits(weight=True, name="div")
+			self.dev.garbage_collect()
+		with mybench.mark("red"):
+			self.div   = self.tiledist.gwmap2dmap(gldiv); del gldiv
+			self.div   = self.div[:,:1]
 		# Set up our degrees of freedom
 		self.dof   = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
-		#self.idiv  = gutils.safe_inv(self.div)
-		self.idiv  = gutils.safe_invert_ivar(self.div)
-		t8 = time.time()
-		L.print("Prep fin %6.3f div %6.3f red %6.3f prec %6.3f" % (t2-t1, t4-t3+t6-t5, t3-t2+t5-t4+t7-t6, t8-t7), level=2)
+		with mybench.mark("prec"):
+			self.idiv  = gutils.safe_invert_ivar(self.div)
+		with mybench.mark("misc"):
+			if "time" in self.outputs:
+				gltime     = self.calc_hits(weight=True, fill="time", name="time")
+		with mybench.mark("red"):
+			if "time" in self.outputs:
+				self.tmap  = self.tiledist.gwmap2dmap(gltime)[:,:1]; del gltime
+		with mybench.mark("misc"):
+			if "time" in self.outputs:
+				self.tmap *= self.idiv
+		L.print("Prep fin %6.3f div %6.3f misc %6.3f red %6.3f prec %6.3f" % tuple([
+			mybench.t_tot[name] for name in ["fin","div","misc","red","prec"]]), level=2)
 		self.ready = True
 	def forward(self, id, gtod, glmap, tmul=1):
 		"""map2tod operation. For tiled maps, the map should be in work distribution,
@@ -303,18 +310,31 @@ class SignalMap(Signal):
 	def to_work(self, gmap): return self.tiledist.dmap2gwmap(gmap, buf=self.ibuf)
 	def from_work(self, glmap): return self.tiledist.gwmap2dmap(glmap)
 	def owork(self): return self.tiledist.gwmap(self.obuf, dtype=self.dtype)
-	def write(self, prefix, tag, m):
+	def written(self, prefix):
+		done  = True
+		for tag in self.outputs:
+			oname = self.ofmt.format(name=self.name)
+			oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+			done  = done and os.path.exists(oname)
+		return done
+	def write(self, prefix, m, tag="map", suffix="", force=False, extra={}):
+		if not force and tag not in self.outputs: return
 		oname = self.ofmt.format(name=self.name)
-		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+		oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
 		omap  = self.tiledist.dmap2omap(m)
 		if self.comm.rank == 0:
-			enmap.write_map(oname, omap)
+			enmap.write_map(oname, omap, extra=extra)
 		return oname
 	def write_misc(self, prefix):
-		self.write(prefix, "rhs",  self.rhs)
-		self.write(prefix, "ivar", self.div[:,0])
-		self.write(prefix, "hits", self.hits[:,0])
-		self.write(prefix, "bin",  self.idiv*self.rhs)
+		# Need the if test here despite write also testing, because
+		# we're referring to members that might not exist
+		if "rhs"  in self.outputs: self.write(prefix, self.rhs,           tag="rhs")
+		if "ivar" in self.outputs: self.write(prefix, self.div[:,0],      tag="ivar")
+		if "hits" in self.outputs: self.write(prefix, self.hits[:,0],     tag="hits")
+		if "bin"  in self.outputs: self.write(prefix, self.idiv*self.rhs, tag="bin")
+		if "time" in self.outputs:
+			self.write(prefix, self.tmap[:,0], tag="time", extra={"TREF":self.tref})
+	valid_outputs = ["map","ivar","hits","bin","rhs","time"]
 
 # What do we need for multi-band mapmaking?
 # Just loop over SignalMaps, but override their TileDistribution
@@ -322,17 +342,18 @@ class SignalMap(Signal):
 
 class SignalMapMulti(Signal):
 	"""Signal describing a multiband sky map."""
-	def __init__(self, shape, wcs, bands, comm, dev=None, name="sky", ofmt="{name}", output=True,
+	def __init__(self, shape, wcs, bands, comm, dev=None, name="sky", ofmt="{name}", outputs=["map","ivar"],
 			ext="fits", dtype=np.float32, ibuf=None, obuf=None, recenter=None,
 			sys=None, interpol=None, autocrop=False):
 		self.mapsigs = [
-			SignalMap(shape, wcs, comm, dev=dev, name=band + "_" + name, ofmt=ofmt, output=output,
+			SignalMap(shape, wcs, comm, dev=dev, name=band + "_" + name, ofmt=ofmt, outputs=outputs,
 				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, recenter=recenter,
 				sys=sys, interpol=interpol, autocrop=autocrop)
 			for band in bands]
+		# Must happen after self.mapsigs has been created
+		Signal.__init__(self, name, ofmt, outputs, ext)
 		self.bands = bands
 		self.dev   = dev or device.get_device()
-		self.output= output
 		self.data  = {}
 		self.ids   = []
 		self.ready = False
@@ -413,22 +434,31 @@ class SignalMapMulti(Signal):
 		return [mapsig.from_work(m) for mapsig, m in zip(self.mapsigs, glmap)]
 	def owork(self):
 		return [mapsig.owork() for mapsig in self.mapsigs]
-	def write(self, prefix, tag, m):
+	def set_outputs(self, outputs):
+		for mapsig in self.mapsigs:
+			mapsig.set_outputs(outputs)
+	def written(self, prefix):
+		for mapsig in self.mapsigs:
+			if not mapsig.written(prefix):
+				return False
+		return True
+	def write(self, prefix, m, tag="map", suffix="", force=False):
 		onames = []
 		for bi, band in enumerate(self.bands):
-			oname = self.mapsigs[bi].write(prefix, tag, m[bi])
+			oname = self.mapsigs[bi].write(prefix, m[bi], tag=tag, suffix=suffix, force=force)
 			onames.append(oname)
 		return ", ".join(onames)
 	def write_misc(self, prefix):
-		for bi, band in enumerate(self.bands):
-			self.mapsigs[bi].write_misc(prefix)
+		for mapsig in self.mapsigs:
+			mapsig.write_misc(prefix)
+	valid_outputs = SignalMap.valid_outputs
 
 class SignalCutFull(Signal):
 	# Placeholder for when we have a gpu implementation
 	def __init__(self, comm, dev=None, name="cut", ofmt="{name}_{rank:02}", dtype=np.float32,
-			output=False):
+			outputs=[]):
 		"""Signal for handling the ML solution for the values of the cut samples."""
-		Signal.__init__(self, name, ofmt, output, ext="hdf")
+		Signal.__init__(self, name, ofmt, outputs, ext="hdf")
 		self.comm  = comm
 		self.dev   = dev or device.get_device()
 		self.dtype = dtype
@@ -490,22 +520,38 @@ class SignalCutFull(Signal):
 	def to_work  (self, x): return self.dev.np.array(x)
 	def from_work(self, x): return self.dev.get(x)
 	def owork(self): return self.dev.np.zeros(self.rhs.shape, self.rhs.dtype)
-	def write(self, prefix, tag, m):
+	def written(self, prefix):
+		if self.comm is None:
+			rank = 0
+		else:
+			rank = self.comm.rank
+		done = True
+		for tag in self.outputs:
+			oname = self.ofmt.format(name=self.name, rank=rank)
+			oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+			done  = done and os.path.exists(oname)
+		if self.comm is not None:
+			done = self.comm.allreduce(done)==self.comm.size
+		return done
+	def write(self, prefix, m, tag="map", suffix="", force=False):
+		if not force and tag not in self.outputs: return
+		import h5py
 		if self.comm is None:
 			rank = 0
 		else:
 			rank = self.comm.rank
 		oname = self.ofmt.format(name=self.name, rank=rank)
-		oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+		oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
 		with h5py.File(oname, "w") as hfile:
 			hfile["data"] = m
 		return oname
+	valid_outputs = ["map"]
 
 class SignalCutPoly(SignalCutFull):
 	def __init__(self, comm, dev=None, order=3, bsize=400, precon="none", name="cut",
-			ofmt="{name}_{rank:02}", dtype=np.float32, output=False):
+			ofmt="{name}_{rank:02}", dtype=np.float32, outputs=[]):
 		"""Signal for handling the ML solution for the values of the cut samples."""
-		SignalCutFull.__init__(self, comm, dev=dev, name=name, ofmt=ofmt, dtype=dtype, output=output)
+		SignalCutFull.__init__(self, comm, dev=dev, name=name, ofmt=ofmt, dtype=dtype, outputs=outputs)
 		self.order  = order
 		self.bsize  = bsize
 		self.basis  = gutils.legbasis(order, bsize)
@@ -558,8 +604,12 @@ class SignalCutPoly(SignalCutFull):
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
 
 # Mapmaking function
-def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
+def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):
 	if prefix is None: prefix = ""
+	# Skip if we're already done
+	if cont and (os.path.exists(prefix + ".empty") or all([signal.written(prefix) for signal in mapmaker.signals])):
+		L.print("Skipped %s: Already done" % prefix, level=2, color=colors.gray)
+		return
 	# Groups is a list of obsinfo entries that should be mapped jointly
 	# (as a big super-tod with full noise correlations)
 	if joint is None: joint = trivial_joint(obsinfo)
@@ -571,10 +621,10 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
 		inds = np.where(dist.owner == comm.rank)[0]
 	# Set up exception types we will ignore
-	if   ignore == "all":     etypes = (Exception,)
-	elif ignore == "missing": etypes = (utils.DataMissing,)
-	elif ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
-	elif ignore == "none":    etypes = ()
+	if   ignore == "all":     etypes, load_catch = (Exception,), "all"
+	elif ignore == "missing": etypes, load_catch = (utils.DataMissing,), "expected"
+	elif ignore == "recover": etypes, load_catch = (utils.DataMissing, gutils.RecoverableError), "all"
+	elif ignore == "none":    etypes, load_catch = (), "none"
 	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
 	# Accept either a list of integers or a single integer
 	try: dump = list(dump)
@@ -594,7 +644,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind])
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch)
 		except etypes as e:
 			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue
@@ -602,10 +652,6 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 			# Partial skip
 			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
 		t2    = time.time()
-
-		print("FIXME handle empty cuts")
-		if data.cuts.size == 0: data.cuts = np.array([[0],[10],[1]],np.int32)
-
 		try:
 			mapmaker.add_obs(name, data, deslope=False)
 		except etypes as e:
@@ -619,28 +665,32 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 	nobs = comm.allreduce(len(mapmaker.data))
 	if nobs == 0:
 		L.print("No tods survived!", id=0, level=0, color=colors.red)
+		# Mark as done by making an .empty-file. This is used by cont
+		# Annoyingly this file will be hidden for the no-prefix case,
+		# since it starts with a .
+		if comm.rank == 0: open(prefix + ".empty", "a").close()
 		return None
 
 	mapmaker.prepare()
 	# Write rhs and ivar
 	for signal in mapmaker.signals:
-		if signal.output:
-			signal.write_misc(prefix)
+		signal.write_misc(prefix)
 
 	# Solve the equation system
 	for step in mapmaker.solve(maxiter=maxiter, maxerr=maxerr):
-		will_dump = len(dump) > 0 and (step.i in dump or (dump[-1] != 0 and step.i % dump[-1] == 0))
+		# Dump if we're in dump-list, or a multiple of the last entry, but not if
+		# we're on the final iteration anyway, since that would be redundant with
+		# the final result
+		will_dump = len(dump) > 0 and (step.i in dump or (dump[-1] != 0 and step.i % dump[-1] == 0)) and step.i != maxiter
 		L.print("CG %4d %15.7e  %6.3f s%s" % (step.i, step.err, step.t, " (write)" if will_dump else ""), id=0, level=1, color=colors.lgreen)
 		if will_dump:
 			for signal, val in zip(mapmaker.signals, step.x):
-				if signal.output:
-					signal.write(prefix, "map%04d" % step.i, val)
+				signal.write(prefix, val, suffix="%04d" % step.i)
 	# Write the final result
 	for signal, val in zip(mapmaker.signals, step.x):
-		if signal.output:
-			signal.write(prefix, "map", val)
+		signal.write(prefix, val)
 
-def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover"):
+def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
 	if joint is None:
@@ -658,9 +708,9 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds
 		name    = joint.names[ind]
 		subpre  = prefix + name.replace(":","_") + "_"
 		L.print("Mapping %s" % name)
-		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
+		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont)
 
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover"):
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
@@ -702,7 +752,7 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, pref
 		name    = "%10.0f" % periods[pid][0]
 		subpre  = prefix + name + "_"
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(my_inds)))
-		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore)
+		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont)
 
 # Mapmaking function
 def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
@@ -927,3 +977,14 @@ def extend_prefix(prefix, extra):
 		return prefix + extra
 	else:
 		return prefix + "_" + extra
+
+def check_outputs(outputs, valid_outputs, name):
+	if   outputs is None: return []
+	elif outputs == "all": return valid_outputs
+	else:
+		res = []
+		for output in outputs:
+			if output not in valid_outputs:
+				raise ValueError("'%s' is not a valid output for %s" % (str(output), name))
+			res.append(output)
+		return res

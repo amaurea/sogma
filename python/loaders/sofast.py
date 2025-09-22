@@ -62,7 +62,8 @@ class SoFastLoader:
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
-	def load(self, subid):
+	def load(self, subid, catch="expected"):
+		catch_list = catch2list(catch)
 		try:
 			with bench.mark("load_meta"):
 				meta = self.fast_meta.read(subid)
@@ -74,7 +75,7 @@ class SoFastLoader:
 			# Calibrate the data
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
-		except self.catch_list as e:
+		except catch_list as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Add timing info
@@ -84,7 +85,7 @@ class SoFastLoader:
 		# Record any non-fatal errors
 		obs.errors = []
 		return obs
-	def load_multi(self, subids, order="band", samprange=None):
+	def load_multi(self, subids, order="band", samprange=None, catch="expected"):
 		"""Load multiple concurrent subids into a single obs"""
 		# FIXME: This is inefficient:
 		# * bands and dark detectors for the same wafer are stored in the same files,
@@ -106,6 +107,7 @@ class SoFastLoader:
 				return toks.band + ":" + toks.type
 			subids = sorted(subids, key=srtfun)
 		else: raise ValueError("Unrecognized subid ordering '%s'" % str(order))
+		catch_list = catch2list(catch)
 		# Read all the metadata
 		metas,     mids = [], []
 		exceptions,eids = [], []
@@ -116,7 +118,7 @@ class SoFastLoader:
 					if meta.aman.dets.count == 0: raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
 					metas.append(meta)
 				mids .append(subid)
-			except self.catch_list as e:
+			except catch_list as e:
 				exceptions.append(e)
 				eids      .append(subid)
 		if len(metas) == 0:
@@ -153,7 +155,7 @@ class SoFastLoader:
 						obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
 					obs.subids = [subid]
 					obs.errors = []
-				except self.catch_list as e:
+				except catch_list as e:
 					exceptions.append(e)
 					eids      .append(subid)
 					continue
@@ -188,110 +190,6 @@ class SoFastLoader:
 		if len(exceptions) > 0:
 			otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
 		return otot
-	# In theory this was supposed to be faster. In practice I didn't see any
-	# difference. And it's more complicated.
-	#def load_multi2(self, subids, order="band", samprange=None):
-	#	"""Load multiple concurrent subids into a single obs"""
-	#	if   order == "raw":  pass
-	#	elif order == "band":
-	#		def srtfun(subid):
-	#			toks = split_subid(subid)
-	#			return toks.band + ":" + toks.type
-	#		subids = sorted(subids, key=srtfun)
-	#	else: raise ValueError("Unrecognized subid ordering '%s'" % str(order))
-	#	# Read all the metadata
-	#	metas,     mids = [], []
-	#	exceptions,eids = [], []
-	#	for si, subid in enumerate(subids):
-	#		try:
-	#			with bench.mark("load_meta"):
-	#				metas.append(self.fast_meta.read(subid))
-	#			mids .append(subid)
-	#		except self.catch_list as e:
-	#			exceptions.append(e)
-	#			eids      .append(subid)
-	#	if len(metas) == 0:
-	#		raise utils.DataMissing(format_multi_exception(exceptions, eids))
-	#	# Restrict them to a common sample range
-	#	sinfo = get_obs_sampinfo(self.obsdb.conn, mids)
-	#	ndet, nsamp = make_metas_compatible(metas, sinfo)
-	#	# Restrict to target sample range
-	#	if samprange is not None:
-	#		for meta in metas:
-	#			off = meta.aman.samps.offset
-	#			meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
-	#	# Set up total obs
-	#	otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[])
-	#	append_fields = [("dets",0),("bands",0),("point_offset",0),("polangle",0),("response",1),("cuts",1)]
-	#	for field, axis in append_fields: otot[field] = []
-	#	# Loading e.g. f090 and f150 separately when we want to analyse
-	#	# both is inefficient, since we will end up reading the same files
-	#	# twice. Will therefore find groups of subids we can load with the same read operation
-	#	finfo_groups = find_finfo_groups(metas)
-	#	# Store prev obs, so we can avoid some redundant calculations
-	#	obs  = None
-	#	dcum = 0
-	#	try:
-	#		# We want the final output tod in the "tod" buffer, but this buffer will be
-	#		# used in calibrate(). The big "pointing" buffer is free at this point, though,
-	#		# so we can trick calibrate() into using that one instead by swapping the
-	#		# "pointing" and "tod" pools. By swapping back in the end, the result will end
-	#		# up where we want it. We also need to swap back in the end to keep our total
-	#		# allocations low, since "pointing" is supposed to be a 3x as large buffer
-	#		self.dev.pools.want("pointing", "tod")
-	#		self.dev.pools.swap("pointing", "tod")
-	#		for gi, finfo_group in enumerate(finfo_groups):
-	#			try:
-	#				with bench.mark("load_data"):
-	#					gdata = fast_data(finfo_group.finfos, finfo_group.dets, finfo_group.samps)
-	#			except self.catch_list as e:
-	#				exceptions.append(e)
-	#				eids      .append(",".join([mids[i] for i in finfo_group.inds]))
-	#				continue
-	#			for si in finfo_group.inds:
-	#				subid = mids[si]
-	#				meta  = metas[si]
-	#				data  = gdata.restrict("dets", meta.aman.dets.vals, in_place=False)
-	#				try:
-	#					with bench.mark("load_calib"):
-	#						obs = calibrate(data, meta, mul=self.mul, dev=self.dev, prev_obs=obs)
-	#					obs.subids = [subid]
-	#					obs.errors = []
-	#				except self.catch_list as e:
-	#					exceptions.append(e)
-	#					eids      .append(subid)
-	#					continue
-	#				# Initial otot setup
-	#				if otot.tod is None:
-	#					otot.ctime     = obs.ctime
-	#					otot.boresight = obs.boresight
-	#					otot.hwp       = obs.hwp
-	#					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
-	#				# Cuts needs to have the detector offsets modified, after which it's simple
-	#				obs.cuts[0] += dcum
-	#				# Handle the simple append cases
-	#				for field, axis in append_fields:
-	#					otot[field].append(obs[field])
-	#				otot.subids += obs.subids
-	#				otot.errors += obs.errors
-	#				# Copy tod over to the right part of the output buffer
-	#				otot.tod[dcum:dcum+len(obs.tod)] = obs.tod
-	#				dcum += len(obs.tod)
-	#		# Were we left with anything at all?
-	#		if dcum == 0:
-	#			raise utils.DataMissing(format_multi_exception(exceptions, eids))
-	#		# Concatenate the work-lists into the final arrays
-	#		for field, axis in append_fields:
-	#			otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
-	#		# Trim tod in case we lost some detectors
-	#		otot.tod = otot.tod[:dcum]
-	#	finally:
-	#		# Finally, move tod to the tod-buffer, where it's expected to be
-	#		self.dev.pools.swap("pointing","tod")
-	#	# Non-fatal errors
-	#	if len(exceptions) > 0:
-	#		otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
-	#	return otot
 	def group_obs(self, obsinfo, mode="obs"):
 		return socommon.group_obs(obsinfo, mode=mode)
 
@@ -1449,3 +1347,10 @@ def get_obs_sampinfo(obsdb, subids):
 
 def detname2band(detnames):
 	return np.char.partition(np.char.partition(detnames, "_")[:,2],"_")[:,0]
+
+def catch2list(catch):
+	if   isinstance(catch, (list,tuple)): return catch
+	elif catch == "all":      return (Exception,)
+	elif catch == "expected": return (Exception,) # TODO: Actual list here
+	elif catch == "none":     return ()
+	else: raise ValueError("Unrecognized catch '%s'" % str(catch))

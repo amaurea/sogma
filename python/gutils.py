@@ -36,6 +36,7 @@ def split_ranges(dets, starts, lens, maxlen):
 	# Probably premature optimization, since it's a bit hard to read.
 	# Works by duplicating elements for too long ranges, and then
 	# calculating new sub-offsets inside these
+	if len(dets) == 0: return dets, starts, lens
 	dets, starts, lens = [np.asarray(a) for a in [dets,starts,lens]]
 	nsplit  = (lens+maxlen-1)//maxlen
 	odets   = np.repeat(dets, nsplit)

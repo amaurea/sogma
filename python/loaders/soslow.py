@@ -4,6 +4,8 @@ from sotodlib import core, mapmaking, preprocess
 from .. import device
 from . import socommon
 
+# TODO: Add load_multi
+
 # Standard Sotodlib slow load
 class SotodlibLoader:
 	def __init__(self, configfile, dev=None, mul=32):
@@ -15,9 +17,10 @@ class SotodlibLoader:
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.context.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, sweeps=sweeps, slices=slices, output=output)
-	def load(self, subid):
+	def load(self, subid, catch="expected"):
 		# Read in and calibrate all our data. This will depend on the
 		# calibration steps listed in the config file
+		catch_list = catch2list(catch)
 		try:
 			with bench.mark("load_and_preprocess"):
 				obs = preprocess.load_and_preprocess(subid, self.config)
@@ -35,7 +38,7 @@ class SotodlibLoader:
 					obs.preprocess.jumps_slow.jump_flag,
 				])
 				cuts = rangesmatrix_to_simplecuts(cuts)
-		except core.metadata.loader.LoaderError as e:
+		except catch_list as e:
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
 		# Transform it to our current work format
 		with bench.mark("reformat"):
@@ -72,3 +75,10 @@ def rangesmatrix_to_simplecuts(rmat):
 		det_cuts[:,2] = ranges[:,1]-ranges[:,0]
 		cuts.append(det_cuts)
 	return np.ascontiguousarray(np.concatenate(cuts).T)
+
+def catch2list(catch):
+	if   isinstance(catch, (list,tuple)): return catch
+	elif catch == "all":      return (Exception,)
+	elif catch == "expected": return (core.metadata.loader.LoaderError,)
+	elif catch == "none":     return ()
+	else: raise ValueError("Unrecognized catch '%s'" % str(catch))

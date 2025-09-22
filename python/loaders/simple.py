@@ -3,6 +3,10 @@ from numpy.lib import recfunctions
 from pixell import utils, fft, bunch
 from .. import device
 
+# TODO:
+# * Check if query is compatible
+# * Add load_multi
+
 class SimpleLoader:
 	def __init__(self, infofile, dev=None, mul=32):
 		"""context is really just a list of tods and meta here"""
@@ -12,7 +16,7 @@ class SimpleLoader:
 		self.mul     = mul
 	def query(self, query=None, sweeps=False):
 		return self.obsinfo
-	def load(self, id):
+	def load(self, id, catch="expected"):
 		ind = self.lookup[id]
 		# Reads pre-calibrated files
 		with bench.mark("read"):

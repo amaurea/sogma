@@ -50,6 +50,7 @@ def read_tod(fname, mul=32):
 	# Change ra,dec and x,y order to dec,ra and y,x, as agreed with Kendrick
 	with np.load(fname) as f:
 		res.dets         = f["dets"]                 # [ndet]
+		res.detids       = f["dets"]                 # [ndet]
 		res.point_offset = f["point_offset"][:,::-1] # [ndet,{y,x}]
 		res.polangle     = f["polangle"]             # [ndet]
 		bore = f["boresight"]

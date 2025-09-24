@@ -133,7 +133,8 @@ class SoFastLoader:
 				meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
 		# Set up total obs
 		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[])
-		append_fields = [("dets",0),("bands",0),("point_offset",0),("polangle",0),("response",1),("cuts",1)]
+		append_fields = [("dets",0),("detids",0),("bands",0),("point_offset",0),
+			("polangle",0),("response",1),("cuts",1)]
 		for field, axis in append_fields: otot[field] = []
 		dcum = 0
 		try:
@@ -532,6 +533,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Our goal is to output what sogma needs. Sogma works on these fields:
 	res  = bunch.Bunch()
 	res.dets         = meta.aman.dets.vals[good]
+	res.detids       = meta.aman.det_ids[good]
 	res.bands        = meta.aman.bands[good]
 	res.point_offset = meta.aman.focal_plane[good,1::-1]
 	res.polangle     = meta.aman.focal_plane[good,2]

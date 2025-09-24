@@ -26,11 +26,6 @@ class PmatMap:
 		self.dev   = dev or device.get_device()
 		self.response = dev.np.array(response) if response is not None else None
 		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, dtype=dtype, recenter=recenter, dev=self.dev)
-		#print("FIXME test pointing fit")
-		#pexact = self.pfit.eval_exact(ctime[::100], bore[:,::100], offs[:1], polang[:1])
-		#pinter = self.dev.get(self.pfit.eval()[:,:1,::100])
-		#np.savetxt("test.txt", np.concatenate([pexact[:,0],pinter[:,0]],0).T, fmt="%15.7e")
-		#1/0
 		self.preplan  = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
 		self.pointing = None
 		self.plan     = None
@@ -176,7 +171,6 @@ def calc_pointing(ctime, bore, offs, polang, sys="cel", site="so", weather="typi
 	if   sys in ["cel","equ"]: fun = so3g.proj.coords.CelestialSightLine.az_el
 	elif sys == "hor":         fun = so3g.proj.coords.CelestialSightLine.for_horizon
 	else: raise ValueError("sys %s not recognized" % str(sys))
-	#sightline = so3g.proj.coords.CelestialSightLine.az_el(ctime, bore[1], bore[0], roll=bore[2], site="so", weather="typical")
 	sightline = fun(ctime, bore[1], bore[0], roll=bore[2], site="so", weather="typical")
 	if recenter is not None:
 		# This assumes the object doesn't move much during the tod
@@ -184,17 +178,8 @@ def calc_pointing(ctime, bore, offs, polang, sys="cel", site="so", weather="typi
 			*evaluate_recentering(recenter, ctime=ctime[len(ctime)//2], site=site, weather=weather)
 		)
 		sightline.Q = rot * sightline.Q
-	fplane    = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], np.pi/2-polang)
+	fplane    = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], polang)
 	pos_equ   = np.moveaxis(sightline.coords(fplane),2,0) # [{ra,dec,c1,s1},ndet,nsamp]
-	#print("ctime %20.5f" % ctime[0])
-	#print("baz  %10.6f" % (bore[1,0]/utils.degree))
-	#print("bel  %10.6f" % (bore[0,0]/utils.degree))
-	#print("roll %10.6f" % (bore[2,0]/utils.degree))
-	#print("xi   %10.6f" % (offs[0,1]/utils.degree))
-	#print("eta  %10.6f" % (offs[0,0]/utils.degree))
-	#print("polang %10.6f" % (polang[0]/utils.degree))
-	#print("ra  %10.6f" % (pos_equ[0,0,0]/utils.degree))
-	#print("dec %10.6f" % (pos_equ[1,0,0]/utils.degree))
 	pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
 	return pos_equ
 

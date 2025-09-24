@@ -64,6 +64,7 @@ class MLMapmaker:
 		# Add the observation to each of our signals
 		for signal in self.signals:
 			signal.add_obs(id, obs, iN, gtod)
+		# TODO: update our stats/info here
 		t6 = time.time()
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
@@ -155,9 +156,11 @@ class Signal:
 	def precon(self, x): return x
 	def to_work  (self, x): return x.copy()
 	def from_work(self, x): return x
+	def owork(self): raise NotImplementedError
 	def set_outputs(self, outputs):
 		self.outputs= check_outputs(outputs, self.valid_outputs, self.__class__.__name__)
-	def write   (self, prefix, tag, x): pass
+	def written(self, prefix): raise NotImplementedError
+	def write   (self, prefix, x, tag="dummy", suffix="", force=False): pass
 	def write_misc(self, prefix): pass
 	valid_outputs = []
 
@@ -238,7 +241,7 @@ class SignalMap(Signal):
 			t1  = time.time()
 			tod    = self.dev.pools["tod"].empty(d.tod_shape, d.tod_dtype)
 			if isinstance(fill, str):
-				if fill == "time": tod[:] = d.ctime-self.tref
+				if fill == "time": tod[:] = self.dev.np.array(d.ctime)-self.tref
 				else: raise ValueError("Unrecognized fill '%s'" % fill)
 			else: tod[:] = fill
 			if weight: d.iN.white(tod)
@@ -254,6 +257,7 @@ class SignalMap(Signal):
 		mybench = bench.Bench()
 		with mybench.mark("fin"):
 			self.tref = min(self.comm.allgather(self.tref))
+			if not np.isfinite(self.tref): self.tref = 0
 			# Ok, this is where we finally know enough to finish the tiledist
 			glrhs  = self.drhs.finalize(); del self.drhs
 			self.tiledist = tiling.TileDistribution(self.fshape, self.fwcs,
@@ -602,6 +606,112 @@ class SignalCutPoly(SignalCutFull):
 		elif self.prec == "none":
 			return junk.copy()
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
+
+# Actually, doing this as an actual Signal might be cleanest.
+# Requries no changes to Mapmaker, make_map, etc.
+# Slightly hacky since it would have no degrees of freedom though.
+class SignalInfo(Signal):
+	def __init__(self, comm, dev=None):
+		Signal.__init__(self, name="info", ofmt="{name}", outputs=["info"], ext="hdf")
+		self.comm  = comm
+		self.dev   = dev if dev is not None else device.get_gevice()
+		self.dof   = ArrayZipper(0, dtype=np.float32)
+		self.rhs   = np.zeros(0, dtype=np.float32)
+		self.info  = []
+	def reset(self):
+		self.info  = []
+		self.ready = False
+	def add_obs(self, id, obs, iN, iNd):
+		srate = (len(obs.ctime)-1)/(obs.ctime[-1]-obs.ctime[0])
+		# Get the scanning info. These are *after* the pointing
+		# model has been applied
+		def leftw(arr):
+			v1, v2 = utils.minmax(arr)
+			return v1, v2-v1
+		def cenw(arr):
+			v1, v2 = utils.minmax(arr)
+			return (v1+v2)/2, v2-v1
+		ctime,  dur   = leftw(obs.ctime)
+		az,     waz   = cenw(obs.boresight[1])
+		el,     wel   = cenw(obs.boresight[0])
+		roll,   wroll = cenw(obs.boresight[2])
+		# Detector info
+		dsens = (iN.ivar*srate)**-0.5
+		# Center and radius per band
+		self.info.append(bunch.Bunch(
+			id=id, ctime=ctime, dur=dur, az=az, waz=waz, el=el, wel=wel, roll=roll, wroll=wroll,
+			dsens=dsens, dets=obs.dets, detids=obs.detids, bands=obs.bands,
+			offs=obs.point_offset))
+	def owork(self): return np.zeros(self.rhs.shape, self.rhs.dtype)
+	def prepare(self):
+		# high-level gather. Hopefully not too high overhead
+		info = self.comm.gather(self.info)
+		if self.comm.rank == 0: self.info = sum(info,[])
+		self.ready = True
+	def written(self, prefix):
+		return os.path.isfile(prefix + "info.hdf")
+	def write_misc(self, prefix):
+		# We only have a misc product, nothing we're actually solving for
+		if "info" not in self.outputs: return
+		if self.comm.rank != 0: return
+		nobs   = len(self.info)
+		# Loop through and find the full set of ids and dets
+		ids, detids = [], []
+		bands = {}
+		for row in self.info:
+			ids.append(row.id)
+			detids.append(row.detids)
+			for detid, band in zip(row.detids, row.bands):
+				bands[detid] = band
+		ids    = np.char.encode(np.array(ids))
+		detids = np.unique(np.concatenate(detids))
+		bands  = np.array([bands[detid] for detid in detids])
+		ndet   = len(detids)
+		# Sort dets by detid and obs by id
+		order_obs = np.argsort(ids)
+		order_det = np.argsort(detids)
+		detids    = detids[order_det]
+		bands     = bands [order_det]
+		# Get the sensitivity per band
+		ubands, order, edges = utils.find_equal_groups_fast(bands)
+		nband     = len(ubands)
+		# Some of our info fits nicely into a simple per-obs table
+		obstab = np.zeros(nobs, [("id",ids.dtype),("ctime","f"),("dur","f"),
+			("az","f"),("waz","f"),("el","f"),("wel","f"),
+			("roll","f"),("wroll","f"),("ndet","i"),("sens","%df"%nband)]).view(np.recarray)
+		simple_fields = ["ctime","dur","az","waz","el","wel","roll","wroll"]
+		deg_fields = ["az","waz","el","wel","roll","wroll"]
+		for i, ri in enumerate(order_obs):
+			row = self.info[ri]
+			obstab[i].id   = row.id
+			obstab[i].ndet = len(row.detids)
+			for field in simple_fields:
+				obstab[i][field] = row[field]
+			# Get the band sensitvity
+			inds  = utils.find(detids, row.detids)
+			dsens = self.dev.get(row.dsens)
+			for bi, band in enumerate(ubands):
+				good = bands[inds]==band
+				band_dsens = dsens[good]
+				if band_dsens.size == 0: continue
+				band_sens  = np.sum(band_dsens**-2)**-0.5
+				obstab[i].sens[bi] = band_sens
+		# to degrees
+		for field in deg_fields:
+			obstab[field] /= utils.degree
+		# Build obs,dsens matrix. A problem with this matrix is that it is
+		# quite sparse for multi-tube obsjoint or multi-wafer waferjoint, and can get
+		# pretty big. It would be more useful to separate out the dense blocks, but
+		# not easy to do this automatically. Basically a boolean svd.
+		# Will leave it as is for now
+		dsens = np.zeros((nobs,ndet), np.float32)
+		for i, ri in enumerate(order_obs):
+			row  = self.info[ri]
+			inds = utils.find(detids, row.detids)
+			dsens[i,inds] = self.dev.get(row.dsens)
+		res = bunch.Bunch(obstab=obstab, detids=detids, bands=bands, ubands=ubands, dsens=dsens)
+		bunch.write(prefix + "info.hdf", res)
+	valid_outputs = ["info"]
 
 # Mapmaking function
 def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):

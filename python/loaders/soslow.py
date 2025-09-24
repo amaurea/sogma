@@ -44,6 +44,7 @@ class SotodlibLoader:
 		with bench.mark("reformat"):
 			res  = bunch.Bunch()
 			res.dets         = obs.dets.vals
+			res.detids       = obs.det_info.det_id
 			res.point_offset = np.array([obs.focal_plane.eta,obs.focal_plane.xi]).T
 			res.polangle     = obs.focal_plane.gamma
 			res.ctime        = obs.timestamps

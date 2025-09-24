@@ -25,7 +25,7 @@ class MMDeviceMinimal(device.DeviceCpu):
 		def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 			return fft.irfft(dat, tod=out, axes=axis, normalize=False)
 		self.lib.irfft = irfft
-		self.lib.fft_factors = [2,4,5,7]
+		self.lib.fft_factors = [2,3,5,7]
 		# BLAS. May need to find a way to make this more compact if we need
 		# more of these functions
 		def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
@@ -87,7 +87,7 @@ try:
 				if plan_cache is None: plan_cache = self.plan_cache
 				return gpu_mm.cufft.irfft(dat, out=out, axis=axis, plan=plan, plan_cache=plan_cache)
 			self.lib.irfft = irfft
-			self.lib.fft_factors = [2,4,5,7]
+			self.lib.fft_factors = [2,3,5,7]
 			# Tiling
 			self.lib.DynamicMap     = gpu_mm.DynamicMap
 			self.lib.LocalMap       = gpu_mm.LocalMap
@@ -186,7 +186,7 @@ try:
 			def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				return fft.irfft(dat, tod=out, axes=axis, normalize=False)
 			self.lib.irfft = irfft
-			self.lib.fft_factors = [2,4,5,7]
+			self.lib.fft_factors = [2,3,5,7]
 			# Tiling
 			self.lib.DynamicMap     = cpu_mm.DynamicMap
 			self.lib.LocalMap       = cpu_mm.LocalMap

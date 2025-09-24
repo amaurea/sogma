@@ -533,3 +533,59 @@ def time_split(obsinfo, joint, maxsize=500e6):
 			ojoint.sampranges.append((i1,i2))
 	ojoint.sampranges = np.array(ojoint.sampranges)
 	return ojoint
+
+def rfft_autopad(tod, n=None, dev=None, tod_pool="tod", ft_pool="ft", scratch_pool="fft_scratch"):
+	"""Perform a hopefully reasonably efficient rfft of a tod with a
+	non-fourier friendly length by copying over to a padded array and
+	transforming it instead. The padded array will have length n, which
+	defaults to utils.nearest_product(orig_len, dev.fft_factors, "above").
+	If this is equal to the current length, then no padding or copying
+	is performed.
+
+	The work is done in the following memory pools of dev.pools:
+	* tod_pool: A pool that can be used for fft scratch calculations
+	  once the tod has been copied over to the padded array. Typically
+	  the pool where the tod lives upon calling this function.
+	* ft_pool: The pool to use for the fourier array
+	* scratch_pool: Pool to use for the padded tod.
+
+	If the pools end up reallocating internally, then tod may end up
+	pointing at an orphaned buffer. This is safe, but it temporarily
+	wastes some memory. This will not happen if the pools are big enough
+	to begin with.
+	"""
+	if dev is None: dev = device.get_device()
+	if n   is None: n   = utils.nearest_product(tod.shape[-1], dev.fft_factors, "above")
+	if n != tod.shape[-1]:
+		# Copy over to padded array
+		tod_pad = dev.pools[scratch_pool].zeros(tod.shape[:-1]+(n,), tod.dtype)
+		tod_pad[...,:tod.shape[-1]] = tod
+		# Set the fft to use the old tod as scratch insted of the newly made padded array
+		dev.pools.swap(tod_pool, scratch_pool)
+	else: tod_pad = tod
+	# Do the actual fft
+	ft = dev.pools[ft_pool].empty((tod.shape[0],n//2+1),utils.complex_dtype(tod.dtype))
+	dev.lib.rfft(tod_pad, ft)
+	# No point in swapping back
+	return ft
+
+def irfft_autopad(ft, tod, n=None, dev=None, tod_pool="tod", ft_pool="ft", scratch_pool="fft_scratch"):
+	"""irfft version of rfft_autpoad. See its docstring.
+	n is the length of the padded array, which must agree with
+	what was used when building ft. The result is not normalized;
+	divide by n to normalize."""
+	if dev is None: dev = device.get_device()
+	if n   is None: n   = utils.nearest_product(tod.shape[-1], dev.fft_factors, "above")
+	if ft.shape[-1] != n//2+1:
+		raise ValueError("Expected ft.shape[-1] = n//2+1, but got %d and %d" % (ft.shape[-1], n))
+	if n != tod.shape[-1]:
+		tod_pad = dev.pools[scratch_pool].empty(tod.shape[:-1]+(n,), tod.dtype)
+		# Set the fft to use the old tod as scratch insted of the newly made padded array
+		dev.pools.swap(tod_pool, scratch_pool)
+	else: tod_pad = tod
+	# Do the actual ifft
+	dev.lib.irfft(ft, tod_pad)
+	if n != tod.shape[-1]:
+		# Copy to actual tod if necessary
+		tod[:] = tod_pad[...,:tod.shape[-1]]
+	return tod

@@ -405,8 +405,10 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	with bench.mark("merge_cuts"):
 		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_jump","cuts_slow"]])#,"cuts_turn"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
-	# Go to a fourier-friendly length
-	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=dev.lib.fft_factors)*mul
+	# Go to a gpu-friendly length by cropping up to 31 samples. Used to
+	# crop to an fft-friendly length, but this cut a bit too much, so switched
+	# to padding where necessary.
+	nsamp = data.signal.shape[1]//mul*mul
 	timestamps, signal, cuts, az, el = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None
 
@@ -471,14 +473,14 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 
 	# FFT stuff should definitely be on the gpu. 640 ms
 	with bench.mark("fft", tfun=dev.time):
-		ftod = dev.pools["ft"].zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
-		dev.lib.rfft(signal, ftod)
-		norm = 1/signal.shape[1]
+		npadded = utils.nearest_product(signal.shape[-1], dev.lib.fft_factors, "above")
+		ftod = gutils.rfft_autopad(signal, n=npadded, dev=dev)
+		norm = 1/npadded
 
 	# Deconvolve iir and time constants
 	with bench.mark("iir_filter", tfun=dev.time):
 		dt    = (ctime[-1]-ctime[0])/(ctime.size-1)
-		freqs = dev.np.fft.rfftfreq(nsamp, dt).astype(signal.dtype)
+		freqs = dev.np.fft.rfftfreq(npadded, dt).astype(signal.dtype)
 		z     = dev.np.exp(-2j*np.pi*meta.iir_params.fscale*freqs)
 		A     = dev.np.polyval(dev.np.array(meta.iir_params.a[:meta.iir_params.order+1][::-1]), z)
 		B     = dev.np.polyval(dev.np.array(meta.iir_params.b[:meta.iir_params.order+1][::-1]), z)
@@ -500,7 +502,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 			del tfact
 	# Back to real space
 	with bench.mark("ifft", tfun=dev.time):
-		dev.lib.irfft(ftod, signal)
+		gutils.irfft_autopad(ftod, signal, n=npadded, dev=dev)
 
 	# Sanity checks
 	with bench.mark("measure noise", tfun=dev.time):

@@ -357,12 +357,15 @@ class NmatAdaptive(Nmat):
 		#    both where to measure the eigenvectors, and
 		#    the bins for the eigenvalues.
 		nwin = utils.nint(self.window*srate)
-		ndet, nsamp = tod.shape
-		nfreq       = nsamp//2+1
+		ndet  = tod.shape[0]
+		nsamp = utils.nearest_product(tod.shape[1], self.dev.lib.fft_factors, "above")
+		nfreq = nsamp//2+1
 		# Apply window in-place, to prefpare for fft
 		gutils.apply_window(tod, nwin)
-		ftod = self.dev.pools["fft"].empty((ndet,nfreq), utils.complex_dtype(tod.dtype))
-		self.dev.lib.rfft(tod, ftod)
+		# rfft_autopad overwrites the tod_pool, but we want to keep tod.
+		# Thank fully the pointing buffer is not in use while we buld the
+		# noise model. Hacky, but then so is the whole pool business.
+		ftod = gutils.rfft_autopad(tod, dev=self.dev, n=nsamp, tod_pool="pointing")
 		# Normalize to avoid 32-bit overflow in atmospheric region.
 		# Make sure apply and ivar are consistent
 		ftod *= nsamp**self.normexp
@@ -476,10 +479,10 @@ class NmatAdaptive(Nmat):
 		t1 = self.dev.time()
 		if not inplace: tod = tod.copy()
 		if not nofft: gutils.apply_window(tod, self.nwin)
+		nsamp = utils.nearest_product(tod.shape[1], self.dev.lib.fft_factors, "above")
 		t2 = self.dev.time()
 		if not nofft:
-			ft = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))
-			self.dev.lib.rfft(tod, ft)
+			ft = gutils.rfft_autopad(tod, dev=self.dev, n=nsamp)
 		else: ft = tod
 		# If we don't cast to real here, we get the same result but much slower
 		# real_dtype needed for the nofft case
@@ -507,7 +510,7 @@ class NmatAdaptive(Nmat):
 		self.dev.lib.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
 		t6 = self.dev.time()
 		# And finish
-		if not nofft: self.dev.lib.irfft(ft, tod)
+		if not nofft: gutils.irfft_autopad(ft, tod, dev=self.dev, n=nsamp)
 		t7 =self.dev.time()
 		if not nofft: gutils.apply_window(tod, self.nwin)
 		t8 =self.dev.time()
@@ -840,7 +843,7 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 		# Measure as many amplitudes as we can afford
 		# C = VEV' => E = (V'V)"V'CV(V'V)"'. V ortho, so this is just E = V'CV
 		E     = ap.einsum("dm,de,em->m", gV, cov, gV)
-		E     = np.diag(gV.T.dot(cov).dot(gV))
+		E     = ap.diag(gV.T.dot(cov).dot(gV))
 		inds  = ap.argsort(E)[-budget_E:][-nmax:]
 		E, V  = E[inds], gV[:,inds]
 		# Finally measure the remaining uncorrelated power

@@ -320,6 +320,8 @@ class NmatDetvecs(Nmat):
 # since these don't have a lot in common. Spikes need narrow bins, while the atmosphere
 # needs to capture more eigenmodes.
 
+# TODO: Update the other noise model's ffts too
+
 class NmatAdaptive(Nmat):
 	def __init__(self, eig_lim=16, single_lim=0.55, window=2, sampvar=1e-2,
 			bsmooth=50, atm_res=2**(1/4), maxmodes=100, dev=None,

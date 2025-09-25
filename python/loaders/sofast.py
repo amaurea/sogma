@@ -408,6 +408,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Go to a gpu-friendly length by cropping up to 31 samples. Used to
 	# crop to an fft-friendly length, but this cut a bit too much, so switched
 	# to padding where necessary.
+	# TODO: Make it configurable whether to fft-crop or not.
+	# Not fft-cropping has significant overhead
 	nsamp = data.signal.shape[1]//mul*mul
 	timestamps, signal, cuts, az, el = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None

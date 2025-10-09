@@ -23,6 +23,7 @@ parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs
 parser.add_argument("-c", "--cont",    action="store_true")
 parser.add_argument(      "--sys",     type=str, default="cel")
 parser.add_argument("-o", "--output",  type=str, default="auto")
+parser.add_argument(      "--sel",     type=str, default=":")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -64,6 +65,10 @@ if len(obsinfo) == 0:
 # .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
 joint   = loader.group_obs(obsinfo, mode=args.joint)
 joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9)
+# group selection. Sadly this can't be done with the query-level selection, as that
+# happens before grouping.
+jinds   = eval("list(range(%d))[%s]" % (len(joint.groups),args.sel))
+joint   = gutils.select_groups(joint, jinds)
 ngroup  = len(joint.groups)
 if joint.joint:
 	bandmsg = ",".join(joint.bands)

@@ -310,6 +310,7 @@ class FastMeta:
 			# for the last thing to be processed, which we'll just have to
 			# hardcode here for now.
 			good = np.diff(np.concatenate([[0],pl.read("noise_mapmaking/valid/ends")])) > 0
+			#good = np.diff(np.concatenate([[0],pl.read("valid_data/ends")])) > 0
 			paman.restrict("dets", paman.dets.vals[good])
 
 		# Eventually we will need to be able to read in sample-ranges.
@@ -409,6 +410,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=dev.lib.fft_factors)*mul
 	timestamps, signal, cuts, az, el = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None
+	ninit = data.dets.count
 
 	# prev_obs lets us pass in the result of calibrate run on
 	# a different set of detectors for the same observation.
@@ -547,6 +549,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	#res.response     = dev.np.zeros((2,len(res.tod)),res.tod.dtype)
 	#res.response[0]  = 2
 	#res.response[1]  = -1
+	res.cutinfo = bunch.Bunch(
+		ndet_init=ninit, ndet_rms=nrms, ndet_dens=ndens, ndet_final=nfinal)
 	return res
 
 #################

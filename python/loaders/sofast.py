@@ -40,10 +40,12 @@ from .socommon import cmeta_lookup
 #    for the tod? This may be good in any case, as we don't need
 #    the read-in buffer later.
 
-# FIXME: fourier-truncation can lose a significant amount of samples, it seems
+# Fourier-truncation can lose a significant amount of samples, it seems
 # Probably best to switch to fourier-padding instead. Will be some work though,
 # since one needs to keep track of the logical length separately from the full
-# length.
+# length. Update: I tested this, but the speed loss was significant and not
+# worth it. But in the process, I discovered that I had a typo in the fourier
+# prime list, and after fixing that the amount of truncation went down a lot.
 
 class SoFastLoader:
 	def __init__(self, context_or_config_or_name, dev=None, mul=32):

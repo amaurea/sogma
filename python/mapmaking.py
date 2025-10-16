@@ -761,6 +761,15 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		if len(data.errors) > 0:
 			# Partial skip
 			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
+		# TODO: Make a new module cuts.py and implement an object-avoidance cut.
+		# Merge that into the cuts here and gapfill before sending the data to add_obs.
+		# May want a setting for only temporarily gapfilling for the purpose of noise
+		# estimation. Could add that as a noise_cuts member of data, and leave it to
+		# the noise model how to deal with it.
+		#
+		# cuts.py will need asteroid ephemerids enabled, and get a configurable list of
+		# objects to cut. It will need to calculate pointing and get distances to
+		# the objects. This is potentially a slow operation, might need a grid or something.
 		t2    = time.time()
 		try:
 			mapmaker.add_obs(name, data, deslope=False)

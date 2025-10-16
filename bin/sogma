@@ -1,6 +1,12 @@
 #!/usr/bin/env python
-import argparse
-parser = argparse.ArgumentParser()
+import numpy as np, os, time, sys
+from pixell import config, enmap, utils, mpi, colors, bench
+from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
+# Have to do all imports that could contain configuration before
+# building config.ArgumentParser because these may define variables.
+# This means we can't bail out early when called with wrong arguments;
+# we have to wait for potentially slow imports first. Oh well.
+parser = config.ArgumentParser("sogma")
 parser.add_argument("area")
 parser.add_argument("odir")
 parser.add_argument("-C", "--context", type=str, default="lat", help="Either a config.yaml, context.yaml or a telescope name, like lat, satp1, etc.. The most general is config.yaml, which works with both the sofast and soslow loaders. Using just a context only works with sofast, and must be a context that includes the preprocess database. Telescope names expand to the default preprocess context using $SOPATH, which should point to the SO top-level directory (the one that contains the metadata directory).")
@@ -28,10 +34,6 @@ args = parser.parse_args()
 
 # Should some of this be factored out into an
 # SO-specific mapmaker class?
-
-import numpy as np, os, time, sys
-from pixell import enmap, utils, mpi, colors, bench
-from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
 
 if   args.mode in ["individual","depth1"]: separate = True
 elif args.mode in ["full", "dump"]:        separate = False

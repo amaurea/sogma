@@ -481,6 +481,9 @@ class SignalCutFull(Signal):
 		iN a noise model, representing the inverse noise covariance matrix,
 		and iNd the result of applying the noise model to the detector time-ordered data."""
 		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
+
+		np.save("test_good_cuts_%s.npy" % id.replace(":","_"), obs.cuts)
+
 		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
 		# Build our RHS
 		obs_rhs = self.dev.np.zeros(pcut.ndof, self.dtype)

@@ -508,29 +508,41 @@ def get_pixbounds(lp, comm):
 	return np.array([[y1,x1],[y2,x2]])
 
 def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
-	"""Given an enmap, return a LocalMap that can be used in
-	map2tod operations. All tiles covering the emap will be
-	active, so there's no distribution happening here. This
-	is useful for cases like projecting a per-obs mask to
-	time domain in order to construct cuts."""
+	"""Given an enmap, return bunch containing:
+
+	* lmap: A LocalMap that can be used in map2tod operations
+	* fshape, fwcs: The enmap geometry of the corresponding
+	  full sky. Needed to construct the corresponding pointing
+	  matrix
+	* pixbox: The pixel-bounding-box of map in the fullsky
+	  geomery. Can be nice to have.
+
+	needed to construct the corresponding pointing matrix.
+	All tiles covering the emap will be active, so there's
+	no distribution happening here. This is useful for cases
+	like projecting a per-obs mask to time domain in order
+	to construct cuts."""
 	if dev is None: dev = device.get_device()
 	fshape, fwcs, pixbox = infer_fullsky_geometry(map.shape, map.wcs)
 	tinfo = tile_pixbox(pixbox, tshape)
 	# Allocate our tiles
 	ncell = tinfo.nty*tinfo.ntx
-	cell_inds = np.arange(ncell).reshape(tinfo.nty,tinfo.ntx).astype(np.int32)
+	cell_inds = np.arange(ncell).reshape(tinfo.nty,tinfo.ntx).astype(np.int64)
 	cell_offs = cell_inds*(ncomp*tshape[0]*tshape[1])
 	# Make a buffer that covers our map and which we can reshape into
 	# our local-map cells later
 	buf = np.zeros((ncomp,tinfo.nty,tshape[0],tinfo.ntx,tshape[1]),map.dtype)
-	buf[:,tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
+	b2d = buf.reshape(ncomp,tinfo.nty*tshape[0],tinfo.ntx*tshape[1])
+	b2d[:,tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
 	# Reshape and then move it to the device
+	buf = np.moveaxis(buf, (0,1,2,3,4), (2,0,3,1,4))
 	buf = buf.reshape(ncell,ncomp,tshape[0],tshape[1])
 	buf = dev.np.array(buf, order="C")
 	# Finally build a LocalMap from it
-	lp  = dev.lib.LocalPixelization(fshape[-2], fshape[-1], cell_offsets=cell_offs)
+	lp  = dev.lib.LocalPixelization(fshape[-2], fshape[-1], cell_offsets=cell_offs,
+		ystride=tshape[1], polstride=tshape[0]*tshape[1])
 	lmap= dev.lib.LocalMap(lp, buf)
-	return lmap
+	return bunch.Bunch(lmap=lmap, fshape=fshape, fwcs=fwcs, pixbox=pixbox)
 
 ###########
 # Helpers #

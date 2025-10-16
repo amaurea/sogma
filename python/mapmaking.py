@@ -1,7 +1,7 @@
 import numpy as np, os
 import time
 from pixell import utils, bunch, enmap, colors, wcsutils, bench
-from . import nmat, pmat, tiling, gutils, device
+from . import nmat, pmat, tiling, gutils, device, autocut
 from .logging import L
 
 class MLMapmaker:
@@ -204,7 +204,7 @@ class SignalMap(Signal):
 		self.ids      = []
 		self.tiledist = None
 		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, self.dtype)
-	def add_obs(self, id, obs, iN, iNd, pmap=None):
+	def add_obs(self, id, obs, iN, iNd, pmap=None, pcut=None):
 		"""Add and process an observation, building the pointing matrix
 		and our part of the RHS. "obs" should be an Observation axis manager,
 		iN a noise model, representing the inverse noise covariance matrix,
@@ -219,16 +219,22 @@ class SignalMap(Signal):
 		if pmap is None:
 			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=iNd.dtype)
 			self.dev.garbage_collect()
+		if pcut is None:
+			# This doesn't have to match the exact cut type in SignalCut.
+			# Since we only use .clear() here, they only need to agree on
+			# which samples are cut.
+			pcut = pmat.PmatCutFull(obs.cuts, dev=self.dev)
 		# Precompute pointing for the upcoming pmap observations
 		# Accumulate local rhs
 		t2 = time.time()
+		pcut.clear(iNd)
 		pmap.backward(iNd, self.drhs)
 		self.dev.garbage_collect()
 		t3 = time.time()
 		L.print("Init map pmat %6.3f rhs %6.3f %s" % (t2-t1,t3-t2,id), level=2)
 		# Save the per-obs things we need. Just the pointing matrix in our case.
 		# Nmat and other non-Signal-specific things are handled in the mapmaker itself.
-		self.data[id] = bunch.Bunch(pmap=pmap, iN=iN, tod_shape=iNd.shape, tod_dtype=iNd.dtype, ctime=ctime)
+		self.data[id] = bunch.Bunch(pmap=pmap, pcut=pcut, iN=iN, tod_shape=iNd.shape, tod_dtype=iNd.dtype, ctime=ctime)
 		self.ids.append(id)
 	def calc_hits(self, weight=False, fill=1, name="hits"):
 		"""Calculate the local div or hits map. Tiling must be
@@ -245,7 +251,7 @@ class SignalMap(Signal):
 				else: raise ValueError("Unrecognized fill '%s'" % fill)
 			else: tod[:] = fill
 			if weight: d.iN.white(tod)
-			# Shouldn't there be a pcut.clear here?
+			d.pcut.clear(tod)
 			d.pmap.backward(tod, glhits)
 			t2  = time.time()
 			L.print("Init map %s %d %6.3f %s" % (name, weight, t2-t1,id), level=2)
@@ -761,15 +767,9 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		if len(data.errors) > 0:
 			# Partial skip
 			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
-		# TODO: Make a new module cuts.py and implement an object-avoidance cut.
-		# Merge that into the cuts here and gapfill before sending the data to add_obs.
-		# May want a setting for only temporarily gapfilling for the purpose of noise
-		# estimation. Could add that as a noise_cuts member of data, and leave it to
-		# the noise model how to deal with it.
-		#
-		# cuts.py will need asteroid ephemerids enabled, and get a configurable list of
-		# objects to cut. It will need to calculate pointing and get distances to
-		# the objects. This is potentially a slow operation, might need a grid or something.
+		# Do configurable autocuts that are indpendent of the loading method here.
+		# Might want to wrap it into some higher-level load function...
+		autocut.autocut(data, dev=dev)
 		t2    = time.time()
 		try:
 			mapmaker.add_obs(name, data, deslope=False)

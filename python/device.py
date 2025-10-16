@@ -91,6 +91,7 @@ try:
 			# Tiling
 			self.lib.DynamicMap     = gpu_mm.DynamicMap
 			self.lib.LocalMap       = gpu_mm.LocalMap
+			self.lib.LocalPixelization = gpu_mm.LocalPixelization
 			# BLAS. May need to find a way to make this more compact if we need
 			# more of these functions
 			self.cublas_handle = cupy.cuda.Device().cublas_handle
@@ -190,6 +191,7 @@ try:
 			# Tiling
 			self.lib.DynamicMap     = cpu_mm.DynamicMap
 			self.lib.LocalMap       = cpu_mm.LocalMap
+			self.lib.LocalPixelization = cpu_mm.LocalPixelization
 			# BLAS. May need to find a way to make this more compact if we need
 			# more of these functions
 			def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):

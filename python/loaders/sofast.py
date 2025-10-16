@@ -1,6 +1,6 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
 from pixell import utils, bunch, bench, sqlite
-from .. import device, gutils
+from .. import device, gutils, socut
 from . import socommon
 from .socommon import cmeta_lookup
 
@@ -134,9 +134,9 @@ class SoFastLoader:
 				off = meta.aman.samps.offset
 				meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
 		# Set up total obs
-		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[])
+		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[], cuts=[])
 		append_fields = [("dets",0),("detids",0),("bands",0),("point_offset",0),
-			("polangle",0),("response",1),("cuts",1)]
+			("polangle",0),("response",1)]
 		for field, axis in append_fields: otot[field] = []
 		dcum = 0
 		try:
@@ -169,10 +169,11 @@ class SoFastLoader:
 					otot.hwp       = obs.hwp
 					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
 				# Cuts needs to have the detector offsets modified, after which it's simple
-				obs.cuts[0] += dcum
+				obs.cuts.dets += dcum
 				# Handle the simple append cases
 				for field, axis in append_fields:
 					otot[field].append(obs[field])
+				otot.cuts.append(obs.cuts)
 				otot.subids += obs.subids
 				otot.errors += obs.errors
 				# Copy tod over to the right part of the output buffer
@@ -184,6 +185,7 @@ class SoFastLoader:
 			# Concatenate the work-lists into the final arrays
 			for field, axis in append_fields:
 				otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
+			otot.cuts = socut.Simplecut.detcat(otot.cuts)
 			# Trim tod in case we lost some detectors
 			otot.tod = otot.tod[:dcum]
 		finally:
@@ -406,7 +408,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	if dev is None: dev = device.get_device()
 	# Merge the cuts. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
-		cuts = merge_cuts([meta.aman[name] for name in ["cuts_glitch","cuts_2pi","cuts_jump","cuts_slow"]])#,"cuts_turn"]])
+		cuts = socut.Sampcut.merge([meta.aman[name] for name in
+			["cuts_glitch","cuts_2pi","cuts_jump","cuts_slow"]])#,"cuts_turn"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 	# Go to a fourier-friendly length
 	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=dev.lib.fft_factors)*mul
@@ -465,7 +468,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Deglitch and dejump
 	w = 10
 	with bench.mark("deglitch", tfun=dev.time):
-		deglitch(signal, cuts, w=w, dev=dev)
+		cuts.gapfill(signal, w=w, dev=dev)
 		#deglitch_commonsep(signal, cuts, w=w, dev=dev)
 
 	# 100 ms for this :(
@@ -529,10 +532,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
 
 	with bench.mark("cuts reformat"):
-		ocuts = np.array([
-			get_range_dets(cuts.bins, cuts.ranges),
-			cuts.ranges[:,0], cuts.ranges[:,1]-cuts.ranges[:,0]], dtype=np.int32)
-		ocuts = ocuts[:,ocuts[0]>=0]
+		ocuts = cuts.to_simple()
 
 	# Our goal is to output what sogma needs. Sogma works on these fields:
 	res  = bunch.Bunch()
@@ -856,140 +856,11 @@ def get_fplane_extent(focal_plane):
 	rad = np.max(utils.angdist(focal_plane[:,:2],mid[:,None]))
 	return mid, rad
 
-# These functions could use some low-level acceleration
-
-def get_range_dets(bins, ranges):
-	bind  = np.full(len(ranges),-1,np.int32)
-	for bi, bin in enumerate(bins):
-		bind[bin[0]:bin[1]] = bi
-	return bind
-
-def counts_to_bins(counts):
-	edges  = utils.cumsum(counts, endpoint=True)
-	bins   = np.zeros((len(counts),2),np.int32)
-	bins[:,0] = edges[:-1]
-	bins[:,1] = edges[1:]
-	return bins
-
-def simplify_cuts(bins, ranges):
-	"""Get sort cuts by detector, and remove empty ones"""
-	obins   = []
-	oranges = []
-	o1 = 0
-	for b1,b2 in bins:
-		o2 = o1
-		for ri in range(b1,b2):
-			if ranges[ri,1] > ranges[ri,0]:
-				o2 += 1
-				oranges.append(ranges[ri])
-		obins.append((o1,o2))
-		o1 = o2
-	obins = np.array(obins, np.int32).reshape((-1,2))
-	oranges = np.array(oranges, np.int32).reshape((-1,2))
-	return obins, oranges
-
-def merge_cuts(cuts):
-	"""Get the union of the given list of Sampcuts"""
-	# 1. Flatten each cut. After this, franges will contain
-	# a concatenated but not sorted set of flattened cuts.
-	ndet = len(cuts[0].bins)
-	nsamp= cuts[0].nsamp
-	N    = nsamp+1 # +1 to avoid merging across dets
-	franges = []
-	for ci, cut in enumerate(cuts):
-		# Get the det each range belongs to
-		bind    = get_range_dets(cut.bins, cut.ranges).astype(np.int64) # avoid overflow
-		franges.append(np.clip(cut.ranges,0,nsamp) + bind[:,None]*N)
-	# 3. Merge overlapping ranges. We count how many times
-	# we enter and exit a cut region across all, and look for places
-	# where this is nonzero. We flatten franges because we will
-	# make a running tally of how many cut starts/ends we have encountred.
-	franges = np.concatenate(franges).reshape(-1)
-	if franges.size == 0: return Sampcut(nsamp=nsamp)
-	# FIXME: Handle everything cut-case
-	vals    = np.zeros(franges.shape,np.int32)
-	vals[0::2] =  1
-	vals[1::2] = -1
-	# For starts and ends that happen at the same point, results could
-	# be ambiguous, resulting in a variable amount of merging. We can
-	# avoid this by making sure starts sort before ends, which will give
-	# maximum merging
-	sortkey = 2*franges + (np.arange(len(franges))&1) # even=start, odd=end, before sort
-	order   = np.argsort(sortkey)
-	franges = franges[order]
-	vals    = vals   [order]
-	# We're in a cut wherever the running tally is positive.
-	# incut[0] will always be True, incut[-1] will always be False
-	incut   = np.cumsum(vals)>0
-	starts, ends = utils.mask2range(incut).T
-	oranges = np.array([franges[starts],franges[ends]]).T
-	# Unflatten into per-detector
-	bind     = oranges[:,0]//N
-	oranges -= bind[:,None]*N
-	oranges  = oranges.astype(np.int32)
-	nperdet  = np.bincount(bind, minlength=ndet)
-	obins    = counts_to_bins(nperdet)
-	# Finally construct a new cut with the result
-	ocut     = Sampcut(obins, oranges, nsamp)
-	return ocut
-
-def get_cut_borders(cuts, n=1):
-	bind      = get_range_dets(cuts.bins, cuts.ranges)
-	border    = np.zeros((len(cuts.ranges),2,2),np.int32)
-	border[:,0,1] = cuts.ranges[:,0]
-	border[:,1,0] = cuts.ranges[:,1]
-	# pad on both ends to make logic simpler
-	padbind   = np.concatenate([[-1],bind,[-1]])
-	padranges = np.concatenate([[[0,0]],cuts.ranges,[[cuts.nsamp,cuts.nsamp]]])
-	left      = np.where(padbind[:-2]==padbind[1:-1],padranges[:-2,1],0)
-	right     = np.where(padbind[ 2:]==padbind[1:-1],padranges[ 2:,0],cuts.nsamp)
-	border[:,0,0] = np.maximum(cuts.ranges[:,0]-n, left)
-	border[:,1,1] = np.minimum(cuts.ranges[:,1]+n, right)
-	return border
-
-# TODO: Consider using just [{det,start,len},:] or its transpose as
-# the cuts format. This is what sogma uses directly, and may be easier
-# to work with overall.
-# This class represents cut ranges relative to the tod start, after
-# any offsets in the OffsetAxis in the axismanager have been applied.
-# So it's directly compatible with the signal array
-class Sampcut:
-	def __init__(self, bins=None, ranges=None, nsamp=0, simplify=False):
-		if bins   is None: bins   = np.zeros((0,2),np.int32)
-		if ranges is None: ranges = np.zeros((0,2),np.int32)
-		if simplify:
-			with bench.mark("simplify cuts"):
-				bins, ranges = simplify_cuts(bins, ranges)
-		self.bins   = np.asarray(bins,   dtype=np.int32) # (ndet,  {from,to})
-		self.ranges = np.asarray(ranges, dtype=np.int32) # (nrange,{from,to})
-		self.nsamp  = nsamp # not *really* necessary, but nice to have
-	def __getitem__(self, sel):
-		"""Extract a subset of detectors and/or samples. Always functions
-		as a slice, so the reslut is a new Sampcut. Only standard slicing is
-		allowed in the sample direction - no direct indexing or indexing by lists."""
-		if not isinstance(sel, tuple): sel = (sel,)
-		if len(sel) == 0: return self
-		if len(sel) > 2: raise IndexError("Too many indices for Sampcut. At most 2 indices supported")
-		# Handle detector parts
-		bins = self.bins[sel[0]]
-		if len(sel) == 1:
-			return Sampcut(bins, self.ranges, self.nsamp)
-		start = sel[1].start or 0
-		stop  = sel[1].stop  or self.nsamp
-		step  = sel[1].step  or 1
-		if start < 0: start += self.nsamp
-		if stop  < 0: stop  += self.nsamp
-		if step != 1: raise ValueError("stride != 1 not supported")
-		ranges = np.clip(self.ranges-start, 0, stop-start)
-		return Sampcut(bins, ranges, stop-start, simplify=True)
-	@property
-	def shape(self): return (len(self.bins),self.nsamp)
-	def sum(self):
-		"""Count cut samples per detector"""
-		nper   = self.ranges[:,1]-self.ranges[:,0]
-		ncum   = utils.cumsum(nper, endpoint=True)
-		counts = ncum[self.bins[:,1]]-ncum[self.bins[:,0]]
-		return counts
+def read_cuts(pl, path):
+	shape     = pl.read(path + "/shape")
+	edges     = pl.read(path + "/ends")
+	intervals = pl.read(path + "/intervals")
+	return expand_cuts_sampcut(shape, edges, intervals, inds = pl.inds)
 
 def expand_cuts_sampcut(shape, ends, intervals, inds=None):
 	if len(shape) != 2:
@@ -999,15 +870,9 @@ def expand_cuts_sampcut(shape, ends, intervals, inds=None):
 	ends = ends//2
 	bins[ :,1] = ends
 	bins[1:,0] = ends[:-1]
-	cuts = Sampcut(bins, intervals.reshape(-1,2), shape[1])
+	cuts = socut.Sampcut(bins, intervals.reshape(-1,2), shape[1])
 	if inds is not None: cuts = cuts[inds]
 	return cuts
-
-def read_cuts(pl, path):
-	shape     = pl.read(path + "/shape")
-	edges     = pl.read(path + "/ends")
-	intervals = pl.read(path + "/intervals")
-	return expand_cuts_sampcut(shape, edges, intervals, inds = pl.inds)
 
 # This thing should basically be a lazy-loading axis-manager,
 # but let's wait with that until we have something that works
@@ -1239,34 +1104,6 @@ def deproject_cosel(signal, el, nmode=2, dev=None):
 	signal -= dev.np.einsum("md,mi->di", coeffs, B)
 	print(dev.np.std(signal))
 
-def deglitch(signal, cuts, w=10, dev=None):
-	if dev is None: dev = device.get_device()
-	# Define sample ranges just before and after each
-	# cut, where we will measure a mean value for dejumping
-	with bench.mark("get_cut_borders", tfun=dev.time):
-		borders = get_cut_borders(cuts,w)
-	# Get on the format Kendrick wants
-	with bench.mark("index_map", tfun=dev.time):
-		ndet      = len(cuts.bins)
-		ncut      = len(borders)
-		nper      = cuts.bins[:,1]-cuts.bins[:,0]
-		index_map        = np.zeros((ncut,5), np.int32)
-		index_map[:,0]   = np.repeat(np.arange(ndet,dtype=np.int32),nper)
-		index_map[:,1:]  = borders.reshape(ncut,-1)
-		index_map2       = np.zeros((ncut,4), np.int32)
-		index_map2[:,0]  = index_map[:,0]
-		index_map2[:,1]  = np.repeat(cuts.bins[:,0],nper)
-		index_map2[:,2:] = cuts.ranges
-		index_map  = dev.np.array(index_map)
-		index_map2 = dev.np.array(index_map2)
-		bvals      = dev.np.zeros((ncut,2), signal.dtype)
-	# Measure the border values
-	with bench.mark("get_border_means", tfun=dev.time):
-		dev.lib.get_border_means(bvals, signal, index_map)
-	# Use them to deglitch
-	with bench.mark("deglitch core", tfun=dev.time):
-		dev.lib.deglitch(signal, bvals, index_map2)
-
 # The idea of this was to effectively gapfill using the
 # common mode. Maybe it could work, but in my test, it
 # didn't really fix the gapfilling artifacts in the map
@@ -1279,9 +1116,9 @@ def deglitch_commonsep(signal, cuts, w=10, dev=None):
 	cmode   = robust_common_mode(signal)
 	signal -= cmode
 	# Deglitch common mode subtracted tod
-	deglitch(signal, cuts, w=w, dev=dev)
+	cuts.gapfill(signal, w=w, dev=dev)
 	# Deglitch common mode
-	deglitch(cmode[None], ccuts, w=w, dev=dev)
+	ccuts.gapfill(cmode[None], w=w, dev=dev)
 	# Add back common mode
 	signal += cmode
 
@@ -1295,9 +1132,9 @@ def merge_det_cuts(cuts):
 	dcuts = []
 	for b in cuts.bins:
 		if b[1] == b[0]: continue
-		dcuts.append(Sampcut((b-b[0])[None], cuts.ranges[b[0]:b[1]], nsamp=cuts.nsamp))
+		dcuts.append(socut.Sampcut((b-b[0])[None], cuts.ranges[b[0]:b[1]], nsamp=cuts.nsamp))
 	# 2. Merge them into a single cut
-	ocuts = merge_cuts(dcuts)
+	ocuts = socut.Sampcut.merge(dcuts)
 	return ocuts
 
 def format_multi_exception(exceptions, subids):

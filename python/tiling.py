@@ -507,24 +507,30 @@ def get_pixbounds(lp, comm):
 	x2 = np.max(xranges[:,1])
 	return np.array([[y1,x1],[y2,x2]])
 
-#    This class contains the following members, which describe the global
-#    pixelization (see "global maps" in the gpu_mm docstring):
-#
-#       nypix_global (int)
-#       nxpix_global (int)
-#       periodic_xcoord (bool)
-#
-#    and the following members, which describe a local pixelization (i.e.
-#    subset of 64-by-64 cells in the global pixelization, see "local maps"
-#    in the gpu_mm docstring):
-#
-#      cell_offsets   2-d integer-valued array indexed by (iycell, ixcell)
-#      ystride        (int)
-#      polstride      (int)
-#      nycells        (int)
-#      nxcells        (int)
-#      npix           (int)
-
+def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
+	"""Given an enmap, return a LocalMap that can be used in
+	map2tod operations. All tiles covering the emap will be
+	active, so there's no distribution happening here. This
+	is useful for cases like projecting a per-obs mask to
+	time domain in order to construct cuts."""
+	if dev is None: dev = device.get_device()
+	fshape, fwcs, pixbox = infer_fullsky_geometry(map.shape, map.wcs)
+	tinfo = tile_pixbox(pixbox, tshape)
+	# Allocate our tiles
+	ncell = tinfo.nty*tinfo.ntx
+	cell_inds = np.arange(ncell).reshape(tinfo.nty,tinfo.ntx).astype(np.int32)
+	cell_offs = cell_inds*(ncomp*tshape[0]*tshape[1])
+	# Make a buffer that covers our map and which we can reshape into
+	# our local-map cells later
+	buf = np.zeros((ncomp,tinfo.nty,tshape[0],tinfo.ntx,tshape[1]),map.dtype)
+	buf[:,tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
+	# Reshape and then move it to the device
+	buf = buf.reshape(ncell,ncomp,tshape[0],tshape[1])
+	buf = dev.np.array(buf, order="C")
+	# Finally build a LocalMap from it
+	lp  = dev.lib.LocalPixelization(fshape[-2], fshape[-1], cell_offsets=cell_offs)
+	lmap= dev.lib.LocalMap(lp, buf)
+	return lmap
 
 ###########
 # Helpers #

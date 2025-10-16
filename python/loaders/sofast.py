@@ -168,8 +168,6 @@ class SoFastLoader:
 					otot.boresight = obs.boresight
 					otot.hwp       = obs.hwp
 					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
-				# Cuts needs to have the detector offsets modified, after which it's simple
-				obs.cuts.dets += dcum
 				# Handle the simple append cases
 				for field, axis in append_fields:
 					otot[field].append(obs[field])

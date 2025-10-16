@@ -769,7 +769,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
 		# Do configurable autocuts that are indpendent of the loading method here.
 		# Might want to wrap it into some higher-level load function...
-		autocut.autocut(data, dev=dev)
+		#autocut.autocut(data, dev=dev)
 		t2    = time.time()
 		try:
 			mapmaker.add_obs(name, data, deslope=False)

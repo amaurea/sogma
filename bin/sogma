@@ -18,7 +18,6 @@ parser.add_argument("-L", "--loader",  type=str, default="auto")
 parser.add_argument("-D", "--device",  type=str, default="auto")
 parser.add_argument("-I", "--maxiter", type=int, default=500)
 parser.add_argument(      "--maxerr",  type=float, default=1e-7)
-parser.add_argument("-@", "--center-at",type=str, default=None)
 parser.add_argument("-m", "--mode",    type=str, default="full")
 parser.add_argument("-a", "--autocrop",   action="store_true")
 parser.add_argument("-N", "--nmat",    type=str, default="new")
@@ -51,6 +50,8 @@ verbosity  = args.verbose-args.quiet
 L = logging.Logger(dev, id=comm_all.rank, level=verbosity, fmt="{id:3d} {t:10.6f} {mem:10.6f} {dmem_pools:10.6f} {dmem_rest:10.6f} {dmem_unknown:10.6f} {msg:s}").setdefault()
 bench.set_verbose(verbosity >= 3)
 L.print("Init", level=0, id=0, color=colors.lgreen)
+# Benchmarking
+bench.set_tfun(dev.time)
 # Set up our memory pools. This shouldn't be necessary if I make
 # the interface a bit nicer
 dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
@@ -99,11 +100,10 @@ for name in args.output.split(","):
 	elif name == "cut": cut_out += ["map"]
 	else:               map_out += [name]
 # Set up the signals we will solve for
-recenter = gutils.parse_recentering(args.center_at) if args.center_at else None
 if joint.joint:
-	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=np.float32, sys=args.sys, recenter=recenter, autocrop=args.autocrop, outputs=map_out)
+	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=np.float32, sys=args.sys, autocrop=args.autocrop, outputs=map_out)
 else:
-	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=np.float32, sys=args.sys, recenter=recenter, autocrop=args.autocrop)
+	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=np.float32, sys=args.sys, autocrop=args.autocrop)
 signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out)
 signal_info= mapmaking.SignalInfo(comm_per, dev=dev)
 signals    = [signal_cut, signal_map, signal_info]

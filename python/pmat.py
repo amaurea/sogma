@@ -1,11 +1,19 @@
 import numpy as np
+import quaternion
 import so3g
-from pixell import utils, enmap
+from pixell import utils, enmap, coordsys, bench
 from . import device, gutils
 from .logging import L
 
+class PmatDummy:
+	def __init__(self): pass
+	def forward(self, gtod, glmap): pass
+	def backward(self, gtod, glmap): pass
+	def precalc_setup(self, reset_buffer=True): pass
+	def precalc_free (self): pass
+
 class PmatMap:
-	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", response=None, ncomp=3, recenter=None, dev=None, dtype=np.float32):
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", response=None, ncomp=3, dev=None, dtype=np.float32):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels
 
@@ -25,7 +33,7 @@ class PmatMap:
 		self.sys   = sys
 		self.dev   = dev or device.get_device()
 		self.response = dev.np.array(response) if response is not None else None
-		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, dtype=dtype, recenter=recenter, dev=self.dev)
+		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, dtype=dtype, dev=self.dev)
 		self.preplan  = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
 		self.pointing = None
 		self.plan     = None
@@ -83,11 +91,13 @@ class PmatCutFull:
 		self.offs   = self.dev.np.asarray(gutils.cumsum0(lens), np.int32)
 	def forward(self, tod, junk):
 		self.dev.lib.insert_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
-	def backward(self, tod, junk):
+	def backward(self, tod, junk=None, clear=True):
+		if junk is None: junk = self.dev.np.zeros(self.nsamp)
 		self.dev.lib.extract_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
 		# Zero-out the samples we used, so the other signals (e.g. the map)
 		# don't need to care about them
-		self.clear(tod)
+		if clear: self.clear(tod)
+		return junk
 	def clear(self, tod):
 		self.dev.lib.clear_ranges(tod, self.dets, self.starts, self.lens)
 
@@ -165,27 +175,40 @@ class PmatCutPoly:
 
 # Misc
 
-def calc_pointing(ctime, bore, offs, polang, sys="cel", site="so", weather="typical", recenter=None, dtype=np.float32):
+def calc_pointing(ctime, bore, offs, polang, sys="cel", site="so", weather="typical",
+		dtype=np.float32, use_so3g="auto"):
 	offs, polang = np.asarray(offs), np.asarray(polang)
 	ndet, nsamp = len(offs), bore.shape[1]
-	if   sys in ["cel","equ"]: fun = so3g.proj.coords.CelestialSightLine.az_el
-	elif sys == "hor":         fun = so3g.proj.coords.CelestialSightLine.for_horizon
-	else: raise ValueError("sys %s not recognized" % str(sys))
-	sightline = fun(ctime, bore[1], bore[0], roll=bore[2], site="so", weather="typical")
-	if recenter is not None:
-		# This assumes the object doesn't move much during the tod
-		rot = recentering_to_quat_lonlat(
-			*evaluate_recentering(recenter, ctime=ctime[len(ctime)//2], site=site, weather=weather)
-		)
-		sightline.Q = rot * sightline.Q
-	fplane    = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], polang)
-	pos_equ   = np.moveaxis(sightline.coords(fplane),2,0) # [{ra,dec,c1,s1},ndet,nsamp]
-	pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
+	# Transform the boresight
+	icoord = coordsys.Coords(az=bore[1], el=bore[0], roll=bore[2])
+	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather)
+	# Apply the detector offsets. Like so3g, we assume that they're all affected
+	# by the same refraction, which is only an approximation
+	if use_so3g == "auto":
+		use_so3g = utils.can_import("so3g")
+	if use_so3g:
+		import so3g
+		fplane  = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], polang)
+		p       = so3g.ProjEng_CAR_TQU_NonTiled((1, 1, 1., 1., 1., 1.))
+		q       = so3g.proj.quat.G3VectorQuat(quaternion.as_float_array(ocoord.q))
+		pos_equ     = np.moveaxis(p.coords(q, fplane.quats, None),2,0)
+		pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
+		# Go from c1,s1 to psi
+		pos_equ[2]  = np.arctan2(pos_equ[3],pos_equ[2])
+		pos_equ     = pos_equ[:3]
+	else:
+		# This part is nicer, but makes the function take 440 ms
+		# vs. 210 ms with so3g. The main slow part is the decomposition,
+		# which seems like it needs to be moved to a lower-level language
+		qdet   = coordsys.rotation_xieta(offs[:,1], offs[:,0], polang)
+		ocoord = ocoord*qdet[:,None] # {ndet,nsamp}
+		# Decompose into ra,dec. This step is surprisingly slow
+		pos_equ= np.array([ocoord.dec, ocoord.ra, ocoord.psi]) # [{dec,ra,psi}]
 	return pos_equ
 
 class PointingFit:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang,
-			subsamp=200, sys="cel", site="so", weather="typical", recenter=None, dtype=np.float64,
+			subsamp=200, sys="cel", site="so", weather="typical", dtype=np.float64,
 			nt=1, nx=3, ny=3, store_basis=False, positive_x=False, dev=None):
 		"""Jon's polynomial pointing fit. This predicts each detector's celestial
 		coordinates based on the array center's celestial coordinates. The model
@@ -219,7 +242,6 @@ class PointingFit:
 		self.nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
 		self.sys  = sys
 		self.site = site
-		self.recenter = recenter
 		self.weather = weather
 		# 1. Find the typical detector offset
 		off0 = np.mean(offs, 0)
@@ -311,63 +333,14 @@ class PointingFit:
 		offs, polang = np.asarray(offs), np.asarray(polang)
 		ndet, nsamp  = len(offs), bore.shape[1]
 		pixs      = np.empty((3,ndet,nsamp),self.dtype) # [{y,x,psi},ndet,nsamp]
-		pos_equ   = calc_pointing(ctime, bore, offs, polang, sys=sys, site=site, weather=weather, recenter=self.recenter, dtype=self.dtype)
+		pos_equ   = calc_pointing(ctime, bore, offs, polang, sys=sys, site=site, weather=weather, dtype=self.dtype)
 		# Unwind avoids angle wraps, which are bad for interpolation
 		pos_equ[1]= utils.unwind(pos_equ[1])
 		pixs[:2]  = (pos_equ[:2]-self.p0[:,None,None])/self.dp[:,None,None]
-		pixs[2]   = utils.unwind(np.arctan2(pos_equ[3],pos_equ[2]))
+		pixs[2]   = utils.unwind(pos_equ[2])
 		return pixs # [{y,x,psi},ndet,nsamp], on cpu
 
 def normalize(x):
 	x1 = np.min(x)
 	x2 = np.max(x)
 	return (x-x1)/(x2-x1) if x2!=x1 else x
-
-# These were taken from sotodlib
-def evaluate_recentering(info, ctime, site=None, weather="typical"):
-	"""Evaluate the quaternion that performs the coordinate recentering specified in
-	info, which can be obtained from parse_recentering."""
-	import ephem
-	# Get the coordinates of the from, to and up points. This was a bit involved...
-	def to_cel(lonlat, sys, ctime=None, site=None, weather=None):
-		# Convert lonlat from sys to celestial coorinates. Maybe polish and put elswhere
-		if sys == "cel" or sys == "equ": return lonlat
-		elif sys == "hor":
-			return so3g.proj.CelestialSightLine.az_el(ctime, lonlat[0], lonlat[1], site=site, weather=weather).coords()[0,:2]
-		else: raise NotImplementedError
-	def get_pos(name, ctime, sys=None):
-		if isinstance(name, str):
-			if name in ["hor", "cel", "equ", "gal"]:
-				return to_cel([0,np.pi/2], name, ctime, site, weather)
-			elif name == "auto":
-				return np.array([0,0]) # would use geom here
-			else:
-				obj = getattr(ephem, name)()
-				djd = ctime/86400 + 40587.0 + 2400000.5 - 2415020
-				obj.compute(djd)
-				return np.array([obj.a_ra, obj.a_dec])
-		else:
-			return to_cel(name, sys, ctime, site, weather)
-	p1 = get_pos(info["from"], ctime, info["from_sys"])
-	p2 = get_pos(info["to"],   ctime, info["to_sys"])
-	pu = get_pos(info["up"],   ctime, info["up_sys"])
-	return [p1,p2,pu]
-
-def recentering_to_quat_lonlat(p1, p2, pu):
-	"""Return the quaternion that represents the rotation that takes point p1
-	to p2, with the up direction pointing towards the point pu, all given as lonlat pairs"""
-	from so3g.proj import quat
-	# 1. First rotate our point to the north pole: Ry(-(90-dec1))Rz(-ra1)
-	# 2. Apply the same rotation to the up point.
-	# 3. We want the up point to be upwards, so rotate it to ra = 180°: Rz(pi-rau2)
-	# 4. Apply the same rotation to the real point
-	# 5. Rotate the point to its target position: Rz(ra2)Ry(90-dec2)
-	ra1, dec1 = p1
-	ra2, dec2 = p2
-	rau, decu = pu
-	qu    = quat.rotation_lonlat(rau, decu)
-	R     = ~quat.rotation_lonlat(ra1, dec1)
-	rau2  = quat.decompose_lonlat(R*qu)[0]
-	R     = quat.euler(2, ra2)*quat.euler(1, np.pi/2-dec2)*quat.euler(2, np.pi-rau2)*R
-	a = quat.decompose_lonlat(R*quat.rotation_lonlat(ra1,dec1))
-	return R

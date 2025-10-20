@@ -32,14 +32,14 @@ class MLMapmaker:
 			signal.reset()
 	def add_obs(self, id, obs, deslope=True, noise_model=None):
 		# Prepare our tod
-		t1 = time.time()
+		t1 = self.dev.time()
 		ctime  = obs.ctime
 		srate  = (len(ctime)-1)/(ctime[-1]-ctime[0])
 		tod    = obs.tod.astype(self.dtype, copy=False)
-		t2 = time.time()
+		t2 = self.dev.time()
 		if deslope:
 			utils.deslope(tod, w=5, inplace=True)
-		t3 = time.time()
+		t3 = self.dev.time()
 		gtod = self.dev.pools["tod"].array(tod)
 		del tod
 		# Allow the user to override the noise model on a per-obs level
@@ -54,10 +54,10 @@ class MLMapmaker:
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise gutils.RecoverableError(msg)
-		t4 = time.time()
+		t4 = self.dev.time()
 		# And apply it to the tod
 		gtod = iN.apply(gtod)
-		t5 = time.time()
+		t5 = self.dev.time()
 		# This is our last chance to safely abort, so check that our data makes sense
 		if not self.dev.np.isfinite(self.dev.np.sum(gtod)):
 			raise gutils.RecoverableError(f"Invalid value in N\"tod")
@@ -65,25 +65,25 @@ class MLMapmaker:
 		for signal in self.signals:
 			signal.add_obs(id, obs, iN, gtod)
 		# TODO: update our stats/info here
-		t6 = time.time()
+		t6 = self.dev.time()
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
 		self.data.append(bunch.Bunch(id=id, ndet=len(obs.dets), nsamp=len(ctime),
 			dets=obs.dets, iN=iN))
 	def prepare(self):
 		if self.ready: return
-		t1 = time.time()
+		t1 = self.dev.time()
 		for signal in self.signals:
 			signal.prepare()
 			self.dof.add(signal.dof)
-		t2 = time.time()
+		t2 = self.dev.time()
 		L.print("Prep sys %6.3f" % (t2-t1), level=2)
 		self.ready = True
 	def A(self, x):
-		t1 = time.time()
+		t1 = self.dev.time()
 		iwork = [signal.to_work(m) for signal,m in zip(self.signals,self.dof.unzip(x))]
 		owork = [signal.owork()    for signal in self.signals]
-		t2 = time.time()
+		t2 = self.dev.time()
 		for di, data in enumerate(self.data):
 			# This is the main place that needs to change for the GPU implementation
 			ta1  = self.dev.time()
@@ -168,14 +168,13 @@ class SignalMap(Signal):
 	"""Signal describing a sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
 			outputs=["map","ivar"], ext="fits", dtype=np.float32, ibuf=None, obuf=None,
-			recenter=None, sys=None, interpol=None, autocrop=False):
+			sys=None, interpol=None, autocrop=False):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
 		to equatorial coordinates."""
 		Signal.__init__(self, name, ofmt, outputs, ext)
 		self.sys   = sys or "cel"
-		if self.sys not in ["cel","equ","hor"]:
-			raise NotImplementedError("Coordinate system rotation not implemented yet")
-		self.recenter = recenter
+		#if self.sys not in ["cel","equ","hor"]:
+		#	raise NotImplementedError("Coordinate system rotation not implemented yet")
 		self.dtype = dtype
 		self.interpol = interpol
 		self.data  = {}
@@ -217,7 +216,14 @@ class SignalMap(Signal):
 		# signal_cut to be safest, but only uses .clear which should be the same for all
 		# of them anyway
 		if pmap is None:
-			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, recenter=self.recenter, dev=self.dev, dtype=iNd.dtype)
+			try:
+				pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, dev=self.dev, dtype=iNd.dtype)
+			except RuntimeError:
+				# This happens if the pointing fit goes badly wrong, which
+				# can happen if the tod crosses the poles. Too late to cancel
+				# the tod at this point, so instead we will skip it just in this
+				# signal
+				pmap = pmat.PmatDummy()
 			self.dev.garbage_collect()
 		if pcut is None:
 			# This doesn't have to match the exact cut type in SignalCut.
@@ -353,12 +359,10 @@ class SignalMap(Signal):
 class SignalMapMulti(Signal):
 	"""Signal describing a multiband sky map."""
 	def __init__(self, shape, wcs, bands, comm, dev=None, name="sky", ofmt="{name}", outputs=["map","ivar"],
-			ext="fits", dtype=np.float32, ibuf=None, obuf=None, recenter=None,
-			sys=None, interpol=None, autocrop=False):
+			ext="fits", dtype=np.float32, ibuf=None, obuf=None, sys=None, interpol=None, autocrop=False):
 		self.mapsigs = [
 			SignalMap(shape, wcs, comm, dev=dev, name=band + "_" + name, ofmt=ofmt, outputs=outputs,
-				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, recenter=recenter,
-				sys=sys, interpol=interpol, autocrop=autocrop)
+				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, sys=sys, interpol=interpol, autocrop=autocrop)
 			for band in bands]
 		# Must happen after self.mapsigs has been created
 		Signal.__init__(self, name, ofmt, outputs, ext)
@@ -383,6 +387,7 @@ class SignalMapMulti(Signal):
 			bobs = obs.copy()
 			bobs.point_offset = obs.point_offset[d1:d2]
 			bobs.polangle     = obs.polangle[d1:d2]
+			bobs.cuts         = obs.cuts[d1:d2]
 			bobs.response     = obs.response[:,d1:d2] if obs.response is not None else None
 			# Also need to restrict iN. iN is only used for the precondtioner, so
 			# only need to handle this part. This is a bit hacky though, as theoretically
@@ -734,6 +739,8 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 	if inds is None:
 		# Use the first entry in groups as representative
 		gfirst = np.array([g[0] for g in joint.groups])
+		# FIXME: This doesn't know about the coordinate system we're using!
+		# It assumes equatorial coordinates.
 		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
 		inds = np.where(dist.owner == comm.rank)[0]
 	# Set up exception types we will ignore
@@ -768,9 +775,16 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 			# Partial skip
 			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
 		# Do configurable autocuts that are indpendent of the loading method here.
-		# Might want to wrap it into some higher-level load function...
-		#autocut.autocut(data, dev=dev)
+		# Might want to wrap it into some higher-level load function.
+		# Autocut and gapfill cost about the same as add_obs, so they definitely
+		# aren't free!
 		t2    = time.time()
+		autocut.autocut(data, dev=dev)
+		# Even eigen-gapfilling leaves big artifacts in the planet cut area.
+		# Not gapfilling, despite the bright planet being there, performs
+		# much better. Should understand why. This worked in ACT
+		#gutils.gapfill_atm(data.tod, data.cuts, dev=dev)
+		t3    = time.time()
 		try:
 			mapmaker.add_obs(name, data, deslope=False)
 		except etypes as e:
@@ -778,8 +792,8 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 			continue
 		dev.garbage_collect()
 		del data
-		t3    = time.time()
-		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (name, t3-t1, t2-t1, t3-t2), level=2)
+		t4    = time.time()
+		L.print("Processed %s in %6.3f. Read %6.3f Autocut %6.3f Add %6.3f" % (name, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
 
 	nobs = comm.allreduce(len(mapmaker.data))
 	if nobs == 0:

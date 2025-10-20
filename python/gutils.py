@@ -256,62 +256,6 @@ def detdup_cuts(cuts, ndet, ndup):
 		ocut[i*ncut:(i+1)*ncut,0] += i*ndet
 	return ocuts
 
-# I originally wrote this for sotodlib
-def parse_recentering(desc):
-	"""Parse an object centering description, as provided by the --center-at argument.
-	The format is [from=](ra:dec|name),[to=(ra:dec|name)],[up=(ra:dec|name|system)]
-	from: specifies which point is to be centered. Given as either
-	  * a ra:dec pair in degrees
-	  * the name of a pre-defined celestial object (e.g. Saturn), which should not move
-	    appreciably in celestial coordinates during a TOD
-	to: the point at which to recenter. Optional. Given as either
-	  * a ra:dec pair in degrees
-	  * the name of a pre-defined celestial object
-	  Defaults to ra=0,dec=0 or ra=0,dec=90, depending on the projection
-	up: which direction should point up after recentering. Optional. Given as either
-	  * the name of a coordinate system (e.g. hor, cel, gal), in which case
-	    up will point towards the north pole of that system
-	  * a ra:dec pair in degrees
-	  * the name of a pre-defined celestial object
-	  Defualts to the celestial north pole
-	
-	Returns "info", a bunch representing the recentering specification in more python-friendly
-	terms. This can later be passed to evaluate_recentering to get the actual euler angles that perform
-	the recentering.
-	
-	Examples:
-	  * 120.2:-13.8
-	    Centers on ra = 120.2°, dec = -13.8°, with up being celestial north
-	  * Saturn
-	    Centers on Saturn, with up being celestial north
-	  * Uranus,up=hor
-	    Centers on Uranus, but up is up in horizontal coordinates. Appropriate for beam mapping
-	  * Uranus,up=hor,to=0:90
-	    As above, but explicitly recenters on the north pole
-	"""
-	# If necessary the syntax above could be extended with from_sys, to_sys and up-sys, which
-	# so one could specify galactic coordiantes for example. Or one could generalize
-	# from ra:dec to phi:theta[:sys], where sys would default to cel. But for how I think
-	# this is enough.
-	args = desc.split(",")
-	info  = {"to":"auto", "up":"cel", "from_sys":"cel", "to_sys":"cel", "up_sys":"cel"}
-	for ai, arg in enumerate(args):
-		# Split into key,value
-		toks = arg.split("=")
-		if ai == 0 and len(toks) == 1:
-			key, val = "from", toks[0]
-		elif len(toks) == 2:
-			key, val = toks
-		else:
-			raise ValueError("parse_recentering wants key=value format, but got %s" % (arg))
-		# Handle the values
-		if ":" in val:
-			val = [float(w)*utils.degree for w in val.split(":")]
-		info[key] = val
-	if "from" not in info:
-		raise ValueError("parse_recentering needs at least the from argument")
-	return info
-
 def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	"""Given an obsinfo as returned by a loader.query(), return the set
 	of contiguous scanning periods in the form [:,{ctime_from,ctime_to}].
@@ -540,3 +484,109 @@ def select_groups(joint, inds):
 		names  = [joint.names[i]  for i in inds],
 		sampranges=np.array([joint.sampranges[i] for i in inds]),
 		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
+
+def robust_atm_cov(tod, down=200, nmed=10, high=20, dev=None):
+	"""Estimate the atmospheric covariance using a real-space
+	median of means approach. We effecitvely bandpass filter
+	the tod by first downgrading until we reach the atmospheric
+	regime around 1 Hz, and then do a diference samples high
+	apart to highpass filter."""
+	# TODO: Consider replacing median with a masking of cut values,
+	# since the median takes up >90% of the runtime of the function
+	from pixell import bench
+	if dev is None: dev = device.get_device()
+	dtod   = downgrade(tod, down)
+	nper   = dtod.shape[1]//nmed
+	blocks = dtod[:,:nmed*nper].reshape(-1,nmed,nper)
+	if blocks.shape[1] > high:
+		blocks = blocks[:,high:,:]-blocks[:,:-high,:]
+	else:
+		blocks-= dev.np.mean(blocks,-1)[:,:,None]
+	# Calculate the covariance in each block. Shouldn't be worse
+	# than about 10 MB or so
+	cov    = dev.np.einsum("dbs,ebs->deb", blocks, blocks)
+	# Median across blocks, to avoid outliers. This is the slow step.
+	# Around 300 ms on gpu
+	cov    = dev.np.median(cov,-1)
+	return cov
+
+def top_eigs(cov, eig_lim=1e-3, dev=None):
+	# This is surprisingly slow, but the matrix is
+	# quite large
+	if dev is None: dev = device.get_device()
+	E, V = dev.np.linalg.eigh(cov)
+	good = np.where(E>np.max(E)*eig_lim)[0]
+	E, V = E[good], V[:,good]
+	return E, V
+
+def gapfill_eigvecs(tod, pcut, V, E, prior=1e-6, sub_lim=0.25, dev=None):
+	"""Gapfill cut regions of tod by modelling the tod-signal
+	as detector-correlated with covmat VEV' per sample, with
+	samples uncorrelated. The uncut detectors are used to predict
+	the cut samples. The solution is biased towards zero with
+	strength prior/E, which mainly matters when so many detectors
+	are cut that the per-sample system becomes degenerate.
+
+	pcut is an instance of PcutFull.
+
+	Uses the buffer "pointing"
+	"""
+	if dev is None: dev = device.get_device()
+	# Find which samples we need to concern ourselves with
+	mask = dev.pools["ft"].ones(tod.shape, tod.dtype)
+	pcut.clear(tod)
+	pcut.clear(mask)
+	with dev.pools["pointing"].as_allocator():
+		ngood = dev.np.sum(mask,0)
+		sel   = dev.np.where(ngood<tod.shape[0])[0]
+		do_sub = len(sel) < tod.shape[1]*sub_lim
+		if do_sub:
+			# Extract the relevant parts. Hopefully very few samples
+			wtod, wmask = tod[:,sel], mask[:,sel]
+		else:
+			wtod, wmask = tod, mask
+		# Build our equation system
+		rhs  = wtod.T.dot(V)
+		# Sadly, this is split into pairwise operations internally
+		# by cupy.einsum, which results in a temporary of size ndet*nmode*nsamp
+		# being allocated. That defeats the whole point of calling einsum
+		# in the first place!
+		div  = dev.np.einsum("da,ds,db->sab", V, wmask, V)
+		del wtod, wmask
+		# add prior
+		Q    = dev.np.max(E)/E*prior
+		for i, q in enumerate(Q):
+			div[:,i,i] += q
+		# now solve per element. Sadly solve doesn't have an output
+		# argument, so this will allocate
+		amps = dev.np.linalg.solve(div,rhs[:,:,None])[:,:,0] # [nsamp,nmode]
+		del rhs,div
+		# Build our model
+		model = dev.np.einsum("sa,da->ds", amps, V)
+		if do_sub:
+			# Copy over needed parts to tod
+			mask[:,sel] = model
+		else:
+			mask = model
+		vals = dev.np.zeros(pcut.nsamp, tod.dtype)
+	pcut.backward(mask, vals)
+	pcut.forward(tod, vals)
+
+def gapfill_eigvecs_iterative(tod, pcut, V, niter=4, dev=None):
+	if dev is None: dev = device.get_device()
+	# Repeatedly subtract best model, gapfill, and add it back
+	vals  = pcut.backward(tod, clear=False)
+	model = dev.pools["ft"].zeros(tod.shape, tod.dtype)
+	for it in range(niter):
+		pcut.forward(tod, vals)
+		amps = V.T.dot(tod)
+		dev.np.dot(V, amps, out=model)
+		pcut.backward(model, vals)
+
+def gapfill_atm(tod, cuts, eig_lim=1e-3, dev=None):
+	from . import pmat
+	pcut = pmat.PmatCutFull(cuts, dev=dev)
+	cov  = robust_atm_cov(tod, dev=dev)
+	E, V = top_eigs(cov, eig_lim=eig_lim, dev=dev)
+	#gapfill_eigvecs(tod, pcut, V, E, dev=dev)
+	gapfill_eigvecs_iterative(tod, pcut, V, dev=dev)

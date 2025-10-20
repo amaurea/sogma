@@ -3,7 +3,7 @@ from pixell import config, utils, enmap, ephem, pointsrcs
 from . import pmat, tiling, device, socut
 
 config.default("autocut",       "objects", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut.")
-config.default("object_cut",    "planets:30,asteroids:5")
+config.default("object_cut",    "planets:10,asteroids:5")
 config.default("planet_list",   "Mercury,Venus,Mars,Jupiter,Saturn,Uranus,Neptune", "What planets the 'planets' keyword in object_cut expands to")
 # Vesta has a peak brightness of 1 Jy @f150. These asteroids get within 4% of that
 # (40 mJy) at some point in their orbit by extrapolation. This is the 5σ forecasted
@@ -25,7 +25,7 @@ def autocut(obs, which=None, geo=None, dev=None):
 	for i, cutname in enumerate(which):
 		cuts.append(cutfuns[cutname](obs, geo=geo, dev=dev))
 	cuts = socut.Simplecut.merge(cuts)
-	cuts.gapfill(obs.tod, dev=dev)
+	#cuts.gapfill(obs.tod, dev=dev)
 	obs.cuts = cuts
 	return obs
 

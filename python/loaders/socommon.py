@@ -196,7 +196,8 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 	# Filter on tags
 	if len(qtags) > 0:
 		# I tried exists too, but it was much slower
-		query += " and obs_id in (select obs_id from tags where " + " and ".join(qtags) + ")"
+		for qtag in qtags:
+			query += " and obs_id in (select obs_id from tags where %s)" % qtag
 	# Add default OPTC (non-dark) detector selection
 	if not det_type_set and "det_type" in cols:
 		query += " and (det_type = 'OPTC')"

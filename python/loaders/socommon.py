@@ -119,7 +119,6 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 	else:              bandsel = lambda ftag, flavor: "(tube_flavor = '%s')" % flavor
 	# 3. Loop through all referenced fields, and expand them if necessary.
 	otoks = []
-	qtags = []
 	prep_sel = {"set": False, "good": True, "bad": False}
 	for tok, isname in fieldname_iter(query):
 		# Split out unary op
@@ -160,21 +159,19 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		elif tok == "tcorot": tok = "1749513600"
 		# Don't interpret columns as tags if they conflict
 		elif tok in cols: pass
-		# Finally handle tags. These must be alone, not part of
-		# value comparisons, but they can be negated.
+		# Actual tags
+		elif tok in tags:
+			tok = tag_op("(obs_id in (select obs_id from tags where (tag = '%s')))" % tok, op)
+		# Planet pseudo-tag
+		elif tok == "planet":
+			# The or 0 handles the case where there are no planets defined
+			sel = "(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)"
+			tok = tag_op("(obs_id in (select obs_id from tags where %s))" % sel, op)
 		else:
-			# negation. This required a hack in the fieldname iterator,
-			# making it treat the ~ as part of the name itself. Ugly.
+			# Stuff that doesn't fit in. These are more limited than the others,
+			# and can't be parts of complicated expressions.
 			eq = "!=" if op in "-~" else "="
-			# Handle normal tags
-			if tok in tags:
-				qtags.append(tag_op("(tag = '%s')" % tok, op))
-			# Handle some pseudo-tags
-			elif tok == "planet":
-				# The or 0 handles the case where there are no planets defined
-				sel = tag_op("(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)", op)
-				qtags.append(sel)
-			elif tok == "good":
+			if tok == "good":
 				if   op == " ": prep_sel["good"], prep_sel["bad"] = True, False
 				elif op == "+": prep_sel["good"] = True
 				elif op == "-": prep_sel["good"] = False
@@ -193,11 +190,6 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 			tok = "1"
 		otoks.append(tok)
 	query = "".join(otoks) if len(otoks) > 0 else "1"
-	# Filter on tags
-	if len(qtags) > 0:
-		# I tried exists too, but it was much slower
-		for qtag in qtags:
-			query += " and obs_id in (select obs_id from tags where %s)" % qtag
 	# Add default OPTC (non-dark) detector selection
 	if not det_type_set and "det_type" in cols:
 		query += " and (det_type = 'OPTC')"

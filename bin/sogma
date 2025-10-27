@@ -25,6 +25,7 @@ parser.add_argument(      "--ignore",  type=str, default="recover")
 parser.add_argument("-d", "--dump",    type=str, default="10,20,50,100")
 parser.add_argument("-j", "--joint",   type=str, default="obs")
 parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
+parser.add_argument(      "--tsplit",  type=float, default=None, help="Split obs-groups in time to keep them shorter than this many seconds. See also --split")
 parser.add_argument("-c", "--cont",    action="store_true")
 parser.add_argument(      "--sys",     type=str, default="cel")
 parser.add_argument("-o", "--output",  type=str, default="auto")
@@ -68,7 +69,7 @@ if len(obsinfo) == 0:
 # .bands[nband]      List of bands involved
 # .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
 joint   = loader.group_obs(obsinfo, mode=args.joint)
-joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9)
+joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
 # group selection. Sadly this can't be done with the query-level selection, as that
 # happens before grouping.
 jinds   = eval("list(range(%d))[%s]" % (len(joint.groups),args.sel))

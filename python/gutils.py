@@ -449,14 +449,30 @@ def obs_group_size(obsinfo, groups, inds=None, sampranges=None):
 		nsamps = sampranges[:,1]-sampranges[:,0]
 		return np.array([np.sum(obsinfo.ndet[groups[i]])*nsamps[i] for i in inds])
 
-def time_split(obsinfo, joint, maxsize=500e6):
+def obs_group_dur(obsinfo, groups, inds=None, sampranges=None):
+	if inds is None: inds = np.arange(len(groups))
+	# duration from first member of group. This assumes that a group doesn't
+	# contain multiple time-ranges
+	durs = np.array([obsinfo.dur[groups[i][0]] for i in inds])
+	if sampranges is not None:
+		nsamps = sampranges[:,1]-sampranges[:,0]
+		tfracs = np.array([nsamps[i]/obsinfo.nsamp[groups[i][0]] for i in inds])
+		durs  *= tfracs
+	return durs
+
+def time_split(obsinfo, joint, maxsize=None, maxdur=None):
 	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
 	into subranges so that the total ndet*nsamp size of each is no larger than
 	maxsize. This can be needed due to memory constraints."""
-	# calculate the total size of each group
-	sizes  = obs_group_size(obsinfo, joint.groups, sampranges=joint.sampranges)
-	# number of time splits for each
-	nsplits= utils.floor(sizes/maxsize)+1
+	nsplits = np.ones(len(joint.groups), int)
+	if maxsize is not None:
+		# calculate the total size of each group
+		sizes  = obs_group_size(obsinfo, joint.groups, sampranges=joint.sampranges)
+		# number of time splits for each
+		nsplits= np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
+	if maxdur is not None:
+		durs   = obs_group_dur(obsinfo, joint.groups, sampranges=joint.sampranges)
+		nsplits= np.maximum(nsplits, utils.floor(durs/maxdur)+1)
 	# Do the split
 	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
 		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)

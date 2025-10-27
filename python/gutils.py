@@ -590,3 +590,15 @@ def gapfill_atm(tod, cuts, eig_lim=1e-3, dev=None):
 	E, V = top_eigs(cov, eig_lim=eig_lim, dev=dev)
 	#gapfill_eigvecs(tod, pcut, V, E, dev=dev)
 	gapfill_eigvecs_iterative(tod, pcut, V, dev=dev)
+
+def robust_mean(arr, axis=-1, quantile=0.1):
+	ap  = device.anypy(arr)
+	axis= axis%arr.ndim
+	arr = ap.sort(arr, axis=axis)
+	n   = utils.nint(arr.shape[axis]*quantile)
+	arr = arr[(slice(None),)*axis+(slice(n,-n),)]
+	mean= ap.mean(arr, axis)
+	std = ap.std(arr, axis)
+	ngood = arr.shape[axis]
+	err = std/ngood**0.5
+	return mean, err, ngood

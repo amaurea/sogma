@@ -119,9 +119,9 @@ class NmatUncorr(Nmat):
 	def white(self, tod, inplace=True):
 		self.check_ready()
 		if not inplace: tod = tod.copy()
-		gutils.apply_window(gtod, self.nwin)
+		gutils.apply_window(tod, self.nwin)
 		tod *= self.ivar[:,None]
-		gutils.apply_window(gtod, self.nwin)
+		gutils.apply_window(tod, self.nwin)
 		return tod
 	def write(self, fname):
 		self.check_ready()

@@ -1,7 +1,7 @@
 import numpy as np, os
 import time
-from pixell import utils, bunch, enmap, colors, wcsutils, bench
-from . import nmat, pmat, tiling, gutils, device, autocut
+from pixell import utils, bunch, enmap, colors, wcsutils, bench, config
+from . import nmat, pmat, tiling, gutils, device, socal
 from .logging import L
 
 class MLMapmaker:
@@ -469,7 +469,6 @@ class SignalMapMulti(Signal):
 	valid_outputs = SignalMap.valid_outputs
 
 class SignalCutFull(Signal):
-	# Placeholder for when we have a gpu implementation
 	def __init__(self, comm, dev=None, name="cut", ofmt="{name}_{rank:02}", dtype=np.float32,
 			outputs=[]):
 		"""Signal for handling the ML solution for the values of the cut samples."""
@@ -618,6 +617,109 @@ class SignalCutPoly(SignalCutFull):
 			return junk.copy()
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
 
+class SignalElMod(Signal):
+	def __init__(self, comm, order=1, dev=None, name="elmod", ofmt="{name}", dtype=np.float32, outputs=["map"]):
+		Signal.__init__(self, name, ofmt, outputs, ext="txt")
+		self.comm  = comm
+		self.dev   = dev or device.get_device()
+		self.order = order
+		self.dtype = dtype
+		self.off   = 0
+		self.rhs   = []
+		self.idiv  = []
+		self.data  = {}
+	def reset(self):
+		Signal.reset(self)
+		self.off   = 0
+		self.rhs   = []
+		self.idiv  = []
+		self.data  = {}
+	def add_obs(self, id, obs, iN, iNd):
+		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
+		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
+		pel     = pmat.PmatElMod(obs.boresight[1], order=self.order, dev=self.dev, dtype=self.dtype)
+		# Build our RHS
+		ndet    = obs.tod.shape[0]
+		ndof    = ndet*self.order
+		obs_rhs = self.dev.np.zeros((ndet,pel.order), self.dtype)
+		pcut.clear(iNd)
+		pel.backward(iNd, obs_rhs)
+		obs_rhs = self.dev.get(obs_rhs)
+		# Build our preconditioner. Fully diagonal for now
+		obs_div = self.dev.np.ones((ndet,pel.order), self.dtype)
+		iNd[:]   = 0
+		pel.forward(iNd, obs_div)
+		#pcut.clear(iNd) # unnecessary since white is diagonal
+		iN.white(iNd)
+		pcut.clear(iNd)
+		pel.backward(iNd, obs_div)
+		obs_idiv = 1/self.dev.get(obs_div) # back to the cpu
+		self.data[id] = bunch.Bunch(pel=pel, ndet=ndet, i1=self.off, i2=self.off+ndof)
+		self.off += ndof
+		self.rhs.append(obs_rhs.reshape(-1))
+		self.idiv.append(obs_idiv.reshape(-1))
+		self.dev.garbage_collect()
+	def prepare(self):
+		"""Process the added observations, determining our degrees of freedom etc.
+		Should be done before calling forward and backward."""
+		if self.ready: return
+		self.rhs = np.concatenate(self.rhs)  if len(self.rhs) > 0 else np.zeros(0, self.dtype)
+		self.idiv= np.concatenate(self.idiv) if len(self.rhs) > 0 else np.zeros(0, self.dtype)
+		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
+		self.ready = True
+	def forward(self, id, gtod, gamp):
+		if id not in self.data: return
+		d = self.data[id]
+		d.pel.forward(gtod, gamp[d.i1:d.i2].reshape((d.ndet,self.order)))
+	def backward(self, id, gtod, gamp):
+		if id not in self.data: return
+		d = self.data[id]
+		d.pel.backward(gtod, gamp[d.i1:d.i2].reshape((d.ndet,self.order)))
+	def precon(self, amp):
+		return amp*self.idiv
+	def to_work  (self, x): return self.dev.np.array(x)
+	def from_work(self, x): return self.dev.get(x)
+	def owork(self): return self.dev.np.zeros(self.rhs.shape, self.rhs.dtype)
+	# have [id][ndet,order] values. Best as just a text file with
+	# one line per tod and columns of det-order?
+	def write(self, prefix, m, tag="map", suffix="", force=False):
+		if not force and tag not in self.outputs: return
+		# Collect info on root node
+		my_ids   = np.array([id for id in self.data])
+		my_ndets = np.array([self.data[id].ndet for id in my_ids])
+		ids      = utils.allgatherv(my_ids,   self.comm)
+		ndets    = utils.allgatherv(my_ndets, self.comm)
+		vals     = utils.allgatherv(m,        self.comm)
+		offs     = utils.cumsum(ndets*self.order, endpoint=True)
+		order    = np.argsort(my_ids)
+		## Conversion from µK/rad to mK/degree
+		#uconv    = 1e-3*utils.degree**np.arange(1, self.order+1)
+		uconv = 1
+		oname = self.ofmt.format(name=self.name)
+		oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
+		if self.comm.rank == 0:
+			with open(oname, "w") as ofile:
+				for i in order:
+					id   = ids[i]
+					amps = vals[offs[i]:offs[i+1]].reshape(ndets[i],self.order)
+					amps*= uconv # unit conversion
+					# Format line
+					msg  = "%s " % id
+					for damps in amps:
+						msg += " %8.5f"*(len(damps)) % tuple(damps)
+					ofile.write(msg + "\n")
+		return oname
+	def written(self, prefix):
+		done  = True
+		for tag in self.outputs:
+			oname = self.ofmt.format(name=self.name)
+			oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
+			done  = done and os.path.exists(oname)
+		return done
+	# "map" means the main output for the signal here, in contrast with
+	# e.g. rhs and ivar. It doesn't mean an actual sky map
+	valid_outputs = ["map"]
+
 # Actually, doing this as an actual Signal might be cleanest.
 # Requries no changes to Mapmaker, make_map, etc.
 # Slightly hacky since it would have no degrees of freedom though.
@@ -686,6 +788,7 @@ class SignalInfo(Signal):
 		# Get the sensitivity per band
 		ubands, order, edges = utils.find_equal_groups_fast(bands)
 		nband     = len(ubands)
+		nperband  = edges[1:]-edges[:-1]
 		# Some of our info fits nicely into a simple per-obs table
 		obstab = np.zeros(nobs, [("id",ids.dtype),("ctime","f"),("dur","f"),
 			("az","f"),("waz","f"),("el","f"),("wel","f"),
@@ -722,9 +825,28 @@ class SignalInfo(Signal):
 			dsens[i,inds] = self.dev.get(row.dsens)
 		res = bunch.Bunch(obstab=obstab, detids=detids, bands=bands, ubands=ubands, dsens=dsens)
 		bunch.write(prefix + "info.hdf", res)
+		# Also write obstab to simple text file, since the info files are a bit tedious to
+		# deal with for quick inspection
+		idlen = max([len(row.id) for row in obstab])
+		with open(prefix + "info.txt", "w") as ofile:
+			msg = "#%*s %10s  %6s %8s %7s %7s %5s %8s %5s " % (idlen-1, "id", "ctime",
+				"dur", "az", "waz", "el", "wel", "roll", "wroll")
+			for bname in ubands:
+				msg += " n%4s %7s" % (bname, "sens")
+			ofile.write(msg + "\n")
+			for row in obstab:
+				msg = "%*s %10.0f  %6.1f %8.3f %7.3f %7.3f %5.3f %8.3f %5.3f " % (
+						idlen, row.id.decode(), row.ctime, row.dur, row.az, row.waz, row.el, row.wel,
+						row.roll, row.wroll,
+				)
+				for bname, nper, bsens in zip(ubands, nperband, row.sens):
+					msg += " %5d %7.3f" % (nper, bsens)
+				ofile.write(msg + "\n")
+
 	valid_outputs = ["info"]
 
 # Mapmaking function
+config.default("taskdist", "semibrute", "Method used to assign tods to mpi tasks")
 def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):
 	if prefix is None: prefix = ""
 	# Skip if we're already done
@@ -741,7 +863,14 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		gfirst = np.array([g[0] for g in joint.groups])
 		# FIXME: This doesn't know about the coordinate system we're using!
 		# It assumes equatorial coordinates.
-		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
+		taskdist = config.get("taskdist")
+		if taskdist == "simple":
+			print("Using simple task distribution. Remember to move default back to semibrute")
+			dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
+		elif taskdist == "semibrute":
+			dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
+		else:
+			raise ValueError("Unrecognized task distribution method '%s'" % str(taskdist))
 		inds = np.where(dist.owner == comm.rank)[0]
 	# Set up exception types we will ignore
 	if   ignore == "all":     etypes, load_catch = (Exception,), "all"
@@ -779,11 +908,13 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		# Autocut and gapfill cost about the same as add_obs, so they definitely
 		# aren't free!
 		t2    = time.time()
-		autocut.autocut(data, dev=dev)
+		socal.autocut(data, dev=dev)
 		# Even eigen-gapfilling leaves big artifacts in the planet cut area.
 		# Not gapfilling, despite the bright planet being there, performs
 		# much better. Should understand why. This worked in ACT
 		#gutils.gapfill_atm(data.tod, data.cuts, dev=dev)
+		# Autocalibration. Controlled by config:elmod_cal
+		socal.elmod_cal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
 		t3    = time.time()
 		try:
 			mapmaker.add_obs(name, data, deslope=False)
@@ -793,7 +924,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		dev.garbage_collect()
 		del data
 		t4    = time.time()
-		L.print("Processed %s in %6.3f. Read %6.3f Autocut %6.3f Add %6.3f" % (name, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
+		L.print("Processed %s in %6.3f. Read %6.3f Autocal %6.3f Add %6.3f" % (name, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
 
 	nobs = comm.allreduce(len(mapmaker.data))
 	if nobs == 0:

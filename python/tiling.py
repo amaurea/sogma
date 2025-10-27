@@ -413,6 +413,12 @@ def distribute_global_tiles_exposed_simple(loc_cells, comm):
 	owner[mask] = np.arange(nhit)*comm.size//nhit
 	return owner
 
+def distribute_tods_simple(obsinfo, nsplit):
+	return bunch.Bunch(
+		owner   = np.arange(len(obsinfo))%nsplit,
+		weights = np.ones(nsplit),
+	)
+
 def distribute_tods_semibrute(obsinfo, nsplit, npass=2, niter=10, verbose=False):
 	"""Split into nsplit groups such that the groups are
 	are approximately maximally-separated in state-space,

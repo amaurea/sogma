@@ -1,5 +1,5 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
-from pixell import utils, bunch, bench, sqlite
+from pixell import utils, bunch, bench, sqlite, coordsys
 from .. import device, gutils, socut
 from . import socommon
 from .socommon import cmeta_lookup
@@ -303,16 +303,18 @@ class FastMeta:
 			with bench.mark("fm_cuts"):
 				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags"),[(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag"),  [(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag"),      [(0,"dets"),(1,"samps")])
+				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag"),      [(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag"), [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds"), [(0,"dets"),(1,"samps")])
 
-			# Hack: Get the valid detectors. This isn't stored in an
-			# easy-to-access way, but it will be in the "vald" entry
-			# for the last thing to be processed, which we'll just have to
-			# hardcode here for now.
-			good = np.diff(np.concatenate([[0],pl.read("noise_mapmaking/valid/ends")])) > 0
-			#good = np.diff(np.concatenate([[0],pl.read("valid_data/ends")])) > 0
+			# TODO: Remove the noise_mapmaking part once the transition is complete
+			try:
+				good = np.diff(np.concatenate([[0],pl.read("valid_data/ends")])) > 0
+			except KeyError:
+				try:
+					good = np.diff(np.concatenate([[0],pl.read("valid_data/valid_data/ends")])) > 0
+				except KeyError:
+					good = np.diff(np.concatenate([[0],pl.read("noise_mapmaking/valid/ends")])) > 0
 			paman.restrict("dets", paman.dets.vals[good])
 
 		# Eventually we will need to be able to read in sample-ranges.
@@ -407,7 +409,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Merge the cuts. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
 		cuts = socut.Sampcut.merge([meta.aman[name] for name in
-			["cuts_glitch","cuts_2pi","cuts_jump","cuts_slow"]])#,"cuts_turn"]])
+			["cuts_glitch","cuts_2pi","cuts_slow"]])#,"cuts_jump","cuts_turn"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 	# Go to a fourier-friendly length
 	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=dev.lib.fft_factors)*mul
@@ -450,11 +452,14 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] # * meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
 
-	with bench.mark("deproject cosel", tfun=dev.time):
-		elrange = utils.minmax(el[::100])
-		if elrange[1]-elrange[0] > 1*utils.arcmin:
-			print("FIXME deprojecting el")
-			deproject_cosel(signal, el, dev=dev)
+	#with bench.mark("deproject sinel", tfun=dev.time):
+	#	elrange = utils.minmax(el[::100])
+	#	if elrange[1]-elrange[0] > 1*utils.arcmin:
+	#		print("FIXME deprojecting el")
+	#		deproject_sinel(signal, el, dev=dev)
+
+	#with bench.mark("autocal", tfun=dev.time):
+	#	autocal_elmod(signal, el, roll, meta.aman.focal_plane, dev=dev)
 
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
@@ -1075,11 +1080,11 @@ def apply_pointing_model(az, el, roll, model):
 
 # This isn't robust to glitches. Should use a block-median or something
 # if that's a problem
-def deproject_cosel(signal, el, nmode=2, dev=None):
+def deproject_sinel(signal, el, nmode=2, dev=None):
 	ndet, nsamp = signal.shape
 	if dev is None: dev = device.get_device()
-	# Sky signal should go as 1/cos(el)
-	depth = 1/dev.np.cos(dev.np.asarray(el, dtype=signal.dtype))
+	# Sky signal should go as 1/sin(el)
+	depth = 1/dev.np.sin(dev.np.asarray(el, dtype=signal.dtype))
 	# Build a basis
 	depth -= dev.np.mean(depth)
 	B   = dev.np.zeros((nmode,nsamp),signal.dtype)
@@ -1090,17 +1095,85 @@ def deproject_cosel(signal, el, nmode=2, dev=None):
 	for i in range(nmode): B[i] = depth**(i+1)
 	rhs = dev.np.einsum("mi,di->md",B,nmat(signal))
 	div = dev.np.einsum("mi,ni->mn",B,nmat(B))
-	print("div")
-	print(dev.get(div))
 	idiv   = dev.np.linalg.inv(div)
 	coeffs = idiv.dot(rhs)
-	print(dev.get(coeffs))
 	# Subtract the el-dependent parts. signal = -coeffs.T matmul B + signal
 	# But fortran is column-major, so it's -coeffs
-	print(dev.np.std(signal))
 	#utils.call_help(dev.lib.sgemm, "N", "N", nsamp, ndet, nmode, -1, B, B.shape[1], coeffs, coeffs.shape[1], 1, signal, signal.shape[1])
 	signal -= dev.np.einsum("md,mi->di", coeffs, B)
-	print(dev.np.std(signal))
+
+#def autocal_elmod(signal, bel, roll, xieta, nmode=2, bsize=2000, tol=0.1, dev=None):
+#	if dev is None: dev = device.get_device()
+#	assert nmode >= 2, "autocal_elmod needs nmode >= 2. The first two modes are an offset (discarded) and a slope (used for calibration)"
+#	ndet, nsamp = signal.shape
+#	# f (bel) = a * 1/sin(f(bel)) = a * 1/sin(f(bel0)) + a * f'(bel0) * Δbel + ...
+#	# Let's call 1/sin(el) = x, and 1/sin(bel) = bx, and x = g(bx)
+#	# f (bx) = a*g(bx) = a*g(bx0) + a*g'(bx0)*Δbx + ...
+#	# Could expand around middle of xieta instad of boresight, but nice to have
+#	# a standard location for all runs.
+#	bx = 1/np.sin(bel)
+#	# Need d(det_x)/dbx for each detector. Will use finite difference over the whole
+#	# elevation range as representative. We assume constant roll
+#	belrange = utils.minmax(bel)
+#	bx1, bx2 = 1/np.sin(belrange)
+#	roll = np.mean(roll)
+#	x1 = 1/np.sin(calc_det_el(belrange[0], roll, xieta))
+#	x2 = 1/np.sin(calc_det_el(belrange[1], roll, xieta))
+#	gprime = (x2-x1)/(bx2-bx1)
+#	print(gprime)
+#	Δbx = dev.np.array(bx-0.5*(bx1+bx2))
+#	# With this, the tod should be const + a*g'*Δbx in each block
+#	# Build the blocks
+#	nblock = nsamp//bsize
+#	btod   = signal[:,:nblock*bsize].reshape(ndet,nblock,bsize)
+#	bΔbx   = Δbx[:nblock*bsize].reshape(nblock,bsize)
+#	# Build basis
+#	B     = dev.np.zeros((nmode,nblock,bsize), btod.dtype)
+#	B[:]  = bΔbx
+#	for i in range(nmode): B[i] **= i
+#	# Fit in blocks
+#	rhs   = dev.np.einsum("mbs,dbs->bdm", B, btod) # [nblock,ndet,nmode]
+#	div   = dev.np.einsum("mbs,nbs->bmn", B, B)   # [nblock,nmode,nmode]
+#	# Reduce to blocks with healthy determinant
+#	det   = dev.np.linalg.det(div)
+#	good  = det > 0
+#	if dev.np.sum(good) == 0: raise ValueError("elmod calibration failed for all blocks. Is elevation actually varying?")
+#	good  = det > dev.np.median(det[good])*tol
+#	if dev.np.sum(good) == 0: raise ValueError("elmod calibration failed for all blocks. Is elevation actually varying?")
+#	rhs, div = rhs[good], div[good]
+#	# Solve the remaining blocks
+#	idiv  = dev.np.linalg.inv(div)
+#	amps  = dev.np.einsum("bmn,bdn->bdm", idiv, rhs) # [nblock,ndet,nmode]
+#	slope = dev.get(amps[:,:,1]) # µK [nblock,ndet]
+#	# slope = a*g'. Divide out g' to get a
+#	ba    = slope/gprime # µK [nblock,ndet]
+#	# Use blocks to get robust mean and error
+#	a, da = robust_mean(ba, 0)
+#	
+#	np.savetxt("test_elgain.txt", np.array([
+#		a, da, gprime, xieta[:,0], xieta[:,1]]).T, fmt="%15.7e")
+#	np.savetxt("test_elgain_t.txt", ba, fmt="%15.7e")
+#	1/0
+#
+#
+#
+#def calc_det_el(bel, roll, xieta):
+#	bel, roll, xi, eta = np.broadcast_arrays(bel, roll, *xieta.T[:2])
+#	# Boresight
+#	bore = coordsys.Coords(az=bel*0, el=bel, roll=roll)
+#	# Focal plane
+#	q    = coordsys.rotation_xieta(xi, eta)
+#	el   = (bore*q).el
+#	return el
+#
+#def robust_mean(arr, axis=-1, quantile=0.1):
+#	axis= axis%arr.ndim
+#	arr = np.sort(arr, axis=axis)
+#	n   = utils.nint(arr.shape[axis]*quantile)
+#	arr = arr[(slice(None),)*axis+(slice(n,-n),)]
+#	mean= np.mean(arr, axis)
+#	err = np.std(arr, axis)/arr.shape[axis]**0.5
+#	return mean, err
 
 # The idea of this was to effectively gapfill using the
 # common mode. Maybe it could work, but in my test, it

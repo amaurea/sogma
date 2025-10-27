@@ -172,6 +172,53 @@ class PmatCutPoly:
 	def clear(self, tod):
 		self.dev.lib.clear_ranges(tod, self.dets, self.starts, self.lens)
 
+# Basic model is tod = 1/sin(el) * amp. However, getting el[t] for each
+# detector requires a rotation operation, which is wasteful. We know our
+# elevation amplitude will be tiny, so easier to just do an expansion:
+#  tod[d,t] = Δbel[t]*amp[d] + Δbel**2*amp2[d] + ... + n[d,t]
+# Probably no point in keeping more than the 1st order, but easy to keep
+# it general. Would then solve for the amps per detector. There's no
+# zeroth-order term because 1. it would be infinitely noisy, and 2.
+# it's degenerate with the map.
+class PmatElMod:
+	def __init__(self, el, dev=None, order=None, B=None, dtype=np.float32):
+		self.dev   = dev or device.get_device()
+		assert dtype == np.float32, "Only float32 supported"
+		self.dtype = dtype
+		self.nsamp = len(el)
+		# Either construct or use an existing basis
+		if B is None:
+			if order is None: order = 1
+			B = self.dev.np.zeros((order,self.nsamp), self.dtype)
+			# B[0] = Δel
+			el = np.ascontiguousarray(el, dtype=dtype)
+			self.dev.copy(el, B[0])
+			B[0] -= 0.5*(dev.np.max(B[0])+dev.np.min(B[0]))
+			# Fill in any higher orders
+			for i in range(1, order):
+				B[i] = B[0]**(i+1)
+			self.B = B
+		else:
+			assert order is None and bsize is None, "Specify either basis or order, not both"
+			self.B = self.dev.np.asarray(B, dtype=self.dtype)
+		self.order = self.B.shape[0]
+	def forward(self, tod, amps):
+		# tod[d,t] += amps[d,a]*B[a,t]. Remember that sgemm is in Fortran order, so
+		# to it we're doing tod[t,d] += B[t,a]*amps[a,d]
+		ndet, nsamp = tod.shape
+		assert amps.shape == (ndet, self.order)
+		assert amps.flags["C_CONTIGUOUS"]
+		assert tod.dtype == self.dtype
+		assert amps.dtype == self.dtype
+		self.dev.lib.sgemm("N", "N", nsamp, ndet, self.order, 1, self.B, nsamp, amps, self.order, 1, tod, nsamp)
+	def backward(self, tod, amps):
+		# amps[d,a] += B[a,t]*tod[d,t] => fortran amps[a,d] += B'[a,t]*tod[t,d]
+		ndet, nsamp = tod.shape
+		assert amps.shape == (ndet, self.order)
+		assert amps.flags["C_CONTIGUOUS"]
+		assert tod.dtype == self.dtype
+		assert amps.dtype == self.dtype
+		self.dev.lib.sgemm("T", "N", self.order, ndet, nsamp, 1, self.B, nsamp, tod, nsamp, 1, amps, self.order)
 
 # Misc
 

@@ -865,7 +865,6 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		# It assumes equatorial coordinates.
 		taskdist = config.get("taskdist")
 		if taskdist == "simple":
-			print("Using simple task distribution. Remember to move default back to semibrute")
 			dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
 		elif taskdist == "semibrute":
 			dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
@@ -898,7 +897,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		try:
 			data = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch)
 		except etypes as e:
-			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
+			L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
 			continue
 		if len(data.errors) > 0:
 			# Partial skip
@@ -919,12 +918,12 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		try:
 			mapmaker.add_obs(name, data, deslope=False)
 		except etypes as e:
-			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
+			L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
 			continue
 		dev.garbage_collect()
 		del data
 		t4    = time.time()
-		L.print("Processed %s in %6.3f. Read %6.3f Autocal %6.3f Add %6.3f" % (name, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
+		L.print("Processed %d %s in %6.3f. Read %6.3f Autocal %6.3f Add %6.3f" % (ind, name, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
 
 	nobs = comm.allreduce(len(mapmaker.data))
 	if nobs == 0:

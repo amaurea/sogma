@@ -1,18 +1,10 @@
 import numpy as np, os
 from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch
-from . import pmat, tiling, device, socut, gutils
+from . import pmat, tiling, device, socut, gutils, soeph
 
 config.default("autocut",       "objects", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut.")
 config.default("object_cut",    "planets:10,asteroids:5")
-config.default("planet_list",   "Mercury,Venus,Mars,Jupiter,Saturn,Uranus,Neptune", "What planets the 'planets' keyword in object_cut expands to")
-# Vesta has a peak brightness of 1 Jy @f150. These asteroids get within 4% of that
-# (40 mJy) at some point in their orbit by extrapolation. This is the 5σ forecasted
-# depth-1 sensitivity at f150, and would be even weaker after dilution from multile
-# exposures, so this should be a safe level without cutting too much.
-config.default("asteroid_list", "Vesta,Ceres,Pallas,Juno,Eunomia,Hebe,Iris,Pluto,Eris,Amphitrite,Makemake,Hygiea,Herculina,Metis,Flora,Dembowska,Melpomene,Haumea,Psyche,Laetitia,Massalia", "What asteroids the 'asteroids' keyword in object_cut expands to")
-# This should probably support variables like $SOPATH to be less system specific
-# os.path.expandvars is good for this
-config.default("asteroid_path", "/global/cfs/cdirs/sobs/users/sigurdkn/ephemerides/objects")
+# planetas and asteroids defined in sogma.soeph
 
 def autocut(obs, which=None, geo=None, dev=None):
 	"""Main driver. Performs all autocuts, merges them with any existing cuts,
@@ -32,7 +24,6 @@ def autocut(obs, which=None, geo=None, dev=None):
 def object_cut(obs, object_list=None, geo=None, down=8, base_res=0.5*utils.arcmin,
 		dt=100, dr=1*utils.arcsec, dev=None):
 	if dev is None: dev = device.get_device()
-	setup_ephem()
 	object_list = get_object_list(object_list)
 	# Set up a low-resolution geometry, either by downgrading a given geometry
 	# of by downgrading a fullsky geometry with the base_res resolution.
@@ -257,16 +248,6 @@ def get_object_list(object_list=None, planet_list=None, asteroid_list=None, dedu
 	if dedup:
 		res = keep_last(res)
 	return res
-
-ephem_setup_done = False
-def setup_ephem(asteroid_path=None):
-	global ephem_setup_done
-	if ephem_setup_done: return
-	asteroid_path = os.path.expandvars(config.get("asteroid_path", asteroid_path))
-	if not asteroid_path: return
-	astephem = ephem.PrecompEphem(asteroid_path)
-	ephem.add(astephem)
-	ephem_setup_done = True
 
 # Small utils below
 

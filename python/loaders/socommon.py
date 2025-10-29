@@ -1,6 +1,6 @@
 # Things used by both sofast and soslow
 import re, numpy as np, warnings, os, yaml, contextlib
-from pixell import utils, sqlite, bunch
+from pixell import utils, sqlite, bunch, config
 from .. import device
 
 def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, pre_cols=None, subobs=True, _obslist=None):
@@ -372,7 +372,7 @@ def load_obslist(fname):
 
 
 # Python functions we will recognize
-_pyfuncs = ["hits"]
+_pyfuncs = ["hits","maxel","minel"]
 def contains_pyfuncs(s):
 	for pyfunc in _pyfuncs:
 		if pyfunc + "(" in s:
@@ -635,17 +635,24 @@ def poly_interpol(x, xp, yp):
 
 def eval_pycode(pycode, obsinfo):
 	if not pycode: return np.ones(len(obsinfo), bool)
-	def pycode_hits(ra, dec=None):
+	def pycode_hits(ra, dec=None, r=1):
 		if isinstance(ra, str):
 			# Special case: 'gal'. The optional second argument gives the min
 			# galactic latitude
-			if ra == "gal": return gal_hit(obsinfo.sweep, obsinfo.dur, obsinfo.r, minlat=dec)
+			if ra == "gal": return gal_hit(obsinfo.sweep, obsinfo.dur, obsinfo.r, minlat=dec, pad=r*utils.degree)
 			# For a planet name, we look up the planet position and continue on to the
 			# standard point hit
 			else: pos = planet_pos(ra, obsinfo)
 		else: pos = np.array([ra,dec])*utils.degree
-		return point_hit(pos, obsinfo.sweep, obsinfo.dur, obsinfo.r)
+		return point_hit(pos, obsinfo.sweep, obsinfo.dur, obsinfo.r, pad=r*utils.degree)
 	def pycode_planet(name): return planet_pos(name, obsinfo)
+	def pycode_maxel(name, dec=None):
+		return np.max(hor_helper(name, obsinfo, dec=dec).el, (0,1))
+	def pycode_minel(name, dec=None):
+		return np.min(hor_helper(name, obsinfo, dec=dec).el, (0,1))
+	# Would be nice to be able to do just hor(planet(name))[1]>0 to get tods
+	# where some object is above the horizon, but they move too quickly
+	# in these coordinates. Will instead make the more specialized maxel and minel
 	globs = {}
 	# Make numpy available, both with and without np
 	globs.update(**vars(np))
@@ -653,25 +660,34 @@ def eval_pycode(pycode, obsinfo):
 	# Register our function
 	globs["hits"]   = pycode_hits
 	globs["planet"] = pycode_planet
+	globs["maxel"]  = pycode_maxel
+	globs["minel"]  = pycode_minel
 	return eval(pycode, globs)
 
-planet_names = ["mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune", "sun", "moon"]
-
 def planet_pos(name, obsinfo):
-	import astropy.time, astropy.coordinates
+	from pixell import ephem
 	name = name.lower()
-	if name == "planet": names = planet_names
-	else: names = name.split(",")
+	if   name == "planet":   name = config.get("planet_list")
+	elif name == "asteroid": name = config.get("asteroid_list")
+	names = name.split(",")
 	poss = []
 	for name in names:
-		if name in astropy.coordinates.solar_system_ephemeris.bodies:
-			t   = astropy.time.Time(obsinfo.ctime, format="unix")
-			obj = astropy.coordinates.get_body(name, t)
-			pos = np.array([obj.ra.radian, obj.dec.radian]).T
-		else:
-			raise ValueError("Unrecognized body '%s'" % str(name))
+		pos = ephem.eval(name, obsinfo.ctime)[0]
 		poss.append(pos)
-	return np.array(poss)
+	return np.array(poss) # [nplanet,nobs,{ra,dec}]
+
+def hor_helper(name, obsinfo, dec=None):
+	from pixell import coordsys
+	if isinstance(name, str):
+		pos = planet_pos(name, obsinfo) # [nplanet,nobs,{ra,dec}]
+	else:
+		ra  = float(name)*utils.degree
+		dec = float(dec)*utils.degree
+		pos = np.array([ra,dec])[None,None]
+	pos  = coordsys.Coords(ra=pos[...,0], dec=pos[...,1])
+	times = np.array([obsinfo.ctime,obsinfo.ctime+obsinfo.dur])[:,None,:] # [2,*,nobs]
+	hpos = coordsys.transform("equ", "hor", pos, ctime=times)
+	return hpos # [2,*,nobs]
 
 # Result-set workaround
 def resultset_subset(resultset, inds):

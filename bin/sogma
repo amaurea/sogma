@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import numpy as np, os, time, sys
 from pixell import config, enmap, utils, mpi, colors, bench
-from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
+from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils, soeph
 # Have to do all imports that could contain configuration before
 # building config.ArgumentParser because these may define variables.
 # This means we can't bail out early when called with wrong arguments;
@@ -57,6 +57,8 @@ bench.set_tfun(dev.time)
 # Set up our memory pools. This shouldn't be necessary if I make
 # the interface a bit nicer
 dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
+# Register ephemerides
+soeph.setup()
 # Set up our data loader
 loader  = loading.Loader(args.context, type=args.loader, dev=dev)
 obsinfo = loader.query(args.query)

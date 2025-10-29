@@ -12,7 +12,7 @@ class Simplecut:
 		self.starts = np.asarray(starts, np.int32)
 		self.lens   = np.asarray(lens,   np.int32)
 		self.nsamp  = nsamp # not *really* necessary, but nice to have
-		self.ndet   = ndet or np.max(self.dets)+1
+		self.ndet   = ndet if ndet is not None else np.max(self.dets)+1
 	@property
 	def shape(self): return (self.ndet, self.nsamp)
 	@property

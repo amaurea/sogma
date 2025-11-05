@@ -134,21 +134,21 @@ class NmatUncorr(Nmat):
 		return NmatUncorr(spacing=data.spacing, nbin=data.nbin, nmin=data.nmin, bins=data.bins, ips_binned=data.ips_binned, ivar=data.ivar, window=window, nwin=nwin, dev=dev)
 
 class NmatWhite(Nmat):
-	def __init__(self, ivar=None, nwin=0, bsize=256, window=2, dev=None):
+	def __init__(self, ivar=None, bsize=256, nwin=0, dev=None):
 		self.dev   = dev or device.get_device()
 		self.bsize = bsize
-		self.window= window
 		self.ivar  = ivar
 		self.nwin  = nwin
+		if self.ivar is not None:
+			self.ivar = self.dev.np.asarray(self.ivar)
 		self.ready = ivar is not None
 	def build(self, tod, srate, **kwargs):
 		nsamp  = tod.shape[1]
 		nblock = nsamp//self.bsize
-		nwin   = utils.nint(self.window*srate)
 		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
 		with utils.nowarn():
 			ivar = utils.without_nan(1/var)
-		return NmatWhite(ivar=ivar, nwin=nwin, bsize=self.bsize, window=self.window, dev=self.dev)
+		return NmatWhite(ivar=ivar, bsize=self.bsize, nwin=self.nwin, dev=self.dev)
 	def apply(self, gtod, inplace=True):
 		self.check_ready()
 		if not inplace: gtod.copy()
@@ -158,12 +158,9 @@ class NmatWhite(Nmat):
 		return gtod
 	def white(self, tod, inplace=True): return self.apply(tod, inplace=inplace)
 	def write(self, fname):
-		bunch.write(fname, bunch.Bunch(type="NmatWhite"))
+		bunch.write(fname, bunch.Bunch(type="NmatWhite", bsize=self.bsize, nwin=self.nwin, ivar=self.dev.get(self.ivar)))
 	@staticmethod
-	def from_bunch(data, dev=None): return NmatWhite(ivar=data.ivar, dev=dev)
-	def check_ready(self):
-		if not self.ready:
-			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
+	def from_bunch(data, dev=None): return NmatWhite(ivar=data.ivar, nwin=data.nwin, dev=dev)
 
 class NmatDetvecs(Nmat):
 	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
@@ -325,7 +322,7 @@ class NmatAdaptive(Nmat):
 			bsmooth=50, atm_res=2**(1/4), maxmodes=100, dev=None,
 			hbmps=None, bsize_mean=None, bsize_per=None,
 			bins=None, iD=None, iE=None, V=None, Kh=None, ivar=None, nwin=None,
-			normexp=-1):
+			nsamp=None, normexp=-1):
 		self.dev = dev or device.get_device()
 		self.eig_lim    = eig_lim
 		self.single_lim = single_lim
@@ -340,6 +337,7 @@ class NmatAdaptive(Nmat):
 		self.bsize_per  = bsize_per
 		self.bins       = bins
 		self.nwin       = nwin
+		self.nsamp      = nsamp
 		self.ready = all([a is not None for a in [bsize_mean,bsize_per,hbmps,bins,iD,iE,V,Kh,ivar,nwin]])
 		if self.ready:
 			self.iD   = dev.np.ascontiguousarray(iD)
@@ -361,7 +359,7 @@ class NmatAdaptive(Nmat):
 		nfreq       = nsamp//2+1
 		# Apply window in-place, to prefpare for fft
 		gutils.apply_window(tod, nwin)
-		ftod = self.dev.pools["fft"].empty((ndet,nfreq), utils.complex_dtype(tod.dtype))
+		ftod = self.dev.pools["ft"].empty((ndet,nfreq), utils.complex_dtype(tod.dtype))
 		self.dev.lib.rfft(tod, ftod)
 		# Normalize to avoid 32-bit overflow in atmospheric region.
 		# Make sure apply and ivar are consistent
@@ -470,7 +468,8 @@ class NmatAdaptive(Nmat):
 			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
 			maxmodes=self.maxmodes, dev=self.dev,
 			hbmps=hbmps, bsize_mean=bsize_mean, bsize_per=bsize_per,
-			bins=bins, iD=iD, iE=iE, V=power.Vs, Kh=Kh, ivar=ivar, nwin=nwin, normexp=self.normexp)
+			bins=bins, iD=iD, iE=iE, V=power.Vs, Kh=Kh, ivar=ivar, nwin=nwin,
+			nsamp=nsamp, normexp=self.normexp)
 	def apply(self, tod, inplace=True, nofft=False):
 		self.check_ready()
 		t1 = self.dev.time()
@@ -585,14 +584,70 @@ class NmatAdaptive(Nmat):
 			iK = self.dev.np.diag(iE[bi]) + self.V[bi].T.dot(iD[bi,:,None] * self.V[bi])
 			Kh.append(np.linalg.cholesky(self.dev.np.linalg.inv(iK)))
 		ivar  = 1/self.ivar
-		hbmps = 1/self.hbmps
+		hbmps = 1/self.nsamp/self.hbmps
 		return NmatAdaptive(
 			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
 			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
 			maxmodes=self.maxmodes, dev=self.dev, hbmps=hbmps,
 			bsize_mean=self.bsize_mean, bsize_per=self.bsize_per,
 			bins=self.bins, iD=iD, iE=iE, V=self.V,
-			Kh=Kh, ivar=ivar, nwin=self.nwin, normexp=self.normexp)
+			Kh=Kh, ivar=ivar, nwin=self.nwin, nsamp=self.nsamp, normexp=self.normexp)
+
+class PseudoNmatGapfill(Nmat):
+	def __init__(self, mask, sys="equ,on=saturn", bsize=256, ivar=None, cuts=None, srate=None, buf="model", dev=None):
+		self.dev   = dev or device.get_device()
+		assert mask.ndim == 3 and mask.shape[0] == 3 and mask.dtype == np.float32
+		self.mask  = mask
+		self.sys   = sys
+		self.bsize = bsize
+		self.buf   = buf
+		self.nwin  = 0
+		self.srate = srate
+		self.ivar  = None if ivar is None else self.dev.np.asarray(ivar)
+		self.cuts  = cuts
+	@property
+	def ready(self): return self.ivar is not None and self.cuts is not None and self.srate is not None
+	def build(self, tod, srate, obs, **kwargs):
+		# First measure the white noise level
+		nsamp  = tod.shape[1]
+		nblock = nsamp//self.bsize
+		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
+		with utils.nowarn():
+			ivar = utils.without_nan(1/var)
+		# Then build our cut object. Very similar to socal.object_cut, but it didn't quite
+		# match what I wanted here. It didn't allow one to specify a coordinate system
+		from . import pmat, tiling
+		lmap = tiling.enmap2lmap(self.mask, dev=self.dev)
+		pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight,
+			obs.point_offset, obs.polangle, sys=self.sys, partial=True, dev=self.dev)
+		wtod = self.dev.pools["ft"].empty(tod.shape, tod.dtype)
+		pmap.forward(wtod, lmap.lmap)
+		# turn non-zero values into a cuts object
+		from . import socal
+		cuts = socal.mask2cut(wtod, dev=self.dev)
+		return PseudoNmatGapfill(mask=self.mask, sys=self.sys, bsize=self.bsize,
+			ivar=ivar, cuts=cuts, srate=srate, buf=self.buf, dev=self.dev)
+	def apply(self, tod, inplace=True):
+		"""Doesn't actually act like multiplying by a noise matrix.
+		Instead it uses the areas outside the mask to predict and subtract the
+		correlated noise inside the mask"""
+		self.check_ready()
+		if not inplace: tod.copy()
+		# Build our gapfilled model
+		model = self.dev.pools[self.buf].array(tod)
+		gutils.gapfill_svd(model, self.cuts, srate=self.srate)
+		# subtract prediction from tod to clean the atmosphere
+		tod -= model
+		return tod
+	def white(self, tod, inplace=True):
+		# This is the only part of this "Nmat" that actually acts as a noise matrix
+		self.check_ready()
+		if not inplace: gtod.copy()
+		gtod *= self.ivar[:,None]
+		return gtod
+	def write(self, fname): return NotImplementedError
+	@staticmethod
+	def from_bunch(data, dev=None): return NotImplementedError
 
 
 #################

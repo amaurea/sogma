@@ -1,5 +1,5 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
-from pixell import utils, bunch, bench, sqlite, coordsys
+from pixell import utils, bunch, bench, sqlite, coordsys, config
 from .. import device, gutils, socut
 from . import socommon
 from .socommon import cmeta_lookup
@@ -196,6 +196,7 @@ class SoFastLoader:
 	def group_obs(self, obsinfo, mode="obs"):
 		return socommon.group_obs(obsinfo, mode=mode)
 
+config.default("cuts_optional", False, "If true, it's not an error for the expected cuts to be missing from the preprocess database")
 class FastMeta:
 	def __init__(self, context):
 		from sotodlib import core
@@ -301,11 +302,12 @@ class FastMeta:
 					# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
 					paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
 			with bench.mark("fm_cuts"):
-				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags"),[(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag"),  [(0,"dets"),(1,"samps")])
-				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag"),      [(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag"), [(0,"dets"),(1,"samps")])
-				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds"), [(0,"dets"),(1,"samps")])
+				optional = config.get("cuts_optional")
+				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags", optional=optional),[(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag", optional=optional),  [(0,"dets"),(1,"samps")])
+				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag", optional=optional),      [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
+				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional=optional), [(0,"dets"),(1,"samps")])
 
 			# TODO: Remove the noise_mapmaking part once the transition is complete
 			try:
@@ -859,11 +861,15 @@ def get_fplane_extent(focal_plane):
 	rad = np.max(utils.angdist(focal_plane[:,:2],mid[:,None]))
 	return mid, rad
 
-def read_cuts(pl, path):
-	shape     = pl.read(path + "/shape")
-	edges     = pl.read(path + "/ends")
-	intervals = pl.read(path + "/intervals")
-	return expand_cuts_sampcut(shape, edges, intervals, inds = pl.inds)
+def read_cuts(pl, path, optional=False):
+	catch = KeyError if optional else ()
+	try:
+		shape     = pl.read(path + "/shape")
+		edges     = pl.read(path + "/ends")
+		intervals = pl.read(path + "/intervals")
+		return expand_cuts_sampcut(shape, edges, intervals, inds = pl.inds)
+	except catch:
+		return socut.Sampcut.empty(pl.ndet, pl.nsamp)
 
 def expand_cuts_sampcut(shape, ends, intervals, inds=None):
 	if len(shape) != 2:
@@ -898,6 +904,10 @@ class PrepLoader:
 	def __exit__(self, *args, **kwargs):
 		self.close()
 	def close(self): self.hfile.close()
+	@property
+	def ndet(self): return len(self.dets)
+	@property
+	def nsamp(self): return self.samps[0]
 	def restrict_dets(self, dets):
 		self.inds = utils.find(self.dets, dets)
 	def restrict_samps(self, sel):

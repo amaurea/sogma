@@ -1,4 +1,4 @@
-import numpy as np, os
+import numpy as np, os, warnings
 import time
 from pixell import utils, bunch, enmap, colors, wcsutils, bench, config
 from . import nmat, pmat, tiling, gutils, device, socal
@@ -50,7 +50,7 @@ class MLMapmaker:
 			iN = noise_model
 		else:
 			try:
-				iN = noise_model.build(gtod, srate=srate)
+				iN = noise_model.build(gtod, srate=srate, obs=obs)
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise gutils.RecoverableError(msg)
@@ -167,7 +167,7 @@ class Signal:
 class SignalMap(Signal):
 	"""Signal describing a sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
-			outputs=["map","ivar"], ext="fits", dtype=np.float32, ibuf=None, obuf=None,
+			outputs=["map","ivar"], precon="ivar", ext="fits", dtype=np.float32, ibuf=None, obuf=None,
 			sys=None, interpol=None, autocrop=False):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
 		to equatorial coordinates."""
@@ -182,6 +182,9 @@ class SignalMap(Signal):
 		self.ncomp = 3
 		self.comm  = comm
 		self.autocrop = autocrop
+		if precon not in ["ivar", "div"]:
+			raise ValueError("precon must be 'ivar' or 'div'")
+		self.prec_mode = precon
 		self.dev   = dev or device.get_device()
 		# Set up our internal tiling
 		self.shape,  self.wcs = shape, wcs
@@ -243,15 +246,15 @@ class SignalMap(Signal):
 		self.data[id] = bunch.Bunch(pmap=pmap, pcut=pcut, iN=iN, tod_shape=iNd.shape, tod_dtype=iNd.dtype, ctime=ctime)
 		self.ids.append(id)
 	def calc_hits(self, weight=False, fill=1, name="hits"):
-		"""Calculate the local div or hits map. Tiling must be
-		finalized before we do this. Will need a different function for non-scalar div"""
+		"""Calculate the local ivar or hits map. Tiling must be
+		finalized before we do this."""
 		# Could save one map buffer by calculating these separately,
 		# but that would be slower
 		glhits = self.tiledist.gwmap(buf=self.obuf, dtype=self.dtype) # LocalMap
 		for i, id in enumerate(self.ids):
 			d   = self.data[id]
 			t1  = time.time()
-			tod    = self.dev.pools["tod"].empty(d.tod_shape, d.tod_dtype)
+			tod = self.dev.pools["tod"].empty(d.tod_shape, d.tod_dtype)
 			if isinstance(fill, str):
 				if fill == "time": tod[:] = self.dev.np.array(d.ctime)-self.tref
 				else: raise ValueError("Unrecognized fill '%s'" % fill)
@@ -262,6 +265,29 @@ class SignalMap(Signal):
 			t2  = time.time()
 			L.print("Init map %s %d %6.3f %s" % (name, weight, t2-t1,id), level=2)
 		return glhits
+	def calc_div(self, type="full", weight=True, name="div"):
+		"""Calculate the full [3,3] div map. This is a bit tricker than
+		calc_hits because LocalMaps are always [3]. Se we will return a
+		list of 3 of them"""
+		self.obuf.reset()
+		gldiv = []
+		for ci in range(self.ncomp):
+			imap = self.tiledist.gwmap(buf=self.ibuf, dtype=self.dtype)
+			imap.arr[:,ci] = 1
+			omap = self.tiledist.gwmap(buf=self.obuf, dtype=self.dtype, reset=False)
+			for i, id in enumerate(self.ids):
+				d   = self.data[id]
+				t1  = time.time()
+				tod = self.dev.pools["tod"].empty(d.tod_shape, d.tod_dtype)
+				d.pmap.forward(tod, imap)
+				# d.pcut.clear(tod) # not needed because iN.white is diag
+				if weight: d.iN.white(tod)
+				d.pcut.clear(tod)
+				d.pmap.backward(tod, omap)
+				t2  = time.time()
+				L.print("Init map %s [%d,:] %d %6.3f %s" % (name, ci, weight, t2-t1,id), level=2)
+			gldiv.append(omap)
+		return gldiv
 	def prepare(self):
 		"""Called when we're done adding everything. Sets up the map distribution,
 		degrees of freedom and preconditioner."""
@@ -284,28 +310,39 @@ class SignalMap(Signal):
 		with mybench.mark("red"):
 			if "hits" in self.outputs:
 				self.hits  = self.tiledist.gwmap2dmap(glhits); del glhits
-				self.hits  = self.hits[:,:1]
-		with mybench.mark("div"):
-			gldiv = self.calc_hits(weight=True, name="div")
+				self.hits  = self.hits[:,0]
+		# Build ivar or div. This is a bit messy
+		with mybench.mark("iprec"):
+			if self.prec_mode == "ivar":
+				gliprec = [self.calc_hits(weight=True, name=self.prec_mode)]
+			else:
+				gliprec = self.calc_div(weight=True, name=self.prec_mode)
 			self.dev.garbage_collect()
 		with mybench.mark("red"):
-			self.div   = self.tiledist.gwmap2dmap(gldiv); del gldiv
-			self.div   = self.div[:,:1]
+			self.iprec  = [self.tiledist.gwmap2dmap(a) for a in gliprec]; del gliprec
+			if self.prec_mode == "ivar":
+				self.iprec = self.iprec[0][:,0]  # [ntile,ty,tx]
+				self.ivar  = self.iprec
+			else:
+				self.iprec = np.moveaxis(self.iprec,0,1) # [ntile,3,3,ty,tx]
+				self.ivar  = self.iprec[:,0,0] # still needed for the time-map
 		# Set up our degrees of freedom
 		self.dof   = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
 		with mybench.mark("prec"):
-			self.idiv  = gutils.safe_invert_ivar(self.div)
+			self.prec = gutils.safe_invert_prec(self.iprec)
 		with mybench.mark("misc"):
 			if "time" in self.outputs:
 				gltime     = self.calc_hits(weight=True, fill="time", name="time")
 		with mybench.mark("red"):
 			if "time" in self.outputs:
-				self.tmap  = self.tiledist.gwmap2dmap(gltime)[:,:1]; del gltime
+				self.tmap  = self.tiledist.gwmap2dmap(gltime)[:,0]; del gltime
 		with mybench.mark("misc"):
 			if "time" in self.outputs:
-				self.tmap *= self.idiv
-		L.print("Prep fin %6.3f div %6.3f misc %6.3f red %6.3f prec %6.3f" % tuple([
-			mybench.t_tot[name] for name in ["fin","div","misc","red","prec"]]), level=2)
+				if self.prec_mode == "ivar": var = self.prec
+				else: var = gutils.safe_invert_prec(self.ivar)
+				self.tmap *= var
+		L.print("Prep fin %6.3f iprec %6.3f misc %6.3f red %6.3f prec %6.3f" % tuple([
+			mybench.t_tot[name] for name in ["fin","iprec","misc","red","prec"]]), level=2)
 		self.ready = True
 	def forward(self, id, gtod, glmap, tmul=1):
 		"""map2tod operation. For tiled maps, the map should be in work distribution,
@@ -321,8 +358,8 @@ class SignalMap(Signal):
 		self.data[id].pmap.backward(gtod, glmap)
 	def precalc_setup(self, id, reset_buffer=True): self.data[id].pmap.precalc_setup(reset_buffer=reset_buffer)
 	def precalc_free (self, id): self.data[id].pmap.precalc_free()
-	def precon(self, gmap):
-		return self.idiv * gmap
+	def precon(self, map):
+		return gutils.apply_prec(self.prec, map)
 	def to_work(self, gmap): return self.tiledist.dmap2gwmap(gmap, buf=self.ibuf)
 	def from_work(self, glmap): return self.tiledist.gwmap2dmap(glmap)
 	def owork(self): return self.tiledist.gwmap(self.obuf, dtype=self.dtype)
@@ -344,13 +381,16 @@ class SignalMap(Signal):
 	def write_misc(self, prefix):
 		# Need the if test here despite write also testing, because
 		# we're referring to members that might not exist
-		if "rhs"  in self.outputs: self.write(prefix, self.rhs,           tag="rhs")
-		if "ivar" in self.outputs: self.write(prefix, self.div[:,0],      tag="ivar")
-		if "hits" in self.outputs: self.write(prefix, self.hits[:,0],     tag="hits")
-		if "bin"  in self.outputs: self.write(prefix, self.idiv*self.rhs, tag="bin")
+		if "rhs"  in self.outputs: self.write(prefix, self.rhs,  tag="rhs")
+		if "ivar" in self.outputs: self.write(prefix, self.ivar, tag="ivar")
+		if "div"  in self.outputs:
+			if self.prec_mode == "div": self.write(prefix, self.iprec,  tag="div")
+			else: warnings.warn("Cannot output div: Not calculated with precon '%s'" % str(self.prec_mode))
+		if "hits" in self.outputs: self.write(prefix, self.hits, tag="hits")
+		if "bin"  in self.outputs: self.write(prefix, self.precon(self.rhs), tag="bin")
 		if "time" in self.outputs:
-			self.write(prefix, self.tmap[:,0], tag="time", extra={"TREF":self.tref})
-	valid_outputs = ["map","ivar","hits","bin","rhs","time"]
+			self.write(prefix, self.tmap, tag="time", extra={"TREF":self.tref})
+	valid_outputs = ["map","ivar","hits","bin","rhs","div","time"]
 
 # What do we need for multi-band mapmaking?
 # Just loop over SignalMaps, but override their TileDistribution
@@ -359,10 +399,10 @@ class SignalMap(Signal):
 class SignalMapMulti(Signal):
 	"""Signal describing a multiband sky map."""
 	def __init__(self, shape, wcs, bands, comm, dev=None, name="sky", ofmt="{name}", outputs=["map","ivar"],
-			ext="fits", dtype=np.float32, ibuf=None, obuf=None, sys=None, interpol=None, autocrop=False):
+			ext="fits", dtype=np.float32, ibuf=None, obuf=None, sys=None, interpol=None, precon="ivar", autocrop=False):
 		self.mapsigs = [
 			SignalMap(shape, wcs, comm, dev=dev, name=band + "_" + name, ofmt=ofmt, outputs=outputs,
-				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, sys=sys, interpol=interpol, autocrop=autocrop)
+				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, sys=sys, interpol=interpol, precon=precon, autocrop=autocrop)
 			for band in bands]
 		# Must happen after self.mapsigs has been created
 		Signal.__init__(self, name, ofmt, outputs, ext)
@@ -940,22 +980,26 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		signal.write_misc(prefix)
 
 	# Solve the equation system
+	step = None
 	for step in mapmaker.solve(maxiter=maxiter, maxerr=maxerr):
 		# Dump if we're in dump-list, or a multiple of the last entry, but not if
 		# we're on the final iteration anyway, since that would be redundant with
 		# the final result
 		will_dump = len(dump) > 0 and (step.i in dump or (dump[-1] != 0 and step.i % dump[-1] == 0)) and step.i != maxiter
-		L.print("CG %4d %15.7e  %6.3f s%s" % (step.i, step.err, step.t, " (write)" if will_dump else ""), id=0, level=1, color=colors.lgreen)
 		if will_dump:
 			for signal, val in zip(mapmaker.signals, step.x):
 				signal.write(prefix, val, suffix="%04d" % step.i)
-	# Write the final result
-	for signal, val in zip(mapmaker.signals, step.x):
-		signal.write(prefix, val)
+		# Safest to print this *after* writing, so the user can safely abort
+		# when they see the message
+		L.print("CG %4d %15.7e  %6.3f s%s" % (step.i, step.err, step.t, " (write)" if will_dump else ""), id=0, level=1, color=colors.lgreen)
+	# Write the final result, unless we didn't do a single CG step
+	if step is not None:
+		for signal, val in zip(mapmaker.signals, step.x):
+			signal.write(prefix, val)
 
 def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
-	signals must be COMM_SELF for this to work. TODO: Make this simpler."""
+	signals must be COMM_SELF for this to work."""
 	if joint is None:
 		joint = trivial_joint(obsinfo)
 	if inds is None:

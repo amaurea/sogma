@@ -1,5 +1,5 @@
 import numpy as np
-from pixell import wcsutils, enmap, utils, bunch
+from pixell import wcsutils, enmap, utils, bunch, config
 from scipy import spatial, optimize
 from . import device
 
@@ -215,8 +215,8 @@ class TileDistribution:
 	def dshape(self): return (self.dist.ntile,self.ncomp,self.tshape[0],self.tshape[1])
 	def dmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.dshape, dtype)
 	def wmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.oshape, dtype)
-	def gwmap(self, buf=None, dtype=np.float32):
-		if buf: arr = buf.zeros(self.work.shape, dtype)
+	def gwmap(self, buf=None, dtype=np.float32, reset=True):
+		if buf: arr = buf.zeros(self.work.shape, dtype, reset=reset)
 		else:   arr = self.dev.np.zeros(self.work.shape, dtype)
 		return self.dev.lib.LocalMap(self.work.lp, arr)
 
@@ -358,12 +358,15 @@ def tile_pixbox(pixbox, tshape):
 	tinds[:,:,1] = np.arange(t1[1],t2[1])[None,:]
 	return bunch.Bunch(t1=t1, t2=t2, nty=nty, ntx=ntx, ibox=ibox, tinds=tinds)
 
+config.default("cap_xwrap", 0, "If > 0, artificially cap the horizontal wrapping period of the sky in pixels. Can be useful to get around gpu_mm's limit that xwrap must be <= 64*1024")
 def infer_fullsky_geometry(shape, wcs):
 	"""Given a cylindrical geometry shape,wcs, return the fullsky geometry
 	it is embedded in, as well as the pixel offset of the map relative
 	to this."""
 	owcs = wcs.deepcopy()
 	nx   = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
+	cap  = config.get("cap_xwrap")
+	if cap: nx = min(nx, cap)
 	y1,y2= enmap.sky2pix(shape, wcs, np.array([[-np.pi/2,np.pi/2],[0,0]]))[0]
 	# We want every valid coordinate to have a non-negative y pixel value,
 	# so we don't get anything chopped off or wrapped in this direction.
@@ -530,11 +533,17 @@ def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
 	to construct cuts."""
 	if dev is None: dev = device.get_device()
 	fshape, fwcs, pixbox = infer_fullsky_geometry(map.shape, map.wcs)
+	# Set up the tiling. Have to keep track of the global tiling
+	# and the part we will actually allocate. First the global part
+	nty_full, ntx_full = (np.array(fshape[-2:])+tshape-1)//tshape
+	ncell_full = nty_full*ntx_full
+	# Then the local part
 	tinfo = tile_pixbox(pixbox, tshape)
-	# Allocate our tiles
 	ncell = tinfo.nty*tinfo.ntx
+	# Ok, set up our cell grid. Non-local global cells have offset -1
 	cell_inds = np.arange(ncell).reshape(tinfo.nty,tinfo.ntx).astype(np.int64)
-	cell_offs = cell_inds*(ncomp*tshape[0]*tshape[1])
+	cell_offs = np.full((nty_full, ntx_full), -1, np.int64)
+	cell_offs[tinfo.t1[0]:tinfo.t2[0],tinfo.t1[1]:tinfo.t2[1]] = cell_inds*(ncomp*tshape[0]*tshape[1])
 	# Make a buffer that covers our map and which we can reshape into
 	# our local-map cells later
 	buf = np.zeros((ncomp,tinfo.nty,tshape[0],tinfo.ntx,tshape[1]),map.dtype)

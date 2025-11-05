@@ -22,8 +22,8 @@ class MMDeviceMinimal(device.DeviceCpu):
 		def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 			return fft.rfft(dat, ft=out, axes=axis)
 		self.lib.rfft = rfft
-		def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
-			return fft.irfft(dat, tod=out, axes=axis, normalize=False)
+		def irfft(dat, out=None, axis=-1, n=None, plan=None, plan_cache=None):
+			return fft.irfft(dat, tod=out, axes=axis, n=n, normalize=False)
 		self.lib.irfft = irfft
 		self.lib.fft_factors = [2,3,5,7]
 		# BLAS. May need to find a way to make this more compact if we need
@@ -69,7 +69,8 @@ try:
 			self.lib.clear_ranges    = gpu_mm.clear_ranges
 			# Deglitching
 			self.lib.get_border_means= gpu_mm.get_border_means
-			self.lib.deglitch        = gpu_mm.deglitch
+			self.lib.dejump          = gpu_mm.dejump
+			self.lib.gapfill         = gpu_mm.gapfill
 			# Low-level fft plans
 			self.lib.get_plan_size   = gpu_mm.cufft.get_plan_size
 			self.lib.get_plan_r2c    = gpu_mm.cufft.get_plan_r2c
@@ -83,9 +84,9 @@ try:
 				if plan_cache is None: plan_cache = self.plan_cache
 				return gpu_mm.cufft.rfft(dat, out=out, axis=axis, plan=plan, plan_cache=plan_cache)
 			self.lib.rfft = rfft
-			def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
+			def irfft(dat, out=None, axis=-1, n=None, plan=None, plan_cache=None):
 				if plan_cache is None: plan_cache = self.plan_cache
-				return gpu_mm.cufft.irfft(dat, out=out, axis=axis, plan=plan, plan_cache=plan_cache)
+				return gpu_mm.cufft.irfft(dat, out=out, axis=axis, n=n, plan=plan, plan_cache=plan_cache)
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
 			# Tiling
@@ -179,13 +180,14 @@ try:
 			self.lib.clear_ranges    = cpu_mm.clear_ranges
 			# Deglitching
 			self.lib.get_border_means= cpu_mm.get_border_means
-			self.lib.deglitch        = cpu_mm.deglitch
+			self.lib.dejump          = cpu_mm.dejump
+			self.lib.gapfill         = cpu_mm.gapfill
 			# ffts. No plan caching for now
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				return fft.rfft(dat, ft=out, axes=axis)
 			self.lib.rfft = rfft
-			def irfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
-				return fft.irfft(dat, tod=out, axes=axis, normalize=False)
+			def irfft(dat, out=None, axis=-1, n=None, plan=None, plan_cache=None):
+				return fft.irfft(dat, tod=out, axes=axis, n=n, normalize=False)
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
 			# Tiling

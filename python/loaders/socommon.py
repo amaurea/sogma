@@ -157,6 +157,7 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		elif tok == "nsamp": tok = "n_samples"
 		# Constants
 		elif tok == "tcorot": tok = "1749513600"
+		elif tok == "tfoc2":  tok = "1756684800"
 		# Don't interpret columns as tags if they conflict
 		elif tok in cols: pass
 		# Actual tags

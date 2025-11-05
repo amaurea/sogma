@@ -36,7 +36,7 @@ def object_cut(obs, object_list=None, geo=None, down=8, base_res=0.5*utils.arcmi
 	map  = ephem_map(shape, wcs, object_list, [t1,t2], dt=dt, dr=dr)
 	# map2tod. ft buffer and the pointing buffers are free
 	lmap = tiling.enmap2lmap(map, dev=dev)
-	pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, dev=dev)
+	pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, partial=True, dev=dev)
 	tod  = dev.pools["ft"].zeros(obs.tod.shape, obs.tod.dtype)
 	pmap.forward(tod, lmap.lmap)
 	# turn non-zero values into a cuts object

@@ -1,6 +1,6 @@
 import time, contextlib
 import numpy as np
-from pixell import utils, colors, bunch
+from pixell import utils, colors, bunch, fft
 from . import device
 from .logging import L
 
@@ -24,11 +24,13 @@ def aranges(lens):
 	offs = np.repeat(np.cumsum(np.concatenate([[0],lens[:-1]])), lens)
 	return itot-offs
 
-def cumsum0(vals):
-	res = np.empty(len(vals), vals.dtype)
+def cumsum0(vals, endpoint=False):
+	ap  = device.anypy(vals)
+	res = ap.empty(len(vals)+endpoint, vals.dtype)
 	if res.size == 0: return res
 	res[0] = 0
-	res[1:] = np.cumsum(vals[:-1])
+	if endpoint: res[1:] = ap.cumsum(vals)
+	else:        res[1:] = ap.cumsum(vals[:-1])
 	return res
 
 def split_ranges(dets, starts, lens, maxlen):
@@ -48,6 +50,17 @@ def split_ranges(dets, starts, lens, maxlen):
 	offs2   = (subi+1)*sublen//subns
 	oends   = offs2-offs
 	return odets, ostarts, oends
+
+def mask2range(mask):
+	"""Convert a binary mask [True,True,False,True,...] into
+	a set of ranges [:,{start,stop}]."""
+	# We consider the outside of the array to be False
+	ap     = device.anypy(mask)
+	mask   = ap.concatenate([[False],mask.astype(bool,copy=False),[False]]).astype(np.int8)
+	diffs  = ap.diff(mask)
+	start  = ap.where(diffs>0)[0]
+	stop   = ap.where(diffs<0)[0]
+	return np.array([start,stop]).T
 
 @contextlib.contextmanager
 def leakcheck(dev, msg):
@@ -90,19 +103,93 @@ def leginverses(basis):
 			iBBs[i,j,j] = 1
 	return iBBs
 
+# Fast matrix inverse for 3x3 matrices. Taken from
+# https://www.dr-lex.be/random/matrix-inv.html
+
+def det3(a, axes=(0,1)):
+	"""Determinant of 3x3 matrices. Much faster than np.linalg.det"""
+	ap = device.anypy(a)
+	(a11, a12, a13),(a21,a22,a23),(a31,a32,a33) = ap.moveaxis(a,axes,(0,1))
+	return a11*(a33*a22-a32*a23) - a21*(a33*a12-a32*a13) + a31*(a23*a12-a22*a13)
+
+def inv3(a, axes=(0,1), sym=False, return_det=False):
+	"""Inverse of 3x3 matrices. Much faster than np.linalg.inv"""
+	ap   = device.anypy(a)
+	res  = ap.zeros_like(a)
+	wres = ap.moveaxis(res,axes,(0,1))
+	(a11, a12, a13),(a21,a22,a23),(a31,a32,a33) = ap.moveaxis(a,axes,(0,1))
+	if sym:
+		wres[0,0] =  a22*a33-a23*a23; wres[0,1] = -a12*a33+a13*a23; wres[0,2] =  a12*a23-a13*a22
+		wres[1,0] =        wres[0,1]; wres[1,1] =  a11*a33-a13*a13; wres[1,2] = -a11*a23+a12*a13
+		wres[2,0] =        wres[0,2]; wres[2,1] =        wres[1,2]; wres[2,2] =  a11*a22-a12*a12
+		det = a11*wres[0,0] + a12*wres[0,1] + a13*wres[0,2]
+	else:
+		wres[0,0] =  a33*a22-a32*a23; wres[0,1] = -a33*a12+a32*a13; wres[0,2] =  a23*a12-a22*a13
+		wres[1,0] = -a33*a21+a31*a23; wres[1,1] =  a33*a11-a31*a13; wres[1,2] = -a23*a11+a21*a13
+		wres[2,0] =  a32*a21-a31*a22; wres[2,1] = -a32*a11+a31*a12; wres[2,2] =  a22*a11-a21*a12
+		det = a11*wres[0,0] + a21*wres[0,1] + a31*wres[0,2]
+	wres /= det
+	if return_det: return res, det
+	else: return res
+
 def safe_inv(a):
+	ap = device.anypy(a)
 	with utils.nowarn():
 		res = 1/a
-		res[~np.isfinite(res)] = 0
+		res[~ap.isfinite(res)] = 0
 	return res
 
 def safe_invert_ivar(ivar, tol=1e-6):
+	ap   = device.anypy(ivar)
 	vals = ivar[ivar!=0]
-	ref  = np.mean(vals[::100])
+	ref  = ap.mean(vals[::100])
 	iivar= ivar*0
 	good = ivar>ref*tol
 	iivar[good] = 1/ivar[good]
 	return iivar
+
+# Runs at 0.45 ms per tile on the cpu and 0.03 ms per tile on the gpu.
+# This is much faster than calling the standard linear algebra functions,
+# but still quite slow. The full LAT area has 100k tiles, which would take
+# 45 s on the cpu. Of course, a single mpi task is unlikely to have such
+# a big area, so this is good enough for now.
+def safe_invert_div(div, tol=1e-3):
+	ap   = device.anypy(div)
+	wdiv = ap.array(ap.moveaxis(div, (-4,-3), (0,1)), order="C")
+	with utils.nowarn():
+		# inv3 involves the cube of TT, which can easily overflow, so we must start by
+		# dividing out a typical value. We do this even if norm is zero, which is not
+		# rare. The reason is that setting up masking is slower than just setting the
+		# nans to zero in the end, which has the same effect
+		norm = wdiv[0,0].copy()
+		wdiv /= norm
+		# Ok, we now have a normalized matrix ready to invert
+		inv, det = inv3(wdiv, axes=(0,1), sym=True, return_det=True)
+		# Check if any of the matrices are poorly conditioned.
+		# A maximally healthy div is diag(1,0.5,0.5) after norm,
+		# so its det should be 0.25. We will be inverting the determinant,
+		# so we're in trouble if it's too small. So we will use det << 0.25
+		# as a stand-in for the condition number
+		bad = det < 0.25*tol
+		inv[:,:,bad] = 0
+		inv[0,0,bad] = 1/wdiv[0,0,bad]
+		# Undo the normalization
+		inv /= norm
+		# Reshape to original ordering
+		odiv = ap.moveaxis(inv, (0,1), (-4,-3))
+		ap.nan_to_num(odiv, copy=False, nan=0, posinf=0, neginf=0)
+	return odiv
+
+def safe_invert_prec(prec):
+	if   prec.ndim == 3: return safe_invert_ivar(prec)
+	elif prec.ndim == 5: return safe_invert_div (prec)
+	else: raise ValueError("prec must be [ntile,ty,tx] (ivar form) or [ntile,3,3,ty,tx] (div form)")
+
+def apply_prec(prec, gmap):
+	ap = device.anypy(prec)
+	if   prec.ndim == 3: return prec[:,None]*gmap
+	elif prec.ndim == 5: return ap.einsum("tabyx,tbyx->tayx", prec, gmap)
+	else: raise ValueError("prec must be [ntile,ty,tx] (ivar form) or [ntile,3,3,ty,tx] (div form)")
 
 # Want something like DataSet or AxisManager that's low-overhead
 # while being able to wrap multiple types of data, ideally without
@@ -501,111 +588,390 @@ def select_groups(joint, inds):
 		sampranges=np.array([joint.sampranges[i] for i in inds]),
 		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
 
-def robust_atm_cov(tod, down=200, nmed=10, high=20, dev=None):
-	"""Estimate the atmospheric covariance using a real-space
-	median of means approach. We effecitvely bandpass filter
-	the tod by first downgrading until we reach the atmospheric
-	regime around 1 Hz, and then do a diference samples high
-	apart to highpass filter."""
-	# TODO: Consider replacing median with a masking of cut values,
-	# since the median takes up >90% of the runtime of the function
-	from pixell import bench
+def alloc_rfft(ishape, idtype, axes=[-1], dev=None, pool=None):
+	if dev  is None: dev  = device.get_device()
+	if pool is None: pool = dev.np
+	ctype  = np.result_type(idtype, 0j)
+	oshape = fft.rfft_shape(ishape, axes=axes)
+	ft     = pool.empty(oshape, ctype)
+	return ft
+
+def alloc_irfft(ishape, idtype,  axes=[-1], n=None, dev=None, pool=None):
+	if dev  is None: dev  = device.get_device()
+	if pool is None: pool = dev.np
+	rtype  = np.zeros(1, idtype).real.dtype
+	oshape = fft.irfft_shape(ishape, axes=axes, n=n)
+	tod    = pool.empty(oshape, rtype)
+	return tod
+
+def fourier_resample(itod, otod, normalize=False, nofft=False, ipool=None, opool=None, dev=None):
+	"""Fourier resample itod into otod along the last axis.
+	If normalize=True, then the output will be normalized by dividing by
+	itod.shape[-1]."""
 	if dev is None: dev = device.get_device()
-	dtod   = downgrade(tod, down)
-	nper   = dtod.shape[1]//nmed
-	blocks = dtod[:,:nmed*nper].reshape(-1,nmed,nper)
-	if blocks.shape[1] > high:
-		blocks = blocks[:,high:,:]-blocks[:,:-high,:]
+	norm = itod.shape[-1]
+	# Go to fourier space
+	if nofft:
+		ift, oft = itod, otod
 	else:
-		blocks-= dev.np.mean(blocks,-1)[:,:,None]
-	# Calculate the covariance in each block. Shouldn't be worse
-	# than about 10 MB or so
-	cov    = dev.np.einsum("dbs,ebs->deb", blocks, blocks)
-	# Median across blocks, to avoid outliers. This is the slow step.
-	# Around 300 ms on gpu
-	cov    = dev.np.median(cov,-1)
-	return cov
+		ift = alloc_rfft(itod.shape, itod.dtype, pool=ipool, dev=dev)
+		oft = alloc_rfft(otod.shape, otod.dtype, pool=opool, dev=dev)
+		dev.lib.rfft(itod, ift)
+		if normalize and itod.shape[-1] < otod.shape[-1]:
+			# Chepeast to do the division here
+			ift /= norm
+	# Translate fourier spaces
+	n = min(ift.shape[-1], oft.shape[-1])
+	oft[...,:n] = ift[...,:n]
+	oft[...,n:] = 0
+	# Transform back
+	if not nofft:
+		dev.lib.irfft(oft, otod)
+		if normalize and otod.shape[-1] < itod.shape[-1]:
+			# Chepeast to do the division here
+			otod /= norm
+	return otod
 
-def top_eigs(cov, eig_lim=1e-3, dev=None):
-	# This is surprisingly slow, but the matrix is
-	# quite large
-	if dev is None: dev = device.get_device()
-	E, V = dev.np.linalg.eigh(cov)
-	good = np.where(E>np.max(E)*eig_lim)[0]
-	E, V = E[good], V[:,good]
-	return E, V
-
-def gapfill_eigvecs(tod, pcut, V, E, prior=1e-6, sub_lim=0.25, dev=None):
-	"""Gapfill cut regions of tod by modelling the tod-signal
-	as detector-correlated with covmat VEV' per sample, with
-	samples uncorrelated. The uncut detectors are used to predict
-	the cut samples. The solution is biased towards zero with
-	strength prior/E, which mainly matters when so many detectors
-	are cut that the per-sample system becomes degenerate.
-
-	pcut is an instance of PcutFull.
-
-	Uses the buffer "pointing"
-	"""
-	if dev is None: dev = device.get_device()
-	# Find which samples we need to concern ourselves with
-	mask = dev.pools["ft"].ones(tod.shape, tod.dtype)
-	pcut.clear(tod)
-	pcut.clear(mask)
-	with dev.pools["pointing"].as_allocator():
-		ngood = dev.np.sum(mask,0)
-		sel   = dev.np.where(ngood<tod.shape[0])[0]
-		do_sub = len(sel) < tod.shape[1]*sub_lim
-		if do_sub:
-			# Extract the relevant parts. Hopefully very few samples
-			wtod, wmask = tod[:,sel], mask[:,sel]
-		else:
-			wtod, wmask = tod, mask
-		# Build our equation system
-		rhs  = wtod.T.dot(V)
-		# Sadly, this is split into pairwise operations internally
-		# by cupy.einsum, which results in a temporary of size ndet*nmode*nsamp
-		# being allocated. That defeats the whole point of calling einsum
-		# in the first place!
-		div  = dev.np.einsum("da,ds,db->sab", V, wmask, V)
-		del wtod, wmask
-		# add prior
-		Q    = dev.np.max(E)/E*prior
-		for i, q in enumerate(Q):
-			div[:,i,i] += q
-		# now solve per element. Sadly solve doesn't have an output
-		# argument, so this will allocate
-		amps = dev.np.linalg.solve(div,rhs[:,:,None])[:,:,0] # [nsamp,nmode]
-		del rhs,div
-		# Build our model
-		model = dev.np.einsum("sa,da->ds", amps, V)
-		if do_sub:
-			# Copy over needed parts to tod
-			mask[:,sel] = model
-		else:
-			mask = model
-		vals = dev.np.zeros(pcut.nsamp, tod.dtype)
-	pcut.backward(mask, vals)
-	pcut.forward(tod, vals)
-
-def gapfill_eigvecs_iterative(tod, pcut, V, niter=4, dev=None):
-	if dev is None: dev = device.get_device()
-	# Repeatedly subtract best model, gapfill, and add it back
-	vals  = pcut.backward(tod, clear=False)
-	model = dev.pools["ft"].zeros(tod.shape, tod.dtype)
+def jacobi(tod, op, iop=lambda x:x, niter=4):
+	res = op(tod)
 	for it in range(niter):
-		pcut.forward(tod, vals)
-		amps = V.T.dot(tod)
-		dev.np.dot(V, amps, out=model)
-		pcut.backward(model, vals)
+		res += op(tod-iop(res))
+	return res
 
-def gapfill_atm(tod, cuts, eig_lim=1e-3, dev=None):
-	from . import pmat
-	pcut = pmat.PmatCutFull(cuts, dev=dev)
-	cov  = robust_atm_cov(tod, dev=dev)
-	E, V = top_eigs(cov, eig_lim=eig_lim, dev=dev)
-	#gapfill_eigvecs(tod, pcut, V, E, dev=dev)
-	gapfill_eigvecs_iterative(tod, pcut, V, dev=dev)
+def lowpass(tod, fknee, alpha=-8, srate=1, dev=None, pool=None, inplace=False):
+	if dev is None: dev = device.get_device()
+	if not inplace: tod = tod.copy()
+	ft  = alloc_rfft(tod.shape, tod.dtype, dev=dev, pool=pool)
+	dev.lib.rfft(tod, ft)
+	f   = dev.np.fft.rfftfreq(tod.shape[-1], 1/srate)
+	with utils.nowarn():
+		flt  = (1+(f/fknee)**alpha)**-1
+	ft *= flt / tod.shape[-1]
+	dev.lib.irfft(ft, tod)
+	return tod
+
+def svd_filter(tod, eiglim=1e-3, dev=None):
+	if dev is None: dev = device.get_device()
+	U, S, Vh = dev.np.linalg.svd(tod, full_matrices=False)
+	good     = S>np.max(S)*eiglim
+	return (U[:,good]*S[good]).dot(Vh[good])
+
+def pca1(tod, tol=None, maxiter=1000, verbose=False):
+	"""Extract the largest left principal component of tod"""
+	ap = device.anypy(tod)
+	if tol is None:
+		tol = np.finfo(tod.dtype).resolution
+	def norm(x): return ap.sum(x**2)**.5
+	def normalize(x): return x/norm(x)
+	r = normalize(ap.random.randn(tod.shape[0]).astype(tod.dtype))
+	for i in range(maxiter):
+		s = tod.dot(tod.T.dot(r))
+		λ = ap.dot(r,s)
+		err = norm(r-s/λ)
+		r = normalize(s)
+		if verbose:
+			print("%4d %15.7e" % (i+1, err))
+		if err <= tol: break
+	# Want largest element positive to get consistent sign
+	r *= ap.sign(r[ap.argmax(ap.abs(r))])
+	return r
+
+# Ideas tested:
+# * constrained solution: Slow, memory-expensive. Needs good preconditioenr.
+#   Had overflow issues (fixable)
+# * svd-filter + per-detector ps interpolation: Slow interpolation, but more
+#   importantly, visual inspection showed that the signal was simply not
+#   that predictable. Two different interpolations both looked sensible, but
+#   differed by as much as the linear gapfilling did.
+# * plain common mode. Faster than svd, but at least for multi-band had much
+#   bigger residuals. Didn't test that thoroughly. svd fast enough on gpu.
+# Ended up with just the simple svd. Currently uses two rounds, but
+# only to be extra safe. 1 seems almost indistinguishable.
+
+def gapfill_svd(tod, cut, srate=400, fmax=10, fmin=0.05, niter=2, eiglim=1e-5,
+		ps_bsize=10, dev=None, pool=None):
+	if dev is None: dev = device.get_device()
+	ndet, nsamp = tod.shape
+	# 1. Start with simple gapfilling, so we don't have potentially huge values
+	#    messing things up
+	cut.gapfill(tod)
+	# 2. Downsample to target fmax. This not only greatly reduces our
+	#    resource requirements, it also protects us from whtie noise leakage
+	n     = utils.floor(tod.shape[1]*fmax/(srate/2))
+	dtod  = dev.np.zeros((ndet,n), tod.dtype)
+	fourier_resample(tod, dtod, ipool=pool, dev=dev, normalize=True)
+	dcut  = cut.resample(n)
+	# Iterate over model estimation and gapfilling
+	model = None
+	for it in range(niter):
+		# Redo gapfilling relative to the best model so far
+		if model is not None:
+			dtod = dcut.gapfill(dtod-model)+model
+		work = dtod.copy()
+		# 3. Factor out super-slow modes, which we may be unrepresentative.
+		model   = lowpass(work, fmin, srate=fmax, dev=dev)
+		work   -= model
+		# 4. Subtract svd
+		dsvd   = svd_filter(work, eiglim=eiglim, dev=dev)
+		model += dsvd
+		del dsvd
+	# Resample back to our original resolution, overwriting our input argument
+	fourier_resample(model, tod, opool=pool, dev=dev, normalize=True)
+	return dtod
+
+#def pca1_filter(tod, dev=None):
+#	if dev is None: dev = device.get_device()
+#	V = pca1(tod)
+#	return V[:,None]*V.dot(tod)
+#
+#def mask_wiener(tod, ips, mask, mtol=0.01, cgtol=1e-8, maxiter=100, dev=None):
+#	if dev is None: dev = device.get_device()
+#	norm = np.max(ips)**0.5
+#	iS   = ips/norm**2
+#	d    = tod/norm
+#	iM   = mask*(norm/mtol)
+#	prec = 1/dev.np.max(iM)
+#	# Set up our CG solver. We model the data as
+#	# tod = s + n, where icov(s) = ips and icov(n) = N",
+#	# N" = 0 in masked region and big elsewhere.
+#	# Then (S"+N")ŝ = N"tod
+#	def zip(tod): return tod.reshape(-1)
+#	def unzip(x): return x.reshape(tod.shape)
+#	rhs = zip(iM*d)
+#	def A(x):
+#		x = unzip(x)
+#		res = dev.lib.irfft(iS*dev.lib.rfft(x), n=x.shape[-1])/x.shape[-1] + iM*x
+#		return zip(res)
+#	def precon(x): return x*prec
+#	solver = utils.CG(A, rhs, M=precon)
+#	while solver.i < maxiter and solver.err > cgtol:
+#		solver.step()
+#		print("CG %4d %15.7e" % (solver.i, solver.err))
+#	res  = unzip(solver.x)
+#	res *= norm
+#	return res
+
+# Could model data as d[d,f] = V[d,m]*e[m,f] + u[d,f],
+# where var(e) = E[m,f] and var(u) = U[d,f]. Want to
+# solve for e and u, masked. Rewrite as d = [V 1][e;u] = Px
+# P(x|d) = P(d|x) * P(x)
+# -2logP = (d-Px)'M"(d-Px) + x'X"x
+#        = (x-(P'M"P+X")"P'M"d)'(P'M"P+X")(x-...)
+# So (P'M"P+X")x = P'M"d
+
+#def robust_atm_cov(tod, down=200, nmed=10, high=5, dev=None):
+#	"""Estimate the atmospheric covariance using a real-space
+#	median of means approach. We effecitvely bandpass filter
+#	the tod by first downgrading until we reach the atmospheric
+#	regime around 1 Hz, and then do a diference samples high
+#	apart to highpass filter."""
+#	# TODO: Consider replacing median with a masking of cut values,
+#	# since the median takes up >90% of the runtime of the function
+#	from pixell import bench
+#	if dev is None: dev = device.get_device()
+#	dtod   = downgrade(tod, down)
+#	nper   = dtod.shape[1]//nmed
+#	blocks = dtod[:,:nmed*nper].reshape(-1,nmed,nper)
+#	if blocks.shape[2] > high:
+#		blocks = blocks[:,:,high:]-blocks[:,:,:-high]
+#	else:
+#		blocks-= dev.np.mean(blocks,-1)[:,:,None]
+#	# Calculate the covariance in each block. Shouldn't be worse
+#	# than about 10 MB or so
+#	cov    = dev.np.einsum("dbs,ebs->deb", blocks, blocks)
+#	# Median across blocks, to avoid outliers. This is the slow step.
+#	# Around 300 ms on gpu
+#	cov    = dev.np.median(cov,-1)
+#	return cov
+#
+#def top_eigs(cov, eig_lim=1e-3, dev=None):
+#	# This is surprisingly slow, but the matrix is
+#	# quite large
+#	if dev is None: dev = device.get_device()
+#	E, V = dev.np.linalg.eigh(cov)
+#	good = np.where(E>np.max(E)*eig_lim)[0]
+#	E, V = E[good], V[:,good]
+#	return E, V
+#
+#def gapfill_eigvecs(tod, pcut, V, E, prior=1e-6, sub_lim=0.25, dev=None):
+#	"""Gapfill cut regions of tod by modelling the tod-signal
+#	as detector-correlated with covmat VEV' per sample, with
+#	samples uncorrelated. The uncut detectors are used to predict
+#	the cut samples. The solution is biased towards zero with
+#	strength prior/E, which mainly matters when so many detectors
+#	are cut that the per-sample system becomes degenerate.
+#
+#	pcut is an instance of PcutFull.
+#
+#	Uses the buffer "pointing"
+#	"""
+#	if dev is None: dev = device.get_device()
+#	# Find which samples we need to concern ourselves with
+#	mask = dev.pools["ft"].ones(tod.shape, tod.dtype)
+#	pcut.clear(tod)
+#	pcut.clear(mask)
+#	with dev.pools["pointing"].as_allocator():
+#		ngood = dev.np.sum(mask,0)
+#		sel   = dev.np.where(ngood<tod.shape[0])[0]
+#		do_sub = len(sel) < tod.shape[1]*sub_lim
+#		if do_sub:
+#			# Extract the relevant parts. Hopefully very few samples
+#			wtod, wmask = tod[:,sel], mask[:,sel]
+#		else:
+#			wtod, wmask = tod, mask
+#		# Build our equation system
+#		rhs  = wtod.T.dot(V)
+#		# Sadly, this is split into pairwise operations internally
+#		# by cupy.einsum, which results in a temporary of size ndet*nmode*nsamp
+#		# being allocated. That defeats the whole point of calling einsum
+#		# in the first place!
+#		div  = dev.np.einsum("da,ds,db->sab", V, wmask, V)
+#		del wtod, wmask
+#		# add prior
+#		Q    = dev.np.max(E)/E*prior
+#		for i, q in enumerate(Q):
+#			div[:,i,i] += q
+#		# now solve per element. Sadly solve doesn't have an output
+#		# argument, so this will allocate
+#		amps = dev.np.linalg.solve(div,rhs[:,:,None])[:,:,0] # [nsamp,nmode]
+#		del rhs,div
+#		# Build our model
+#		model = dev.np.einsum("sa,da->ds", amps, V)
+#		if do_sub:
+#			# Copy over needed parts to tod
+#			mask[:,sel] = model
+#		else:
+#			mask = model
+#		vals = dev.np.zeros(pcut.nsamp, tod.dtype)
+#	pcut.backward(mask, vals)
+#	pcut.forward(tod, vals)
+#
+#def gapfill_eigvecs_iterative(tod, pcut, V, niter=4, dev=None):
+#	# This function would be cleaner and faster if we had pgood instead of pcut
+#	if dev is None: dev = device.get_device()
+#	work = dev.pools["ft"].empty(tod.shape, tod.dtype)
+#	for it in range(niter):
+#		amps = V.T.dot(tod)
+#		dev.np.dot(V, amps, out=work)
+#		# extract values in cut region from work, and insert into tod
+#		vals = pcut.backward(work)
+#		pcut.forward(tod, vals)
+#
+## This was supposed to be a faster and simpler version of the ACT
+## atm gapfiller, but it's not working well at all here. It leaves
+## sharp edges and in general isn't a good guess.
+##
+## What could be going wrong?
+## 1. Our plain gapfilling is different here. In ACT we did linear
+##    interpolation, while sogma does dejumping. Maybe doing dejumping
+##    only for the actual jumps would be better, and having linear
+##    interpolation for the rest.
+## 2. ACT built the cov from the full frequency range, diluting the
+##    atm with some white noise. What we're doing here should be better.
+## 3. We have more detectors. That shouldn't be a problem, but
+##    in my tests, restricting to just 500 dets results in much nicer
+##    gapfilling.
+#def gapfill_atm(tod, cuts, eig_lim=1e-3, niter=4, dev=None):
+#	from . import pmat
+#
+#	tod0 = tod.copy()
+#
+#	pcut = pmat.PmatCutFull(cuts, dev=dev)
+#	cov  = robust_atm_cov(tod, dev=dev)
+#	E, V = top_eigs(cov, eig_lim=eig_lim, dev=dev)
+#	#gapfill_eigvecs(tod, pcut, V, E, dev=dev)
+#	gapfill_eigvecs_iterative(tod, pcut, V, niter=niter, dev=dev)
+#
+#	model = downgrade(tod,  10)
+#	tod   = downgrade(tod0, 10)
+#	pcut = pmat.PmatCutFull(cuts, dev=dev)
+#	mask   = dev.np.ones_like(tod0)
+#	pcut.clear(mask)
+#	mask  = downgrade(mask, 10)
+#
+#	bunch.write("test.hdf", bunch.Bunch(
+#		tod=dev.get(tod), model=dev.get(model), cov=dev.get(cov), E=dev.get(E), V=dev.get(V),
+#		mask=dev.get(mask),
+#		cuts=bunch.Bunch(starts=cuts.starts//10, dets=cuts.dets, lens=(cuts.lens+9)//10)))
+#	#1/0
+#
+## assume that both iN and N destroy bufs tod and ft
+## Argh, lots of trouble with this function too.
+## 1. N and iN are not good inverses of each other.
+##    Due to windowing? Or a bug?
+## 2. I'm getting overflow very quickly, even with very mild q.
+##    Both cg and jacobi
+## 3. This really shouldn't be hard to get to work, but should maybe
+##    try another idea first: First do a gap-safe bandpass filter to
+##    isolate the coarse atmosphere. Subtract this as a first approximation.
+##    Then low-pass filter result to get the rest of the atmosphere.
+##    Build covmat of this, then use it to eigen-gapfill.
+##    Then add back in the coarse atmosphere. I think this should be a pretty
+##    good procedure, and if it's all done downsampled then it would be fast
+##    and low-memory. The final model would then be interpolated to the original
+##    resolution. Doing it this way also means we don't need a separate smoothing
+##    step.
+#def gapfill_nmat(tod, cuts, iN, N, q=1, solver="jacobi", niter=10, strict=False, dev=None):
+#	# Solve for the maximum-likelihood values in the cut region,
+#	# given the rest of the data. This is just a wiener filter
+#	#  (N"+M")x = M"d, M" = inf in unmasked, 0 in masked
+#	# Can't actually make it inf, of course. Instead set it to
+#	# q*max(N"). Can then solve with CG, where prec = N. Or use
+#	# simple jacobi iteration
+#	from . import pmat
+#	if dev is None: dev = device.get_device()
+#	if strict: backup = tod.copy()
+#	pcut = pmat.PmatCutFull(cuts, dev=dev)
+#	ref  = dev.np.mean(iN.ivar)
+#	print("solver", solver)
+#	print("A", ref)
+#	def iM(x):
+#		x *= ref*q
+#		pcut.clear(x)
+#		return x
+#	# This function needs a lot of memory for tod-sized buffers, and
+#	# there aren't many free. We'll worry about that later, but may need
+#	# to this downsampled in the end
+#	rhs  = iM(tod.copy())
+#	print("B", dev.np.std(rhs))
+#	def A(x):
+#		tmp = iM(x.copy())
+#		iN.apply(x)
+#		x += tmp
+#		return x
+#	def precon(x):
+#		return N.apply(x)
+#	if solver == "jacobi":
+#		# x    = precon(rhs)
+#		# rhs -= A(x)
+#		# x   += precon(rhs) ...
+#		# Bleh, this buffer juggling is tedious!
+#		x = precon(rhs.copy())
+#		print("C", dev.np.std(x))
+#		for it in range(1,niter):
+#			rhs -= A(x.copy())
+#			print("D", dev.np.std(rhs))
+#			x += precon(rhs.copy())
+#			print("E", dev.np.std(x))
+#	elif solver == "cg":
+#		def zip(tod): return tod.reshape(-1)
+#		def unzip(x): return x.reshape(tod.shape)
+#		def fA(x): return zip(A(unzip(x)))
+#		def myprec(x): return x/ref
+#		cg = utils.CG(A=fA, b=zip(rhs), M=myprec, dot=dev.np.dot)
+#		while cg.i < niter:
+#			print("moo %4d %15.7e" % (cg.i, cg.err))
+#			cg.step()
+#		x = unzip(cg.x)
+#	else: raise ValueError(solver)
+#	# copy target part out
+#	if strict:
+#		tod[:] = backup
+#		vals = pcut.backward(x)
+#		pcut.forward(tod, vals)
+#	else:
+#		tod[:] = x
+#	return tod
 
 def robust_mean(arr, axis=-1, quantile=0.1):
 	ap  = device.anypy(arr)

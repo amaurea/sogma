@@ -13,7 +13,8 @@ class PmatDummy:
 	def precalc_free (self): pass
 
 class PmatMap:
-	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", response=None, ncomp=3, dev=None, dtype=np.float32):
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", response=None,
+			ncomp=3, dev=None, dtype=np.float32, partial=False):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels
 
@@ -32,6 +33,7 @@ class PmatMap:
 		self.ncomp = ncomp
 		self.sys   = sys
 		self.dev   = dev or device.get_device()
+		self.partial  = partial
 		self.response = dev.np.array(response) if response is not None else None
 		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, dtype=dtype, dev=self.dev)
 		self.preplan  = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
@@ -43,7 +45,7 @@ class PmatMap:
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
 		t2 = self.dev.time()
-		self.dev.lib.map2tod(gtod, glmap, pointing, plan, response=self.response)
+		self.dev.lib.map2tod(gtod, glmap, pointing, plan, response=self.response, partial_pixelization=self.partial)
 		t3 = self.dev.time()
 		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gtod
@@ -52,7 +54,7 @@ class PmatMap:
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
 		t2 = self.dev.time()
-		self.dev.lib.tod2map(glmap, gtod, pointing, plan, response=self.response)
+		self.dev.lib.tod2map(glmap, gtod, pointing, plan, response=self.response, partial_pixelization=self.partial)
 		t3 = self.dev.time()
 		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return glmap

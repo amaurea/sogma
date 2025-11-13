@@ -635,7 +635,7 @@ class PseudoNmatGapfill(Nmat):
 		if not inplace: tod.copy()
 		# Build our gapfilled model
 		model = self.dev.pools[self.buf].array(tod)
-		gutils.gapfill_svd(model, self.cuts, srate=self.srate)
+		gutils.estimate_atm_tod(model, self.cuts, srate=self.srate, pool=self.dev.pools["ft"])
 		# subtract prediction from tod to clean the atmosphere
 		tod -= model
 		return tod

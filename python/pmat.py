@@ -13,7 +13,7 @@ class PmatDummy:
 	def precalc_free (self): pass
 
 class PmatMap:
-	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", response=None,
+	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", site=None, response=None,
 			ncomp=3, dev=None, dtype=np.float32, partial=False):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels
@@ -32,10 +32,11 @@ class PmatMap:
 		self.dtype = dtype
 		self.ncomp = ncomp
 		self.sys   = sys
+		self.site  = site
 		self.dev   = dev or device.get_device()
 		self.partial  = partial
 		self.response = dev.np.array(response) if response is not None else None
-		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, dtype=dtype, dev=self.dev)
+		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, site=site, dtype=dtype, dev=self.dev)
 		self.preplan  = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
 		self.pointing = None
 		self.plan     = None
@@ -224,7 +225,7 @@ class PmatElMod:
 
 # Misc
 
-def calc_pointing(ctime, bore, offs, polang, sys="cel", site="so", weather="typical",
+def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typical",
 		dtype=np.float32, use_so3g="auto"):
 	offs, polang = np.asarray(offs), np.asarray(polang)
 	ndet, nsamp = len(offs), bore.shape[1]
@@ -257,7 +258,7 @@ def calc_pointing(ctime, bore, offs, polang, sys="cel", site="so", weather="typi
 
 class PointingFit:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang,
-			subsamp=200, sys="cel", site="so", weather="typical", dtype=np.float64,
+			subsamp=200, sys="cel", site=None, weather="typical", dtype=np.float64,
 			nt=1, nx=3, ny=3, store_basis=False, positive_x=False, dev=None):
 		"""Jon's polynomial pointing fit. This predicts each detector's celestial
 		coordinates based on the array center's celestial coordinates. The model
@@ -300,10 +301,10 @@ class PointingFit:
 		#self.p0 = enmap.pix2sky(shape, wcs, [0,0]) # [{dec,ra}]
 		self.dp = wcs.wcs.cdelt[::-1]*utils.degree # [{dec,ra}]
 		# 3. Calculate the full pointing for the reference pixel
-		ref_pixs = self.dev.np.array(self.eval_exact(ctime, bore, off0[None], [0])[:,0])
+		ref_pixs = self.dev.np.array(self.eval_exact(ctime, bore, off0[None], [0], site=self.site)[:,0])
 		# 4. Calculate a sparse pointing for the individual detectors
 		# [{y,x,psi},ndet,nsamp]
-		det_pixs = self.dev.np.array(self.eval_exact(ctime[::subsamp], bore[:,::subsamp], offs, polang))
+		det_pixs = self.dev.np.array(self.eval_exact(ctime[::subsamp], bore[:,::subsamp], offs, polang, site=self.site))
 		# 4b. Add multiples of the sky wrapping so all x pixels are positive.
 		# This is useful if we do map-space wrapping instead of per-sample wrapping
 		if positive_x:

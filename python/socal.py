@@ -1,27 +1,33 @@
 import numpy as np, os
-from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch
+from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch, colors
 from . import pmat, tiling, device, socut, gutils, soeph
+from .logging import L
 
-config.default("autocut",       "objects", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut.")
+config.default("autocut",       "objects,sidelobes", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut. sidelobes: The sidelobe cut")
 config.default("object_cut",    "planets:10,asteroids:5")
 # planetas and asteroids defined in sogma.soeph
 
-def autocut(obs, which=None, geo=None, dev=None):
+# TODO: site should be a part of the observation. Add it and
+# update the functions here, and those in SignalMap, to use it
+# in the pointing
+
+def autocut(obs, id="?", which=None, geo=None, dev=None):
 	"""Main driver. Performs all autocuts, merges them with any existing cuts,
 	updates obs and gpfills tod"""
 	if dev is None: dev = device.get_device()
-	which   = config.get("autocut", which).split(",")
-	cutfuns = {"objects": object_cut}
-	if len(which) == 0: return obs
+	which   = config.get("autocut", which)
+	if which == "none" or len(which) == 0: return obs
+	which   = which.split(",")
+	cutfuns = {"objects": object_cut, "sidelobes": sidelobe_cut}
 	cuts = [obs.cuts]
 	for i, cutname in enumerate(which):
-		cuts.append(cutfuns[cutname](obs, geo=geo, dev=dev))
+		cuts += cutfuns[cutname](obs, id=id, geo=geo, dev=dev)
 	cuts = socut.Simplecut.merge(cuts)
 	#cuts.gapfill(obs.tod, dev=dev)
 	obs.cuts = cuts
 	return obs
 
-def object_cut(obs, object_list=None, geo=None, down=8, base_res=0.5*utils.arcmin,
+def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*utils.arcmin,
 		dt=100, dr=1*utils.arcsec, dev=None):
 	if dev is None: dev = device.get_device()
 	object_list = get_object_list(object_list)
@@ -36,49 +42,186 @@ def object_cut(obs, object_list=None, geo=None, down=8, base_res=0.5*utils.arcmi
 	map  = ephem_map(shape, wcs, object_list, [t1,t2], dt=dt, dr=dr)
 	# map2tod. ft buffer and the pointing buffers are free
 	lmap = tiling.enmap2lmap(map, dev=dev)
-	pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, partial=True, dev=dev)
+	pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, site=obs.site, partial=True, dev=dev)
 	tod  = dev.pools["ft"].zeros(obs.tod.shape, obs.tod.dtype)
 	pmap.forward(tod, lmap.lmap)
 	# turn non-zero values into a cuts object
 	cuts = mask2cut(tod, dev=dev)
-	# return result. User must merge with other cuts and gapfill as necessary
-	return cuts
+	# return result as length-1 list of cuts
+	# It's a list of cuts because other cut types can return multiple cuts
+	# User must merge with other cuts and gapfill as necessary
+	return [cuts]
 
-config.default("elmod_cal", "cal", "Comma-separated list of what to do with the elevation modulation gain fit. If it contains 'cal', then it will be used to flatfield the tod. If it contains 'dump', then the fit will be dumped to individual files. If it contains neither of these, then no elmod fit will be performed. If the elvation is not actually modulated, then nothing will be done")
+config.default("sun_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/sun.fits", "Location of Sun sidelobe mask")
+config.default("moon_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/moon.fits", "Location of Sun sidelobe mask")
+sidelobe_cutters = {}
+def sidelobe_cut(obs, id="?", object_list=None, geo=None, dev=None):
+	if object_list is None: object_list = ["sun", "moon"]
+	cutss = []
+	for name in object_list:
+		if name not in sidelobe_cutters:
+			fname = config.get(name + "_mask")
+			if not fname: raise ValueError("config setting %s_mask missing for sidelobe cut" % name)
+			mask  = enmap.read_map(fname)
+			sidelobe_cutters[name] = SidelobeCutter(mask, objname=name, dtype=obs.tod.dtype, dev=dev)
+		cutter = sidelobe_cutters[name]
+		cuts   = cutter.make_cuts(obs, id=id)
+		cutss.append(cuts)
+	return cutss
+
+# TODO: Idea for optimizing this
+# 1. Build distance map from mask in constructor
+# 2. For each tod, calculate obj-centered coordinates for a few representative positions,
+#    e.g. 10 times, 10 azs. Look these up in distance map. Compare to fplane radius and
+#    max point distance. If further away than that, skip all the rest. This will be the
+#    case for most observations, making this practically free on average.
+class SidelobeCutter:
+	def __init__(self, mask, objname, dtype=np.float32, rise_tol=1*utils.degree, dev=None):
+		self.dev  = dev or device.get_device()
+		self.mask = mask
+		self.lmap = tiling.enmap2lmap(mask.astype(dtype), dev=self.dev)
+		self.objname= objname
+		self.sys  = "hor,on=%s" % objname
+		self.rise_tol = rise_tol
+	def make_cuts(self, obs, id="?"):
+		# First check if the object is above the horizon. We just check the endpoints
+		# to keep things simple
+		ts    = obs.ctime[[0,-1]]
+		hor   = coordsys.transform(self.sys, "hor", coordsys.Coords(ra=0, dec=0), ctime=ts, site=obs.site)
+		risen = np.any(hor.el > self.rise_tol)
+		if not risen: return socut.Simplecut(ndet=obs.tod.shape[0], nsamp=obs.tod.shape[1])
+		# Ok, it's above the horizon, check which samples are affected
+		try:
+			pmap = pmat.PmatMap(self.lmap.fshape, self.lmap.fwcs, obs.ctime,
+				obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, site=obs.site,
+				partial=True, dev=self.dev)
+			tod  = self.dev.pools["ft"].zeros(obs.tod.shape, obs.tod.dtype)
+			pmap.forward(tod, self.lmap.lmap)
+		except RuntimeError:
+			# This happens when the interpolated pointing ends up outside the -npix:+2npix range
+			# that gpu_mm allows. This can happen when a detector moves too close to the north pole
+			# in the object-centered coordinates, which in CAR makes it seem to teleport by 180
+			# degrees. When combined with unwinding, some jumps being sligthly less than 180 and
+			# some slightly more than 180 can lead to the numbers drifting over a large range.
+			# It might be better to catch this by just looking for values too close to the poles
+			# explicitly instead of relying on gpu_mm to catch things itself
+			L.print("Error cutting %s sidelobes for %s: Pointing overflow. Skipping cut" % (self.objname, id), level=2, color=colors.red)
+			return socut.Simplecut(ndet=obs.tod.shape[0], nsamp=obs.tod.shape[1])
+		# turn non-zero values into a cuts object
+		cuts = mask2cut(tod, dev=self.dev)
+		return cuts
+
+def autocal(obs, prefix=None, dev=None):
+	# Are we doing elmod calibration?
+	if elmod_cal(obs, prefix=prefix, dev=dev): return True
+	if cmod_cal (obs, prefix=prefix, dev=dev): return True
+	return False
+
+config.default("cmod_cal", "none", "Comma-separated list of what to do with the common-mode gain fit. If it contains 'cal', then it will be used to flatfield the tod. If it contains 'dump', then the fit will be dumped to individual files. If it contains neither of these, then no common mode fit will be performed. Common mode calibration will not be done if elevation-modulation calibration is enabled and applicable")
+def cmod_cal(obs, fmin=0.05, fmax=3, tol=1e-4, prefix=None, dev=None):
+	"""Do elevation-modulation auto-calibration if elevation is actually modulated (determined by
+	minamp), and config:elmod_cal has turned this on. Otherwise does nothing"""
+	tasks = config.get("cmod_cal").split(",")
+	if not ("cal" in tasks or "dump" in tasks or "tdump" in tasks): return False
+	# Ok, do a fit
+	try:
+		fit = measure_cmode_response(obs, fmin=fmin, fmax=fmax, tol=tol, dev=dev)
+		if "cal" in tasks:
+			obs.tod *= dev.np.array(fit.gain)[:,None]
+		# Prefix required if dumping!
+		if "dump" in tasks:
+			dump_cmod_fit(prefix + "ccal.txt", fit)
+		if "tdump" in tasks:
+			dump_cmod_tfit(prefix + "tccal.txt", fit)
+	except ():
+		return False
+	return "cal" in tasks
+
+# Status: I've tried measuring this several ways:
+# * Fourier-bandpass + plain pca
+# * Fourier-bandpass + bunched pca median
+# * Group-downsampling + bunched pca median
+# All produce sensible-looking results, but they're also
+# quite different from each other. All have a few outliers,
+# but often different ones. Overall I'm not satisfied with
+# the quality, so I'll disable this for now
+def measure_cmode_response(obs, fmin=0.01, fmax=3, tol=1e-4, dev=None):
+	dev = device.get_device()
+	ndet, nsamp = obs.tod.shape
+	srate  = (len(obs.ctime)-1)/(obs.ctime[-1]-obs.ctime[0])
+	bsize  = utils.nint(srate/2/fmax)
+	gsize  = utils.nint(fmax/fmin)
+	# Downgrade by bsize to get us out of the white noise regime,
+	# and demean by gsize to restrict to the higher parts of the
+	# atmospheric modes, where we have more staticits and are less
+	# likely to be impacted by other types of picup
+	ngroup = nsamp//(bsize*gsize)
+	vals   = obs.tod[:,:ngroup*gsize*bsize].reshape(ndet,ngroup,gsize,bsize)
+	vals   = dev.np.mean(vals,-1)
+	vals  -= dev.np.mean(vals,-1)[:,:,None]
+	# Do commmon mode calibration in each. Yuck, looping.
+	# Won't be gpu-efficient. Consider writing a multi-pca.
+	# Simply reshaping didn't work
+	ba = np.zeros((ngroup, ndet), obs.tod.dtype)
+	for gi in range(ngroup):
+		ba[gi] = dev.get(gutils.pca1(vals[:,gi], tol=tol))
+	# each row of ba will have arbitrary sign. Normalize that out
+	# using an average
+	a, da, n = gutils.robust_mean(ba, 0, quantile=0.25)
+	ba /= (np.sum(ba*a,1)/np.sum(a*a))[:,None]
+	# robust mean over groups, to reduce the impact of outliers like tunarounds
+	# or planets
+	a, da, n = gutils.robust_mean(ba, 0, quantile=0.25)
+	ba /= np.median(a)
+	# flatfield per band, since the atm response should be freq-dependent
+	gain = np.full(ndet, 1, obs.tod.dtype)
+	ubands, order, edges = utils.find_equal_groups_fast(obs.bands)
+	for bi, uband in enumerate(ubands):
+		inds       = order[edges[bi]:edges[bi+1]]
+		band_a     = a[inds]
+		gain[inds] = np.median(band_a)/band_a
+	# This is only used for the dump file format
+	xieta= obs.point_offset[:,1::-1]
+	return bunch.Bunch(a=a, da=da, n=n, gain=gain, ba=ba,
+		bands=obs.bands, detids=obs.detids, xieta=xieta)
+
+def dump_cmod_fit(fname, fit):
+	with open(fname, "w") as ofile:
+		for di in range(len(fit.bands)):
+			ofile.write("%s %s %8.5f %8.5f %8.5f %4d %8.5f %8.5f\n" % (
+				fit.detids[di], fit.bands[di], fit.gain[di],
+				fit.a[di], fit.da[di], fit.n,
+				fit.xieta[di,0]/utils.degree, fit.xieta[di,1]/utils.degree))
+
+def dump_cmod_tfit(fname, fit):
+	np.savetxt(fname, fit.ba, fmt="%8.5f")
+
+config.default("elmod_cal", "cal,clean", "Comma-separated list of what to do with the elevation modulation gain fit. If it contains 'cal', then it will be used to flatfield the tod. If it contains 'dump', then the fit will be dumped to individual files. If it contains neither of these, then no elmod fit will be performed. If the elvation is not actually modulated, then nothing will be done")
 config.default("elmod_minamp", 1, "elmod_cal is skipped if the elevation amplitude is less than this, in arcminutes")
 def elmod_cal(obs, nmode=2, bsize=2000, tol=0.1, prefix=None, minamp=None, dev=None):
 	"""Do elevation-modulation auto-calibration if elevation is actually modulated (determined by
 	minamp), and config:elmod_cal has turned this on. Otherwise does nothing"""
-	elmod = config.get("elmod_cal").split(",")
-	if not ("cal" in elmod or "clean" in elmod or "dump" in elmod or "tdump" in elmod): return
+	tasks = config.get("elmod_cal").split(",")
+	if not ("cal" in tasks or "clean" in tasks or "dump" in tasks or "tdump" in tasks): return False
 	# Check if we're el-modulated
 	if minamp is None: minamp = config.get("elmod_minamp")*utils.arcmin
 	elamp = np.std(obs.boresight[0,::100])*2**0.5
-	if elamp < minamp: return
+	if elamp < minamp: return False
 	# Ok, do a fit
 	try:
 		fit = measure_el_response(obs, dev=dev)
-		if "clean" in elmod:
+		if "clean" in tasks:
 			deproj_el_response(obs.tod, fit, dev=dev)
-		if "cal" in elmod:
+		if "cal" in tasks:
 			obs.tod *= dev.np.array(fit.gain)[:,None]
 		# Prefix required if dumping!
-		if "dump" in elmod:
+		if "dump" in tasks:
 			dump_elmod_fit(prefix + "elcal.txt", fit)
-		if "tdump" in elmod:
+		if "tdump" in tasks:
 			dump_elmod_tfit(prefix + "telcal.txt", fit)
-	except ValueError: pass
-
-def dump_elmod_fit(fname, fit):
-	with open(fname, "w") as ofile:
-		for di in range(len(fit.bands)):
-			ofile.write("%s %s %8.5f %8.5f %8.5f %8.5f %4d %8.5f\n" % (
-				fit.detids[di], fit.bands[di], fit.xieta[di,0]/utils.degree,
-				fit.xieta[di,1]/utils.degree, fit.a[di]/1e6, fit.da[di]/1e6,
-				fit.n, fit.gprime[di]))
-
-def dump_elmod_tfit(fname, fit):
-	np.savetxt(fname, fit.ba/1e6, fmt="%8.5f")
+	except ValueError:
+		return False
+	return "cal" in tasks
 
 def measure_el_response(obs, nmode=2, bsize=2000, tol=0.1, dev=None):
 	if dev is None: dev = device.get_device()
@@ -127,7 +270,7 @@ def measure_el_response(obs, nmode=2, bsize=2000, tol=0.1, dev=None):
 	amps  = dev.np.einsum("bmn,bdn->bdm", idiv, rhs) # [nblock,ndet,nmode]
 	slope = dev.get(amps[:,:,1]) # µK [nblock,ndet]
 	# slope = a*g'. Divide out g' to get a
-	ba    = slope/gprime # µK [nblock,ndet]
+	ba    = slope/gprime/1e6 # K [nblock,ndet]
 	# Use blocks to get robust mean and error
 	a, da, n = gutils.robust_mean(ba, 0)
 	# Build flatfield
@@ -157,6 +300,17 @@ def calc_det_el(bel, roll, xieta):
 	q    = coordsys.rotation_xieta(xi, eta)
 	el   = (bore*q).el
 	return el
+
+def dump_elmod_fit(fname, fit):
+	with open(fname, "w") as ofile:
+		for di in range(len(fit.bands)):
+			ofile.write("%s %s %8.5f %8.5f %8.5f %4d %8.5f %8.5f %8.5f\n" % (
+				fit.detids[di], fit.bands[di], fit.gain[di],
+				fit.a[di], fit.da[di], fit.n,
+				fit.xieta[di,0]/utils.degree, fit.xieta[di,1]/utils.degree, fit.gprime[di]))
+
+def dump_elmod_tfit(fname, fit):
+	np.savetxt(fname, fit.ba, fmt="%8.5f")
 
 # Helpers
 

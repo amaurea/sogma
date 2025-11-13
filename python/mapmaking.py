@@ -220,7 +220,7 @@ class SignalMap(Signal):
 		# of them anyway
 		if pmap is None:
 			try:
-				pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, dev=self.dev, dtype=iNd.dtype)
+				pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, site=obs.site, dev=self.dev, dtype=iNd.dtype)
 			except RuntimeError:
 				# This happens if the pointing fit goes badly wrong, which
 				# can happen if the tod crosses the poles. Too late to cancel
@@ -935,7 +935,10 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch)
+			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch)
+			# I keep calculating this. It should be a standard member of data
+			# Should probably promote data to a full class
+			srate = (len(data.ctime)-1)/(data.ctime[-1]-data.ctime[0])
 		except etypes as e:
 			L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
 			continue
@@ -947,13 +950,12 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		# Autocut and gapfill cost about the same as add_obs, so they definitely
 		# aren't free!
 		t2    = time.time()
-		socal.autocut(data, dev=dev)
-		# Even eigen-gapfilling leaves big artifacts in the planet cut area.
-		# Not gapfilling, despite the bright planet being there, performs
-		# much better. Should understand why. This worked in ACT
-		#gutils.gapfill_atm(data.tod, data.cuts, dev=dev)
-		# Autocalibration. Controlled by config:elmod_cal
-		socal.elmod_cal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
+		socal.autocut(data, dev=dev, id=name)
+		# Remove extreme values in the cut areas. This is gentler than trying
+		# and failing to gapfill with realistic noise
+		gutils.gapfill_extreme(data.tod, data.cuts, dev=dev)
+		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
+		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
 		t3    = time.time()
 		try:
 			mapmaker.add_obs(name, data, deslope=False)

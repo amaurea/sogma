@@ -688,9 +688,25 @@ def pca1(tod, tol=None, maxiter=1000, verbose=False):
 # Ended up with just the simple svd. Currently uses two rounds, but
 # only to be extra safe. 1 seems almost indistinguishable.
 
-def gapfill_svd(tod, cut, srate=400, fmax=10, fmin=0.05, niter=2, eiglim=1e-5,
-		ps_bsize=10, dev=None, pool=None):
+def estimate_atm_tod(tod, cut=None, srate=400, fmax=10, fmin=0.05, niter=None, eiglim=1e-5,
+		dev=None, pool=None):
+	"""Given a tod, overwrite it with an estimate of its smooth atmospheric signal.
+	This can be used in e.g. atmospheric subtraction. The atmosheric estimation consists
+	of removing fourier-fmodes abofe fmax and removing eigenmodes below eiglim.
+	If cut is passed, then the atmospheric estimate will be independent of the signal
+	in the cut area, which can be useful for planet mapping for example.
+
+	FIXME: This function produces a sensible-looking tod, but to the noise model
+	its still very different from the actual data, resulting in strong discontinuities
+	when used to gapfill. As it is, it therefore isn't usable for gapfilling.
+	"""
 	if dev is None: dev = device.get_device()
+	if cut is None:
+		from . import socut
+		cut   = socut.Simplecut(ndet=tod.shape[0], nsamp=tod.shape[1])
+	if niter is None:
+		# No need to do iteration if we don't have any cuts
+		niter = 1 if cut.nrange == 0 else 2
 	ndet, nsamp = tod.shape
 	# 1. Start with simple gapfilling, so we don't have potentially huge values
 	#    messing things up
@@ -718,6 +734,48 @@ def gapfill_svd(tod, cut, srate=400, fmax=10, fmin=0.05, niter=2, eiglim=1e-5,
 	# Resample back to our original resolution, overwriting our input argument
 	fourier_resample(model, tod, opool=pool, dev=dev, normalize=True)
 	return dtod
+
+def gapfill_atm(tod, cut, srate=400, fmax=10, fmin=0.05, niter=None, eiglim=1e-5,
+		dev=None, fpool=None, mpool=None):
+	"""FIXME: This function isn't usable as a gapfiller for normal mapmaking. While
+	the output looks sensible by eye, the noise model thinks otherwise."""
+	if dev   is None: dev = device.get_device()
+	if mpool is None: mpool = dev.np
+	# Model the atmosphere
+	model = mpool.array(tod)
+	estimate_atm_tod(model, cut, srate=srate, fmax=fmax, fmin=fmin, niter=niter,
+		eiglim=eiglim, dev=dev, pool=fpool)
+	# Use it to gapfill
+	vals = cut.extract(model)
+	cut.insert(tod, vals)
+	return tod
+
+def gapfill_extreme(tod, cut, tol=100, dstep=10, step=100, dev=None):
+	"""Remove extreme values in the cut regions, leaving normal samples untouched.
+	The idea is that gapfilling only is needed to keep non-local operations like
+	noise model estimation sane. A gapfiller must do less harm by distorting the
+	noise than one does by letting through glitches. As long as one can't generate
+	realistic enough noise, it makes sense to leave almost everything untouched"""
+	if dev   is None: dev = device.get_device()
+	dcut = cut.to_device(dev)
+	# extract the original values
+	vals = dcut.extract(tod)
+	# get gapfilled values, which we will use temporarily when
+	# juding which values are extreme. The original values will
+	# be restored later
+	dcut.gapfill(tod)
+	bg    = dcut.extract(tod)
+	vals -= bg
+	# estimate the mid-scale rms from the whole tod
+	rms   = dev.np.median(dev.np.diff(tod[::dstep,::step])**2)**0.5
+	# could do something smooth with the extreme values, but should be
+	# practically as good to just clip
+	dev.np.clip(vals, -rms*tol, rms*tol, out=vals)
+	# restore background and reinsert
+	vals += bg
+	dcut.insert(tod, vals)
+	# done!
+	return tod
 
 #def pca1_filter(tod, dev=None):
 #	if dev is None: dev = device.get_device()

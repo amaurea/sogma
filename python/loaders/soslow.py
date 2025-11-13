@@ -51,6 +51,7 @@ class SotodlibLoader:
 			res.boresight    = np.array([obs.boresight.el,obs.boresight.az,obs.boresight.roll])
 			res.hwp          = obs.preprocess.hwp_angle.hwp_angle if "hwp_angle" in obs.preprocess else None
 			res.cuts         = cuts
+			res.site         = "so"
 			res.response     = None
 			res.tod          = self.dev.pools["tod"].array(obs.signal)
 			res.tod         *= 1e6

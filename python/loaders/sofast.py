@@ -167,6 +167,7 @@ class SoFastLoader:
 					otot.ctime     = obs.ctime
 					otot.boresight = obs.boresight
 					otot.hwp       = obs.hwp
+					otot.site      = obs.site
 					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
 				# Handle the simple append cases
 				for field, axis in append_fields:
@@ -413,10 +414,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		cuts = socut.Sampcut.merge([meta.aman[name] for name in
 			["cuts_glitch","cuts_2pi","cuts_slow"]])#,"cuts_jump","cuts_turn"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
-	# Go to a fourier-friendly length
-	nsamp = fft.fft_len(data.signal.shape[1]//mul, factors=dev.lib.fft_factors)*mul
-	timestamps, signal, cuts, az, el = [a[...,:nsamp] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
-	hwp_angle = meta.aman.hwp_angle[:nsamp] if "hwp_angle" in meta.aman else None
+	# Find when we're actually scanning
+	i1, i2 = socommon.find_scanning(data.az)
+	# Adjust to fourier-friendly length
+	nsamp = fft.fft_len((i2-i1)//mul, factors=dev.lib.fft_factors)*mul
+	i2    = i1+nsamp
+	timestamps, signal, cuts, az, el = [a[...,i1:i2] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
+	hwp_angle = meta.aman.hwp_angle[i1:i2] if "hwp_angle" in meta.aman else None
 	ninit = data.dets.count
 
 	# prev_obs lets us pass in the result of calibrate run on
@@ -435,10 +439,10 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 			el      = el   * utils.degree
 			if "brot" in data:
 				# SAT: boresight angle → roll
-				roll = -data.brot [:nsamp]*utils.degree
+				roll = -data.brot [i1:i2]*utils.degree
 			else:
 				# LAT: corotator angle → roll
-				roll = -data.corot[:nsamp]*utils.degree + el - 60*utils.degree
+				roll = -data.corot[i1:i2]*utils.degree + el - 60*utils.degree
 		with bench.mark("pointing correction"):
 			az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
 
@@ -551,6 +555,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	res.hwp          = hwp_angle
 	res.tod          = signal
 	res.cuts         = ocuts
+	res.site         = "so"
 	res.response     = None
 	# Test per-detector response
 	#res.response     = dev.np.zeros((2,len(res.tod)),res.tod.dtype)
@@ -1069,13 +1074,18 @@ def apply_pointing_model(az, el, roll, model):
 		q_tot     = q_enc * q_mir * q_el_roll * q_tel * q_cr_roll * q_rx
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az       *= -1
-	elif model.version == "lat_v1":
+	elif model.version in ["lat_v1", "lat_v2"]:
 		# Reconstruct the corotator angle
 		corot = el - roll - 60*utils.degree
 		# Apply offsets
 		az    += model.enc_offset_az
 		el    += model.enc_offset_el
 		corot += model.enc_offset_cr
+		try: # Optional el sag
+			Δel = el - model.el_sag_pivot
+			el += Δel    * model.el_sag_lin
+			el += Δel**2 * model.el_sag_quad
+		except AttributeError: pass
 		q_lonlat     = quat.rotation_lonlat(-az, el)
 		q_mir_center = ~quat.rotation_xieta(model.mir_center_xi0, model.mir_center_eta0)
 		q_el_roll    = quat.euler(2, el - 60*utils.degree)
@@ -1083,6 +1093,13 @@ def apply_pointing_model(az, el, roll, model):
 		q_cr_roll    = quat.euler(2, -corot)
 		q_cr_center  = ~quat.rotation_xieta(model.cr_center_xi0, model.cr_center_eta0)
 		q_tot        = q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
+		try: # Optional base tilt
+			phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
+			amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
+			q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
+			q_tot  = q_base * q_tot
+		except AttributeError: pass
+		# Finally back to coordinates
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1
 	else: raise ValueError("Unrecognized model '%s'" % str(model.version))

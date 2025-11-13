@@ -1,7 +1,7 @@
 # Things used by both sofast and soslow
 import re, numpy as np, warnings, os, yaml, contextlib
 from pixell import utils, sqlite, bunch, config
-from .. import device
+from .. import device, gutils
 
 def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, pre_cols=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the
@@ -812,3 +812,16 @@ def _group_obs_tol(obsinfo, tol=100):
 	groups = utils.find_equal_groups(obsinfo.ctime, tol=tol)
 	names  = np.array(["_".join(obsinfo.id[g[0]].split("_")[:2]) for g in groups])
 	return groups, names
+
+def find_scanning(az, down=10, tol=0.01, pad=1):
+	"""Find the first and last sample where the telescope is scanning in az"""
+	# Downgrade to reduce noise
+	baz  = gutils.downgrade(az, down)
+	# Measure the speed
+	v     = np.abs(np.gradient(baz))
+	vtyp  = np.mean(v)
+	moving= np.where(v>vtyp*tol)[0]
+	if len(moving) == 0: return 0, 0
+	i1   = max((moving[ 0]-1-pad)*down, 0)
+	i2   = min((moving[-1]+1+pad)*down+1, az.size)
+	return i1, i2

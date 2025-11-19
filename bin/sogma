@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python -u
 import numpy as np, os, time, sys
 from pixell import config, enmap, utils, mpi, colors, bench
 from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils, soeph
@@ -42,6 +42,7 @@ elif args.mode in ["full", "dump"]:        separate = False
 else: raise ValueError("Unknown mode '%s'" % (str(args.mode)))
 comm_all   = mpi.COMM_WORLD
 comm_per   = mpi.COMM_SELF if separate else mpi.COMM_WORLD
+mpi.install_abort_hook()
 dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)

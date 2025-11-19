@@ -1,0 +1,403 @@
+#!/usr/bin/env python
+from pixell import config, bunch, coordsys, utils
+from sogma import loading, device, gutils
+parser = config.ArgumentParser("sogma")
+parser.add_argument("query")
+parser.add_argument("odir")
+parser.add_argument("-C", "--context", type=str,   default="lat")
+parser.add_argument("-L", "--loader",  type=str,   default="auto")
+parser.add_argument(      "--nopre",   action="store_true")
+parser.add_argument("-d", "--dsplit",  type=str,   default="tube")
+parser.add_argument("-T", "--tsplit",  type=str,   default="day:1")
+parser.add_argument("-s", "--ssplit",  type=str,   default="crossel")
+parser.add_argument("-r", "--res",     type=float, default=1, help="degrees")
+parser.add_argument("-n", "--nsplit",  type=int,   default=2)
+parser.add_argument("-H", "--write-hits", action="store_true")
+args = parser.parse_args()
+import numpy as np
+from pixell import enmap
+
+def parse_obsids(obsids):
+	"""Split an array of obsids of the form obs_1759107020_lati6_111:ws0:f090,
+	where the last parts are optional, into arrays of pre=obs, tid=1759107020,
+	tube=lati6, wslot=ws0, band=f090. All obsids must have the same format, and
+	must be in a recognized form"""
+	obsid = obsids[0]
+	if "_lat" in obsid:
+		fields = {"pre":[0,3], "tid":[4,14], "tube":[18,20], "wslot":[25,28], "band":[29,33]}
+	else:
+		raise ValueError("obsid '%s' not in a recognized format for parse_obsids" % str(obsid))
+	res = bunch.Bunch()
+	for fname, (i1,i2) in fields.items():
+		if i1 < len(obsid):
+			res[fname] = np.strings.slice(obsids, i1, i2)
+	return res
+
+def ajoin(arrs, sep):
+	res = arrs[0]
+	for arr in arrs[1:]:
+		res = np.strings.add(np.strings.add(res, "_"), arr)
+	return res
+
+def dsplit(obsinfo, by="tube"):
+	id_toks = parse_obsids(obsinfo.id)
+	by_toks = by.split(",")
+	vals    = [id_toks[tok] for tok in by_toks]
+	vals    = ajoin(vals, "_")
+	uvals, inds = np.unique(vals, return_inverse=True)
+	return inds, uvals
+
+def ssplit(obsinfo, by="plain", tol=1*utils.degree, weltol=0.1):
+	import pdb
+	pdb.set_trace()
+	if   by == "plain":
+		return np.zeros(len(obsinfo),int), np.array([""])
+	elif by == "crosslink":
+		return (utils.rewind(obsinfo.baz)<0).astype(int), np.array(["r", "s"])
+	elif by == "crossel":
+		id_rs  = (utils.rewind(obsinfo.baz)<0).astype(int)
+		id_el  = utils.label_similar_groups_fast(obsinfo.bel, tol=tol)
+		id_wel = utils.label_similar_groups_fast(obsinfo.wel, tol=weltol)
+		id, inds = utils.label_multi([id_rs, id_el, id_wel], return_index=True)
+		names = np.array(["%s_el%d_wel%d" % ("rs"[id_rs[i]], id_el[i], id_wel[i]) for i in inds])
+		return id, names
+	elif by == "scanpat":
+		id_el  = utils.label_similar_groups_fast(obsinfo.bel, tol=tol)
+		id_az  = utils.label_similar_groups_fast(obsinfo.baz, tol=tol)
+		id_wel = utils.label_similar_groups_fast(obsinfo.wel, tol=weltol)
+		id_waz = utils.label_similar_groups_fast(obsinfo.waz, tol=tol)
+		id, inds = utils.label_multi([id_el, id_az, id_wel, id_waz], return_index=True)
+		names = np.array(["el%d_az%d_wel%d_waz%d" % (id_el[i], id_az[i], id_wel[i], id_waz[i]) for i in inds])
+		return id, names
+	else: raise ValueError("Unrecognized sublabel by '%s'" % str(by))
+
+def tsplit(obsinfo, by="day"):
+	toks = by.split(":")
+	unit = {"day":utils.day}[toks[0]]
+	Δt   = float(toks[1]) * unit
+	vals = (obsinfo.ctime // Δt).astype(int)
+	uvals, inds = np.unique(vals, return_inverse=True)
+	return inds, uvals
+
+def merge_obsinfo(obsinfo, mids, tol=10):
+	# Find mergable entries in obsinfo. For now, we just merge anything with
+	# the same ctime
+	gids = utils.label_similar_groups_fast(obsinfo.ctime, tol=tol)
+	# Only merge inside each merge-group
+	ids  = utils.label_multi([mids, gids])
+	n    = int(np.max(ids))+1
+	# Ok, set up our output obsid. Most things can be simply
+	# copied over from the first element in each group, since
+	# they should be the same inside the group
+	first_inds = np.unique(ids, return_index=True)[1]
+	mobsinfo   = obsinfo[first_inds].copy()
+	# The detector count should be accumulated
+	mobsinfo.ndet = utils.bincount(ids, obsinfo.ndet, minlength=n)
+	return mobsinfo, first_inds, ids
+
+def unmerge_inds(inds, omids):
+	n    = int(np.max(omids))+1
+	msel = np.zeros(n, bool)
+	msel[inds] = True
+	osel = msel[omids]
+	return np.where(osel)[0]
+
+def splitinfo_unmerge_inds(splitinfo, omids):
+	res = bunch.Bunch(dgroups=[])
+	for di, idgroup in enumerate(splitinfo.dgroups):
+		odgroup = bunch.Bunch(splits=[])
+		for si, isplit in enumerate(idgroup.splits):
+			osplit = bunch.Bunch()
+			osplit.inds = unmerge_inds(isplit.inds, omids)
+			osplit.hits = isplit.hits.copy()
+			odgroup.splits.append(osplit)
+		res.dgroups.append(odgroup)
+	return res
+
+# Hm, I think my data organization is making these unmerging and merging operations
+# unnecessarily complicated
+def splitinfo_submerge(splitinfo, dlabel):
+	ngroup = int(np.max(dlabel))+1
+	nsplit = len(splitinfo.dgroups[0].splits)
+	# Set up an empty output
+	res = bunch.Bunch(dgroups=[bunch.Bunch(splits=[bunch.Bunch(inds=[], hits=0) for i in range(nsplit)]) for i in range(ngroup)])
+	# Then accumulate into it
+	for di, gi in enumerate(dlabel):
+		idgroup = splitinfo.dgroups[di]
+		odgroup = res      .dgroups[gi]
+		for si, isplit in enumerate(idgroup.splits):
+			osplit = odgroup.splits[si]
+			osplit.inds.append(isplit.inds)
+			osplit.hits += isplit.hits
+	# Concatenate lists
+	for dgroup in res.dgroups:
+		for split in dgroup.splits:
+			split.inds = np.concatenate(split.inds)
+	return res
+
+def write_split_ids(odir, splitinfo, obsinfo, dnames):
+	utils.mkdir(odir)
+	for dname, dgroup in zip(dnames, splitinfo.dgroups):
+		for si, split in enumerate(dgroup.splits):
+			print("Writing %s/ids_%s_%d.txt" % (odir, dname, si))
+			np.savetxt("%s/ids_%s_%d.txt" % (odir, dname, si), obsinfo.id[split.inds], fmt="%s")
+
+def write_split_hits(odir, splitinfo, gnames):
+	utils.mkdir(odir)
+	for gname, dgroup in zip(gnames, splitinfo.dgroups):
+		for si, split in enumerate(dgroup.splits):
+			enmap.write_map("%s/hits_%s_%d.fits" % (odir, gname, si), split.hits)
+
+def build_scancurve(az1, az2, el, t, daz=1*utils.degree, site="so"):
+	naz = utils.ceil((az2-az1)/daz)+1
+	az  = np.linspace(az1, az2, naz)
+	coords = coordsys.transform("hor", "equ", coordsys.Coords(az=az, el=el), ctime=t, site=site)
+	ra  = utils.unwind(coords.ra)
+	return np.array([az, ra, coords.dec])
+
+def build_skew(scancurve, geo):
+	shape, wcs      = geo
+	pix_dec, pix_ra = enmap.posaxes(shape, wcs)
+	# Want to read off ra from the scancurve for each
+	# dec value in the map
+	order     = np.argsort(scancurve[2])
+	scancurve = scancurve[:,order]
+	scan_ra   = np.interp(pix_dec, scancurve[2], scancurve[1])
+	# round to nearest pixel offset from 
+	iref = len(scan_ra)//2
+	Δra  = scan_ra - scan_ra[iref]
+	# The skew is just the per-y x offset
+	skew = utils.nint(Δra / (wcs.wcs.cdelt[0]*utils.degree))
+	return skew
+
+def skew_map(map, skew, inplace=False):
+	if not inplace: map = map.copy()
+	for y, Δx in enumerate(skew):
+		map[...,y,:] = np.roll(map[...,y,:], -Δx, axis=-1)
+	return map
+
+def unskew_map(map, skew, inplace=False):
+	return skew_map(map, -skew, inplace=inplace)
+
+# We want to estimate time/area. We cover a total area of Δdec*(sdrift*dur),
+# so the average depth is 1/(Δdec*sdrift). But areas where we scan more
+# slowly are deeper. 1/(Δdec*decspeed/avg_decspeed*sdrift)
+# = 1/(Δdec*ddec/di/(Δdec/n)*sdrift) = 1/(ddec/di*n*sdrift)
+def calc_exposure_rate(scancurve, geo):
+	shape, wcs = geo
+	pix_dec, pix_ra = enmap.posaxes(shape, wcs)
+	# interpolate to az for each y-pixel
+	order      = np.argsort(scancurve[2])
+	scancurve  = scancurve[:,order]
+	pix_az     = np.interp(pix_dec, scancurve[2], scancurve[0])
+	# dec speed ddec/daz. This goes out of the scan range, but harmless
+	with utils.nowarn():
+		decspeed = np.abs(utils.without_nan(np.gradient(pix_dec)/np.gradient(pix_az)))
+	decspan    = scancurve[2,-1]-scancurve[2,0]
+	azspan     = scancurve[0,-1]-scancurve[0,0]
+	avgspeed   = np.abs(decspan/azspan)
+	sdrift     = 15*utils.degree/utils.hour
+	iyavg = decspan*sdrift
+	iyexp = iyavg * np.maximum(decspeed/avgspeed, 0.1)
+	# units: time/rad**2
+	yexp  = 1/iyexp
+	return yexp
+
+def accumulate_hits(hitmaps, gids, pixboxs, weights=None, callback=lambda: None):
+	nx = hitmaps.shape[-1]
+	for i, gid in enumerate(gids):
+		weight = weights[i] if weights is not None else 1
+		(y1,x1),(y2,x2) = pixboxs[i]
+		# want x1 in bounds
+		off = utils.floor(x1/nx)*nx
+		x1, x2 = (x1-off),(x2-off)
+		# handle x wrapping
+		if x2 > nx:
+			hitmaps[gid,y1:y2,x1:nx]   += weight
+			hitmaps[gid,y1:y2,0:x2-nx] += weight
+		else:
+			hitmaps[gid,y1:y2,x1:x2]   += weight
+		callback()
+	return hitmaps
+
+class ProgPrinter:
+	def __init__(self, fmt, n=0, step=1, pend="\n"):
+		self.fmt = fmt
+		self.i   = 1
+		self.n   = n
+		self.step= step
+		self.pend= pend
+	def __call__(self):
+		if self.i % self.step == 0 or self.i == self.n:
+			print(self.fmt.format(i=self.i, n=self.n), end=self.pend)
+		self.i += 1
+
+def build_hitmaps(obsinfo, gids, geo=None, eltol=1*utils.degree, dtype=np.float64, hitmaps=None, site="so"):
+	if geo is None: geo = enmap.geometry2(res=1*utils.degree)
+	shape, wcs = geo
+	baz    = utils.rewind(obsinfo.baz)
+	if hitmaps is None:
+		ngroup  = int(np.max(gids))+1
+		hitmaps = enmap.zeros((ngroup,)+shape, wcs, dtype)
+	# 1. split *all* observations by elevation. Groups will come later
+	nel, order, edges = utils.find_similar_groups_fast(obsinfo.bel, tol=eltol)
+	uels = obsinfo.bel[order[(edges[:-1]+edges[1:]-1)//2]]
+	tref = obsinfo.ctime[0]
+	# Keep track of our progress
+	ntot = len(obsinfo)
+	prog_printer = ProgPrinter("\rBuilding hitmap {i:5d}/{n}", n=ntot, step=10, pend="")
+	for ei in range(nel):
+		inds = order[edges[ei]:edges[ei+1]]
+		el   = uels[ei]
+		# 2. for each elevation, find the ra(az),dec(az) curve for
+		#    rising and setting separately, and use it to build a skew
+		#    transform that will take us from/to a straightened system
+		#    where the covered area is a simple rectangle per obs
+		for name, az1, az2 in [("rise", 0, np.pi), ("set", -np.pi, 0)]:
+			# group hitcounts for this el-rise combination
+			subhits   = np.zeros_like(hitmaps)
+			# skew information
+			scancurve = build_scancurve(az1, az2, el, tref, site=site)
+			skew      = build_skew(scancurve, geo)
+			# time per square radian as a function of y pixel
+			yexp      = calc_exposure_rate(scancurve, geo)
+			# Select the observations that fall inside this rising/setting range
+			azmask    = (baz[inds]>=az1)&(baz[inds]<az2)
+			subinds   = inds[azmask]
+			# Caclulate original-coordinate pixel box for the observations
+			my_baz    = baz[subinds]
+			my_amp    = obsinfo.waz[subinds]/2
+			my_az1, my_az2 = my_baz-my_amp, my_baz+my_amp
+			my_coord  = coordsys.transform("hor", "equ", coordsys.Coords(
+				az=np.array([my_az1,my_az2]), el=el), ctime=obsinfo.ctime[subinds], site=site)
+			my_pixs   = enmap.sky2pix(shape, wcs, [my_coord.dec, my_coord.ra])
+			my_pixs   = utils.nint(my_pixs) # [{y,x},{from,to},nobs]
+			my_pixs   = np.sort(my_pixs,1)  # make sure from is < to
+			xwidths   = np.abs(utils.nint(obsinfo.dur[subinds] * (15/utils.hour/wcs.wcs.cdelt[0])))
+			y1, x1    = my_pixs[:,0]
+			y2        = my_pixs[0,1]
+			# Skew the x values
+			x1 -= skew[y1]
+			x2  = x1 + xwidths
+			pixbox = np.array([[y1,x1],[y2,x2]]) # [{from,to},{y,x},nobs]
+			pixbox = np.moveaxis(pixbox, -1, 0)  # [nobs,{from,to},{y,x}]
+			# Build our contribution to the hitcounts
+			accumulate_hits(subhits, gids[subinds], pixbox, weights=obsinfo.ndet[subinds], callback=prog_printer)
+			#accumulate_hits(subhits, gids[subinds], pixbox, weights=obsinfo.ndet[subinds])
+			# Apply the y-dependent scaling
+			subhits *= yexp[:,None]
+			# Unskew and add into running total
+			hitmaps += unskew_map(subhits, skew)
+	print()
+	return hitmaps
+
+def calc_delta_score(cumhits, thits, weightmap, maxrat=1e3):
+	"""Find which split of cumhits[nsplit,ngroup,ny,nx] it's best to add
+	thits[ngroup,ny,nx] to based on which sees the best fractional improvement,
+	defined as (cumhits+thits)/cumhits-1 = thits/cumhits. This would often lead
+	to division by zero, which wouldn't be catastrophic, but would lose us the
+	ability to distinguish between multiple cases that would all fill in empty
+	pixels. So we cap the ratio to a large number."""
+	with utils.nowarn():
+		ratio = thits/cumhits
+		np.nan_to_num(ratio, copy=False, nan=0, posinf=maxrat)
+		ratio = np.maximum(ratio, 0)
+	Δscore = np.sum(ratio*weightmap,(-3,-2,-1)) # [nsplit]
+	return Δscore
+
+def smartsplit(obsinfo, gids, tids, geo=None, nsplit=2, minweight=0.1, niter=3, dtype=np.float32):
+	if geo is None: geo = enmap.geometry2(res=1*utils.degree)
+	shape, wcs = geo
+	# 1. build hitmaps for each group-time combination
+	ngroup= int(np.max(gids))+1
+	ntid  = int(np.max(tids))+1
+	gtids = tids*ngroup+gids
+	hitmaps = enmap.zeros((ntid,ngroup,shape[-2],shape[-1]),wcs,dtype=dtype)
+	build_hitmaps(obsinfo, gtids, geo=geo, dtype=dtype, hitmaps=hitmaps.reshape(-1,shape[-2],shape[-1]))
+	# 2. Define the reference area, which we will try to keep as even as
+	#    possible between the splits. It will be the area observed by all
+	#    groups. Areas outside this count less in the optimization
+	mask      = np.all(np.sum(hitmaps,0)>0,0)
+	weightmap = np.maximum(mask, minweight)
+	# 3. hand them out using greedy algorithm
+	cumhits = enmap.zeros((nsplit,ngroup,shape[-2],shape[-1]), wcs, dtype=dtype)
+	tid_split  = np.full(ntid,-1,int)
+	for ti in range(ntid):
+		print("\rAllocating time-chunk %5d/%d" % (ti+1, ntid), end="")
+		Δscore = calc_delta_score(cumhits, hitmaps[ti], weightmap)
+		ibest  = np.argmax(Δscore)
+		tid_split[ti] = ibest
+		cumhits[ibest] += hitmaps[ti]
+	print()
+	# 3. maybe optimize in the end, but not sure how important that
+	# actually is
+	nmoved = 0
+	for it in range(niter):
+		for ti in range(ntid):
+			# remove from current, and find which would be the best place to put it
+			cumhits[tid_split[ti]] -= hitmaps[ti]
+			Δscore = calc_delta_score(cumhits, hitmaps[ti], weightmap)
+			ibest  = np.argmax(Δscore)
+			nmoved += ibest != tid_split[ti]
+			tid_split[ti] = ibest
+			cumhits[ibest] += hitmaps[ti]
+			print("\rOptimizing %5d/%d Changes %4d" % (it*ntid+ti+1, niter*ntid, nmoved), end="")
+	print()
+	# 4. format as splitinfo. But maybe just split_tids, cumhits tuple would be better..
+	splitinfo = bunch.Bunch(dgroups=[bunch.Bunch(splits=[bunch.Bunch(inds=[], hits=0) for i in range(nsplit)]) for i in range(ngroup)])
+	for gi in range(ngroup):
+		for si in range(nsplit):
+			split_tids = np.zeros(ntid, bool)
+			split_tids[tid_split] = True
+			# split_tids has length ntid. We want all the indices into tids that match those  tid-values
+			splitinfo.dgroups[gi].splits[si].inds = np.where(split_tids[tids] & (gids == gi))[0]
+			splitinfo.dgroups[gi].splits[si].hits = cumhits[si,gi]
+	return splitinfo
+
+print("Yep, all the time until now was spent loading python modules")
+dev     = device.get_device("minimal")
+# 1. query our database. The query should cover all the data we want
+# to consider, even what will ultimately be mapped separately. It will
+# be split into parts using the --dsplit argument.
+loader  = loading.Loader(args.context, type=args.loader, dev=dev)
+obsinfo = loader.query(args.query)
+# 2. Split into detector groups and and sub-divisions that we want to be evenly balanced,
+# and collapse these into a single 1d index
+dids, dnames = dsplit(obsinfo, args.dsplit)
+sids, snames = ssplit(obsinfo, args.ssplit)
+gids, ginds  = utils.label_multi([dids, sids], return_index=True)
+gnames = ajoin([dnames[dids[ginds]],snames[sids[ginds]]], "_")
+print(gnames)
+ngroup = int(np.max(gids))+1
+print(ngroup, len(gnames))
+# 3. Split the time axis into the blocks that will be the smallest unit
+# of data we distribute
+tids, tnames = tsplit(obsinfo, args.tsplit)
+print("Splitting %d obs in %d time-chunks over %d datasets (%s) with %d subsets (%s) into %d splits" % (len(obsinfo), len(tnames), len(dnames), ",".join(dnames), len(snames), ",".join(snames), args.nsplit))
+# 4. Can greatly speed things up by merging compatible observations in the same group.
+# After this, mobsinfo, gids[minds] and tids[minds] are what's relevant, and hopefully
+# much smaller
+mids = utils.label_multi([gids, tids])
+mobsinfo, minds, omids = merge_obsinfo(obsinfo, mids)
+print("Simplifying to %d merged obs" % len(mobsinfo))
+# 5. Build our initial exposure geometry
+shape, wcs = enmap.geometry2(res=args.res*utils.degree)
+
+import pdb
+pdb.set_trace()
+
+
+# 6. Ok, do our splitting
+print("Assigning chunks...")
+splitinfo = smartsplit(mobsinfo, gids[minds], tids[minds], geo=(shape, wcs), nsplit=args.nsplit)
+print("Unsimplifying")
+splitinfo = splitinfo_unmerge_inds(splitinfo, omids)
+# 7. Optionally write out the hitcounts. TODO: gnames
+if args.write_hits: write_split_hits(args.odir + "/misc", splitinfo, gnames)
+# 8. Merge across sub-divisions. For each split, anything with the same did will
+# be combined
+print("Merging subsets into final lists")
+splitinfo = splitinfo_submerge(splitinfo, dids[ginds])
+# 9. Write the result
+write_split_ids(args.odir, splitinfo, obsinfo, dnames)
+if args.write_hits: write_split_hits(args.odir + "/misc", splitinfo, dnames)

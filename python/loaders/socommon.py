@@ -357,7 +357,7 @@ def load_obslist(fname):
 			toks = line.split()
 			if len(toks) > 0: idlist.append(toks[0])
 	# Check first entry to see if these are obsids or not
-	ncolon = len(idlist[0].split(":")) if len(idlist) > 0 else 0
+	ncolon = len(idlist[0].split(":"))-1 if len(idlist) > 0 else 0
 	if ncolon == 0:
 		# We have a plain obslist
 		obss    = idlist

@@ -1,4 +1,4 @@
-import numpy as np, os
+import numpy as np, os, contextlib
 from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch, colors
 from . import pmat, tiling, device, socut, gutils, soeph
 from .logging import L
@@ -6,10 +6,6 @@ from .logging import L
 config.default("autocut",       "objects,sidelobes", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut. sidelobes: The sidelobe cut")
 config.default("object_cut",    "planets:10,asteroids:5")
 # planetas and asteroids defined in sogma.soeph
-
-# TODO: site should be a part of the observation. Add it and
-# update the functions here, and those in SignalMap, to use it
-# in the pointing
 
 def autocut(obs, id="?", which=None, geo=None, dev=None):
 	"""Main driver. Performs all autocuts, merges them with any existing cuts,
@@ -27,6 +23,9 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	obs.cuts = cuts
 	return obs
 
+# TODO: This function takes around 1 sec, dominated by ephem_map+lmap+pmap
+# Could potentially speed up by using pmap.backward to figure out which tiles
+# are hit, instead of building a fullsky map.
 def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*utils.arcmin,
 		dt=100, dr=1*utils.arcsec, dev=None):
 	if dev is None: dev = device.get_device()
@@ -45,8 +44,8 @@ def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*uti
 	pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, site=obs.site, partial=True, dev=dev)
 	tod  = dev.pools["ft"].zeros(obs.tod.shape, obs.tod.dtype)
 	pmap.forward(tod, lmap.lmap)
-	# turn non-zero values into a cuts object
-	cuts = mask2cut(tod, dev=dev)
+	# turn non-zero values into a cuts object. Done with pmap here, so can use pointing pool
+	cuts = mask2cut(tod, dev=dev, pool=dev.pools["pointing"])
 	# return result as length-1 list of cuts
 	# It's a list of cuts because other cut types can return multiple cuts
 	# User must merge with other cuts and gapfill as necessary
@@ -69,28 +68,29 @@ def sidelobe_cut(obs, id="?", object_list=None, geo=None, dev=None):
 		cutss.append(cuts)
 	return cutss
 
-# TODO: Idea for optimizing this
-# 1. Build distance map from mask in constructor
-# 2. For each tod, calculate obj-centered coordinates for a few representative positions,
-#    e.g. 10 times, 10 azs. Look these up in distance map. Compare to fplane radius and
-#    max point distance. If further away than that, skip all the rest. This will be the
-#    case for most observations, making this practically free on average.
 class SidelobeCutter:
-	def __init__(self, mask, objname, dtype=np.float32, rise_tol=1*utils.degree, dev=None):
-		self.dev  = dev or device.get_device()
-		self.mask = mask
-		self.lmap = tiling.enmap2lmap(mask.astype(dtype), dev=self.dev)
-		self.objname= objname
+	def __init__(self, mask, objname, dtype=np.float32, rise_tol=1*utils.degree, dist_tol=5*utils.degree, dev=None):
+		self.dev     = dev or device.get_device()
+		self.mask    = mask
+		self.distmap = enmap.distance_transform(mask<1).astype(dtype)
+		self.lmap    = tiling.enmap2lmap(mask.astype(dtype), dev=self.dev)
+		self.objname = objname
 		self.sys  = "hor,on=%s" % objname
 		self.rise_tol = rise_tol
+		self.dist_tol = dist_tol
 	def make_cuts(self, obs, id="?"):
 		# First check if the object is above the horizon. We just check the endpoints
 		# to keep things simple
 		ts    = obs.ctime[[0,-1]]
 		hor   = coordsys.transform(self.sys, "hor", coordsys.Coords(ra=0, dec=0), ctime=ts, site=obs.site)
 		risen = np.any(hor.el > self.rise_tol)
-		if not risen: return socut.Simplecut(ndet=obs.tod.shape[0], nsamp=obs.tod.shape[1])
-		# Ok, it's above the horizon, check which samples are affected
+		if not risen:
+			return socut.Simplecut(ndet=obs.tod.shape[0], nsamp=obs.tod.shape[1])
+		# Ok, it's above the horizon. Estimate if we get close enough to the mask to bother
+		mindist = estimate_mindist(obs, self.distmap, sys=self.sys, step=self.dist_tol)
+		if mindist > self.dist_tol:
+			return socut.Simplecut(ndet=obs.tod.shape[0], nsamp=obs.tod.shape[1])
+		# Ok, looks like we get close enough that we must do this properly
 		try:
 			pmap = pmat.PmatMap(self.lmap.fshape, self.lmap.fwcs, obs.ctime,
 				obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, site=obs.site,
@@ -107,9 +107,31 @@ class SidelobeCutter:
 			# explicitly instead of relying on gpu_mm to catch things itself
 			L.print("Error cutting %s sidelobes for %s: Pointing overflow. Skipping cut" % (self.objname, id), level=2, color=colors.red)
 			return socut.Simplecut(ndet=obs.tod.shape[0], nsamp=obs.tod.shape[1])
-		# turn non-zero values into a cuts object
-		cuts = mask2cut(tod, dev=self.dev)
+		# turn non-zero values into a cuts object. Done with pmap here, so can
+		# use pointing pool
+		cuts = mask2cut(tod, dev=self.dev, pool=self.dev.pools["pointing"])
 		return cuts
+
+def estimate_mindist(obs, distmap, sys="equ", step=1*utils.degree):
+	# Define the spare points we will sample the boresight path at
+	az1, az2 = utils.minmax(obs.boresight[1,::100])
+	t1,  t2  = obs.ctime[[0,-1]]
+	el       = obs.boresight[0,0] # assume (near) constant-el
+	tstep    = step / (15*utils.degree/utils.hour)
+	naz      = utils.ceil((az2-az1)/step)+1
+	nt       = utils.ceil((t2-t1)/tstep)+1
+	azs      = np.linspace(az1, az2, naz)
+	ts       = np.linspace(t1,  t2,  nt)
+	# Measure fplane radius
+	frad     = np.max(np.sum(obs.point_offset**2,1))**0.5
+	# Transform these to the target coordinate system
+	icoords  = coordsys.Coords(az=azs[None,:], el=el)
+	ocoords  = coordsys.transform("hor", sys, icoords, ctime=ts[:,None], site=obs.site)
+	# Read off the map
+	opos     = np.array([ocoords.dec, ocoords.ra]).reshape(2,-1)
+	dist     = distmap.at(opos, order=0, cval=np.inf)
+	mindist  = max(np.min(dist)-frad,0)
+	return mindist
 
 def autocal(obs, prefix=None, dev=None):
 	# Are we doing elmod calibration?
@@ -314,23 +336,30 @@ def dump_elmod_tfit(fname, fit):
 
 # Helpers
 
-def mask2cut(tod, dev=None):
-	if dev is None: dev = device.get_device()
-	# I think the best way to do this is with np.nonzero followed by
-	# converting that to cuts. I considered starting from np.diff, but
-	# too many big arrays are involved
-	dets, samps = dev.np.nonzero(tod)
-	if len(dets) == 0:
-		return socut.Simplecut(ndet=tod.shape[0], nsamp=tod.shape[1])
-	# Now need to find offset and length of consecutive regions.
-	# Cupy is being clunky here, so must construct this array
-	one = dev.np.ones(1,samps.dtype)
-	isstart = (dev.np.ediff1d(samps, to_begin=-one, to_end=-one)!=1)|(dev.np.ediff1d(dets, to_begin=one, to_end=one)!=0)
-	edges   = dev.np.nonzero(isstart)[0]
-	offs    = edges[:-1]
-	lens    = dev.np.diff(edges)
-	# Format as cuts. These are expected to be on the cpu
-	cuts    = socut.Simplecut(dev.get(dets[offs]), dev.get(samps[offs]),
+# The previous version of mask2cut was optimized for a small cut fraction, but
+# used 9*todsize*cutfrac memory, which would be huge when cutfrac is big.
+# This version uses todsize/2 + tiny memory, where tiny would only become
+# problematic if the total number of cut ranges gets to O(10%) of the number
+# of samples, which should be impossible at this stage
+def mask2cut(tod, dev=None, pool=None):
+	if dev  is None: dev  = device.get_device()
+	ndet, nsamp = tod.shape
+	with pool.as_allocator() if pool is not None else contextlib.nullcontext():
+		# to boolean. Cost: 1/4
+		mask = dev.np.zeros((ndet,nsamp+2), bool)
+		mask[:,1:-1] = tod
+		# changes. Cost: 1/4
+		edges = mask[:,1:] != mask[:,:-1]
+		# We assume that there won't be very many edges. Each edge costs 16 bytes,
+		# so if that assumption fails, we can run out of memory. This would require
+		# the cuts to be oscillating rapidly, which shouldn't happen.
+		detsdets, startend = dev.np.nonzero(edges)
+		# Because we False-padded, we're guaranteed to have start-end pairs
+		dets   = detsdets[0::2]
+		starts = startend[0::2]
+		lens   = startend[1::2]
+		lens  -= starts
+	cuts = socut.Simplecut(dev.get(dets), dev.get(starts),
 		dev.get(lens), ndet=tod.shape[0], nsamp=tod.shape[1])
 	return cuts
 

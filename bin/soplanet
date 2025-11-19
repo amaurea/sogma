@@ -30,6 +30,7 @@ args = parser.parse_args()
 
 comm_all   = mpi.COMM_WORLD
 comm_per   = mpi.COMM_SELF
+mpi.install_abort_hook()
 dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)

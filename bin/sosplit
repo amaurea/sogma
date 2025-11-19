@@ -48,8 +48,6 @@ def dsplit(obsinfo, by="tube"):
 	return inds, uvals
 
 def ssplit(obsinfo, by="plain", tol=1*utils.degree, weltol=0.1):
-	import pdb
-	pdb.set_trace()
 	if   by == "plain":
 		return np.zeros(len(obsinfo),int), np.array([""])
 	elif by == "crosslink":
@@ -354,7 +352,6 @@ def smartsplit(obsinfo, gids, tids, geo=None, nsplit=2, minweight=0.1, niter=3, 
 			splitinfo.dgroups[gi].splits[si].hits = cumhits[si,gi]
 	return splitinfo
 
-print("Yep, all the time until now was spent loading python modules")
 dev     = device.get_device("minimal")
 # 1. query our database. The query should cover all the data we want
 # to consider, even what will ultimately be mapped separately. It will
@@ -367,9 +364,7 @@ dids, dnames = dsplit(obsinfo, args.dsplit)
 sids, snames = ssplit(obsinfo, args.ssplit)
 gids, ginds  = utils.label_multi([dids, sids], return_index=True)
 gnames = ajoin([dnames[dids[ginds]],snames[sids[ginds]]], "_")
-print(gnames)
 ngroup = int(np.max(gids))+1
-print(ngroup, len(gnames))
 # 3. Split the time axis into the blocks that will be the smallest unit
 # of data we distribute
 tids, tnames = tsplit(obsinfo, args.tsplit)
@@ -382,11 +377,6 @@ mobsinfo, minds, omids = merge_obsinfo(obsinfo, mids)
 print("Simplifying to %d merged obs" % len(mobsinfo))
 # 5. Build our initial exposure geometry
 shape, wcs = enmap.geometry2(res=args.res*utils.degree)
-
-import pdb
-pdb.set_trace()
-
-
 # 6. Ok, do our splitting
 print("Assigning chunks...")
 splitinfo = smartsplit(mobsinfo, gids[minds], tids[minds], geo=(shape, wcs), nsplit=args.nsplit)

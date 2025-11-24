@@ -82,15 +82,20 @@ def merge_obsinfo(obsinfo, mids, tol=10):
 	# the same ctime
 	gids = utils.label_similar_groups_fast(obsinfo.ctime, tol=tol)
 	# Only merge inside each merge-group
-	ids  = utils.label_multi([mids, gids])
+	ids, first_inds = utils.label_multi([mids, gids], return_index=True)
 	n    = int(np.max(ids))+1
 	# Ok, set up our output obsid. Most things can be simply
 	# copied over from the first element in each group, since
 	# they should be the same inside the group
-	first_inds = np.unique(ids, return_index=True)[1]
 	mobsinfo   = obsinfo[first_inds].copy()
 	# The detector count should be accumulated
 	mobsinfo.ndet = utils.bincount(ids, obsinfo.ndet, minlength=n)
+	# * mobsinfo is the merged obsinfo, which should contain much fewer
+	#   entries than the original
+	# * fist_inds is the index into obsinfo each entry in mobsinfo was
+	#   based on
+	# * ids gives which entry in mobsinfo each entry in obsinfo maps onto.
+	#   It can be used to go back to the original obsinfo
 	return mobsinfo, first_inds, ids
 
 def unmerge_inds(inds, omids):
@@ -136,15 +141,17 @@ def splitinfo_submerge(splitinfo, dlabel):
 def write_split_ids(odir, splitinfo, obsinfo, dnames):
 	utils.mkdir(odir)
 	for dname, dgroup in zip(dnames, splitinfo.dgroups):
+		ndig = utils.ndigit(len(dgroup.splits))
 		for si, split in enumerate(dgroup.splits):
-			print("Writing %s/ids_%s_%d.txt" % (odir, dname, si))
-			np.savetxt("%s/ids_%s_%d.txt" % (odir, dname, si), obsinfo.id[split.inds], fmt="%s")
+			print("Writing %s/ids_%s_%0*d.txt" % (odir, dname, ndig, si))
+			np.savetxt("%s/ids_%s_%0*d.txt" % (odir, dname, ndig, si), obsinfo.id[split.inds], fmt="%s")
 
 def write_split_hits(odir, splitinfo, gnames):
 	utils.mkdir(odir)
 	for gname, dgroup in zip(gnames, splitinfo.dgroups):
+		ndig = utils.ndigit(len(dgroup.splits))
 		for si, split in enumerate(dgroup.splits):
-			enmap.write_map("%s/hits_%s_%d.fits" % (odir, gname, si), split.hits)
+			enmap.write_map("%s/hits_%s_%0*d.fits" % (odir, gname, ndig, si), split.hits)
 
 def build_scancurve(az1, az2, el, t, daz=1*utils.degree, site="so"):
 	naz = utils.ceil((az2-az1)/daz)+1
@@ -230,16 +237,22 @@ class ProgPrinter:
 			print(self.fmt.format(i=self.i, n=self.n), end=self.pend)
 		self.i += 1
 
+def normalize_bore(baz, bel):
+	over = bel>np.pi/2
+	baz  = utils.rewind(np.where(over,baz+np.pi,baz))
+	bel  = np.where(over,np.pi-bel,bel)
+	return baz, bel
+
 def build_hitmaps(obsinfo, gids, geo=None, eltol=1*utils.degree, dtype=np.float64, hitmaps=None, site="so"):
 	if geo is None: geo = enmap.geometry2(res=1*utils.degree)
 	shape, wcs = geo
-	baz    = utils.rewind(obsinfo.baz)
+	baz, bel = normalize_bore(obsinfo.baz, obsinfo.bel)
 	if hitmaps is None:
 		ngroup  = int(np.max(gids))+1
 		hitmaps = enmap.zeros((ngroup,)+shape, wcs, dtype)
 	# 1. split *all* observations by elevation. Groups will come later
-	nel, order, edges = utils.find_similar_groups_fast(obsinfo.bel, tol=eltol)
-	uels = obsinfo.bel[order[(edges[:-1]+edges[1:]-1)//2]]
+	nel, order, edges = utils.find_similar_groups_fast(bel, tol=eltol)
+	uels = bel[order[(edges[:-1]+edges[1:]-1)//2]]
 	tref = obsinfo.ctime[0]
 	# Keep track of our progress
 	ntot = len(obsinfo)
@@ -289,21 +302,30 @@ def build_hitmaps(obsinfo, gids, geo=None, eltol=1*utils.degree, dtype=np.float6
 	print()
 	return hitmaps
 
-def calc_delta_score(cumhits, thits, weightmap, maxrat=1e3):
-	"""Find which split of cumhits[nsplit,ngroup,ny,nx] it's best to add
-	thits[ngroup,ny,nx] to based on which sees the best fractional improvement,
-	defined as (cumhits+thits)/cumhits-1 = thits/cumhits. This would often lead
-	to division by zero, which wouldn't be catastrophic, but would lose us the
-	ability to distinguish between multiple cases that would all fill in empty
-	pixels. So we cap the ratio to a large number."""
-	with utils.nowarn():
-		ratio = thits/cumhits
-		np.nan_to_num(ratio, copy=False, nan=0, posinf=maxrat)
-		ratio = np.maximum(ratio, 0)
-	Δscore = np.sum(ratio*weightmap,(-3,-2,-1)) # [nsplit]
-	return Δscore
+def sanitize_targ_cum(cumhits, targhits, mask, tol=1e-1):
+	avg_targ   = np.sum(targhits*mask,(-2,-1))/np.sum(mask,(-2,-1))
+	minval     = (avg_targ * tol)[:,None,None]
+	targhits   = np.maximum(targhits, minval)
+	cumhits    = np.maximum(cumhits,  minval)
+	return targhits, cumhits
 
-def smartsplit(obsinfo, gids, tids, geo=None, nsplit=2, minweight=0.1, niter=3, dtype=np.float32):
+moo = 0
+def calc_delta_score(cumhits, thits, targhits, weightmap, maxrat=1e3):
+	"""Find which split of cumhits[nsplit,ngroup,ny,nx] it's best to add
+	thits[ngroup,ny,nx] to based on which sees the best score improvement,
+	where score is defined as
+	score   = -sum weightmap * log(cumhits/targhits)**2 =>
+	score'  = -sum weightmap * 2log(cumhits/targhits)/cumhits
+	best way to cap unhit areas: cumhits starts from a small, nonzero value"""
+	return -2*np.sum(np.log(cumhits/targhits) * (thits/cumhits) * weightmap, (-3,-2,-1))
+
+def crop_hitmaps(hitmaps):
+	totmap = np.sum(hitmaps.preflat,0)
+	totmap = enmap.autocrop(totmap)
+	hitmaps= hitmaps.extract(totmap.shape, totmap.wcs)
+	return hitmaps
+
+def smartsplit(obsinfo, gids, tids, geo=None, nsplit=2, minweight=0.1, niter=3, dtype=np.float32, autocrop=True):
 	if geo is None: geo = enmap.geometry2(res=1*utils.degree)
 	shape, wcs = geo
 	# 1. build hitmaps for each group-time combination
@@ -312,17 +334,23 @@ def smartsplit(obsinfo, gids, tids, geo=None, nsplit=2, minweight=0.1, niter=3, 
 	gtids = tids*ngroup+gids
 	hitmaps = enmap.zeros((ntid,ngroup,shape[-2],shape[-1]),wcs,dtype=dtype)
 	build_hitmaps(obsinfo, gtids, geo=geo, dtype=dtype, hitmaps=hitmaps.reshape(-1,shape[-2],shape[-1]))
+	if autocrop:
+		hitmaps = crop_hitmaps(hitmaps)
+		shape, wcs = hitmaps.shape[-2:], hitmaps.wcs
+	# target hitcounts per split
+	targhits = np.sum(hitmaps,0)/nsplit
 	# 2. Define the reference area, which we will try to keep as even as
 	#    possible between the splits. It will be the area observed by all
 	#    groups. Areas outside this count less in the optimization
 	mask      = np.all(np.sum(hitmaps,0)>0,0)
 	weightmap = np.maximum(mask, minweight)
 	# 3. hand them out using greedy algorithm
-	cumhits = enmap.zeros((nsplit,ngroup,shape[-2],shape[-1]), wcs, dtype=dtype)
+	cumhits    = enmap.zeros((nsplit,)+targhits.shape, targhits.wcs, targhits.dtype)
+	targhits, cumhits = sanitize_targ_cum(cumhits, targhits, mask)
 	tid_split  = np.full(ntid,-1,int)
 	for ti in range(ntid):
 		print("\rAllocating time-chunk %5d/%d" % (ti+1, ntid), end="")
-		Δscore = calc_delta_score(cumhits, hitmaps[ti], weightmap)
+		Δscore = calc_delta_score(cumhits, hitmaps[ti], targhits, weightmap)
 		ibest  = np.argmax(Δscore)
 		tid_split[ti] = ibest
 		cumhits[ibest] += hitmaps[ti]
@@ -334,7 +362,7 @@ def smartsplit(obsinfo, gids, tids, geo=None, nsplit=2, minweight=0.1, niter=3, 
 		for ti in range(ntid):
 			# remove from current, and find which would be the best place to put it
 			cumhits[tid_split[ti]] -= hitmaps[ti]
-			Δscore = calc_delta_score(cumhits, hitmaps[ti], weightmap)
+			Δscore = calc_delta_score(cumhits, hitmaps[ti], targhits, weightmap)
 			ibest  = np.argmax(Δscore)
 			nmoved += ibest != tid_split[ti]
 			tid_split[ti] = ibest
@@ -345,8 +373,9 @@ def smartsplit(obsinfo, gids, tids, geo=None, nsplit=2, minweight=0.1, niter=3, 
 	splitinfo = bunch.Bunch(dgroups=[bunch.Bunch(splits=[bunch.Bunch(inds=[], hits=0) for i in range(nsplit)]) for i in range(ngroup)])
 	for gi in range(ngroup):
 		for si in range(nsplit):
+			# tid_split has which split each tid goes into
 			split_tids = np.zeros(ntid, bool)
-			split_tids[tid_split] = True
+			split_tids[tid_split==si] = True
 			# split_tids has length ntid. We want all the indices into tids that match those  tid-values
 			splitinfo.dgroups[gi].splits[si].inds = np.where(split_tids[tids] & (gids == gi))[0]
 			splitinfo.dgroups[gi].splits[si].hits = cumhits[si,gi]
@@ -358,6 +387,8 @@ dev     = device.get_device("minimal")
 # be split into parts using the --dsplit argument.
 loader  = loading.Loader(args.context, type=args.loader, dev=dev)
 obsinfo = loader.query(args.query)
+# Avoid being confused by el > 90°
+obsinfo.baz, obsinfo.bel = normalize_bore(obsinfo.baz, obsinfo.bel)
 # 2. Split into detector groups and and sub-divisions that we want to be evenly balanced,
 # and collapse these into a single 1d index
 dids, dnames = dsplit(obsinfo, args.dsplit)

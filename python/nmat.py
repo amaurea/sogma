@@ -593,6 +593,288 @@ class NmatAdaptive(Nmat):
 			bins=self.bins, iD=iD, iE=iE, V=self.V,
 			Kh=Kh, ivar=ivar, nwin=self.nwin, nsamp=self.nsamp, normexp=self.normexp)
 
+# This one somehow made things worse
+class NmatAdaptive2(Nmat):
+	def __init__(self, eig_lim=16, single_lim=0.55, window=2, sampvar=1e-2,
+			bsmooth=50, atm_res=2**(1/4), maxmodes=100, dev=None,
+			hbmps=None, bsize_mean=None, bsize_per=None,
+			bins=None, iD=None, iE=None, V=None, Kh=None, ivar=None, nwin=None,
+			nsamp=None, normexp=-1):
+		self.dev = dev or device.get_device()
+		self.eig_lim    = eig_lim
+		self.single_lim = single_lim
+		self.window     = window
+		self.sampvar    = sampvar
+		self.bsmooth    = bsmooth
+		self.atm_res    = atm_res
+		self.maxmodes   = maxmodes
+		self.normexp    = normexp
+		# These are usually computed in build()
+		self.bsize_mean = bsize_mean
+		self.bsize_per  = bsize_per
+		self.bins       = bins
+		self.nwin       = nwin
+		self.nsamp      = nsamp
+		self.ready = all([a is not None for a in [bsize_mean,bsize_per,hbmps,bins,iD,iE,V,Kh,ivar,nwin]])
+		if self.ready:
+			self.iD   = dev.np.ascontiguousarray(iD)
+			self.ivar = dev.np.ascontiguousarray(ivar)
+			self.hbmps= dev.np.ascontiguousarray(hbmps)
+			self.V    = [dev.np.ascontiguousarray(v) for v in V]
+			self.Kh   = [dev.np.ascontiguousarray(kh) for kh in Kh]
+			self.iE   = iE
+			self.maxbin = np.max(self.bins[:,1]-self.bins[:,0])
+		self.dev.garbage_collect()
+	def build(self, tod, srate, extra=False, **kwargs):
+		# Improve on NmatDetvecs in two ways:
+		# 1. Factorize out per-detector power
+		# 2. Use the shape of the power spectrum to define
+		#    both where to measure the eigenvectors, and
+		#    the bins for the eigenvalues.
+		nwin = utils.nint(self.window*srate)
+		ndet, nsamp = tod.shape
+		nfreq       = nsamp//2+1
+		# Apply window in-place, to prefpare for fft
+		gutils.apply_window(tod, nwin)
+		ftod = self.dev.pools["ft"].empty((ndet,nfreq), utils.complex_dtype(tod.dtype))
+		self.dev.lib.rfft(tod, ftod)
+		# Normalize to avoid 32-bit overflow in atmospheric region.
+		# Make sure apply and ivar are consistent
+		ftod *= nsamp**self.normexp
+		# Undo window
+		gutils.apply_window(tod, nwin, -1)
+		return self.build_fourier(ftod, srate, nsamp)
+	def build_fourier(self, ftod, srate, nsamp):
+		ndet, nfreq = ftod.shape
+		dtype = utils.real_dtype(ftod.dtype)
+		nwin  = utils.nint(self.window*srate)
+		# data-type to use in mode-finding. At some point it seemed like
+		# this needed to be float64, but float32 turned out to be fine
+		# after fixing some issues with overfit correlations
+		wtype = np.float32
+		# [Step 1]: Build a detector-uncorrelated noise model
+		# 1a. Measure power spectra
+		ps  = self.dev.np.abs(ftod)**2  # full-res ps
+		# White noise estimate
+		# The relative sample variance is 2/nsamp, which we want to be better than self.sampvar.
+		# This requires nsamp > 2/self.sampvar
+		bsize_mean = max(1,utils.ceil(2/self.sampvar/ndet))
+		bsize_per  = max(1,utils.ceil(2/self.sampvar))
+		ivar  = self.dev.np.mean(1/gutils.downgrade(ps, bsize_per), -1)
+		ivar *= nsamp**(2*self.normexp+1)
+		# Go to units where the white noise level has been divided out
+		ps   *= ivar[:,None]
+		ftod *= ivar[:,None]**0.5
+		mps = self.dev.np.mean(ps,0)    # mean det power
+		mtod= self.dev.np.mean(ftod,0)
+		psm = self.dev.np.abs(mtod)**2  # power of common mode
+		freqs = np.linspace(0, srate, nfreq)
+		# Simpler if the bin sizes are multiples of each other
+		bsize_per  = utils.ceil(bsize_per, bsize_mean)
+		bmps       = gutils.downgrade(mps, bsize_mean)
+		# Precompute whitening version
+		hbmps      = bmps**-0.5
+		# 1b. Divide out from the tod. After this ftod is whitened, except
+		# for the detector correlations
+		self.dev.lib.block_scale(ftod, hbmps, bsize=bsize_mean, inplace=True)
+		# [Step 2]: Build the frequency bins
+		# 2a. Measure the smooth background behind the peaks. The bin size should
+		# be wider then any spike we want to ignore. A good size would be the 1/scan_period,
+		# but we don't have az here. Can't use too wide bins, or we won't find the
+		# first spikes
+		bsize_smooth = self.bsmooth
+		smooth_bps   = gutils.downgrade(mps, bsize_smooth, op=self.dev.np.median)
+		smooth_ps    = gutils.logint(smooth_bps, self.dev.np.arange(nfreq)/bsize_smooth)
+		# 2b. Find our spikes
+		rel_ps       = mps/smooth_ps
+		bins_spike   = find_spikes(self.dev.get(rel_ps))
+		# If we detect a spike at the very beginning, in the extrapolated region, then it's
+		# unreliable
+		if len(bins_spike) > 0 and bins_spike[0,0] == 0: bins_spike = bins_spike[1:]
+		# 2c. Find atmospheric regions using smooth_bps
+		bins_atm     = find_atm_bins(smooth_bps, bsize=bsize_smooth, step=self.atm_res)
+		# Add a final all-the-rest bin
+		bins_atm     = np.concatenate([bins_atm,[[bins_atm[-1,1],nfreq]]],0)
+		# Want to exclude the spikes from the atmospheric model.
+		# Since we model the freq-bins as independent and zero-mean,
+		# we can just zero out the spike regions after measuring
+		# them, and then compensate for the loss of power aftewards.
+		# This lets us avoid splitting the atm-bins when measuring.
+		# 3a. Find modes in spike bins
+		# This is a bit ad-hoc, but it gives high but not completely dominating
+		# weight to the low-l atmospheric region
+		weight = (mps/np.mean(mps))**0.5
+		if len(bins_spike) > 0:
+			spike_power = noise_modes_hybrid(ftod, bins_spike, weight=weight,
+				eig_lim=self.eig_lim, single_lim=self.single_lim, nmax=self.maxmodes, wtype=wtype)
+		# 3c. Find atm modes
+		mask = self.dev.np.ones(ftod.shape[-1], np.int32)
+		for bi, (b1,b2) in enumerate(bins_spike):
+			mask[b1:b2] = 0
+		atm_power = noise_modes_hybrid(ftod, bins_atm, weight=weight, mask=mask,
+			eig_lim=self.eig_lim, single_lim=self.single_lim, nmax=self.maxmodes, wtype=wtype)
+		# 4. Interleave bins, unless we don't need to
+		if len(bins_spike) > 0:
+			bins, srcs, sinds = override_bins([bins_atm, bins_spike])
+			bins  = np.array(bins)
+			power = bunch.Bunch()
+			for key in atm_power:
+				power[key] = pick_data([atm_power[key], spike_power[key]], srcs, sinds)
+		else:
+			bins  = np.array(bins_atm)
+			power = atm_power
+		# 5. Precompute Kh and iD
+		nbin = len(bins)
+		iD = 1/self.dev.np.array(power.Ds).astype(wtype, copy=False) # [nbin,ndet]
+		iE = [1/e.astype(wtype, copy=False) for e in power.Es]       # [nbin][nmode]
+		# Precompute Kh = (E" + V'D"V)**-0.5. [nbin][nmode,nmode]
+		Kh = []
+		for bi in range(nbin):
+			V  = power.Vs[bi].astype(wtype, copy=False)
+			iK = self.dev.np.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
+			Kh.append(np.linalg.cholesky(self.dev.np.linalg.inv(iK)))
+		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
+		# Convert to target precsion
+		iD = iD.astype(dtype, copy=False)
+		iE = [a.astype(dtype, copy=False) for a in iE]
+		Kh = [a.astype(dtype, copy=False) for a in Kh]
+		# 6. nsamp normalization of hbmps
+		hbmps *= nsamp**self.normexp
+		# (nsamp**normexp)**2 * nsamp = nsamp**(2*normexp+1)
+		self.dev.garbage_collect()
+		# 8. Construct the full noise model
+		return NmatAdaptive(
+			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
+			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
+			maxmodes=self.maxmodes, dev=self.dev,
+			hbmps=hbmps, bsize_mean=bsize_mean, bsize_per=bsize_per,
+			bins=bins, iD=iD, iE=iE, V=power.Vs, Kh=Kh, ivar=ivar, nwin=nwin,
+			nsamp=nsamp, normexp=self.normexp)
+	def apply(self, tod, inplace=True, nofft=False):
+		self.check_ready()
+		t1 = self.dev.time()
+		if not inplace: tod = tod.copy()
+		if not nofft: gutils.apply_window(tod, self.nwin)
+		t2 = self.dev.time()
+		if not nofft:
+			ft = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))
+			self.dev.lib.rfft(tod, ft)
+		else: ft = tod
+		# Handle the white noise
+		ft *= self.ivar[:,None]
+		# If we don't cast to real here, we get the same result but much slower
+		# real_dtype needed for the nofft case
+		rft = ft.view(utils.real_dtype(tod.dtype))
+		t3  = self.dev.time()
+		# Apply the high-resolution, non-detector-correlated part of the model.
+		# The *2 compensates for the cast to real
+		self.dev.lib.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
+		t4  = self.dev.time()
+		# Then handle the detector-correlation part.
+		# First set up work arrays. Safe to overwrite tod array here,
+		# since we'll overwrite it with the ifft afterwards anyway
+		ndet     = len(tod)
+		maxnmode = max([V.shape[1] for V in self.V])
+		nbin     = len(self.bins)
+		with self.dev.pools["tod"].as_allocator():
+			# Tmp must be big enough to hold a full bin's worth of data
+			tmp    = self.dev.np.empty([maxnmode,2*self.maxbin],dtype=rft.dtype)
+			vtmp   = self.dev.np.empty([ndet,maxnmode],         dtype=rft.dtype)
+			divtmp = self.dev.np.empty([ndet,maxnmode],         dtype=rft.dtype)
+			apply_vecs2(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
+		self.dev.synchronize()
+		t5 = self.dev.time()
+		# Second half of high-resolution part
+		self.dev.lib.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
+		t6 = self.dev.time()
+		# And finish
+		if not nofft: self.dev.lib.irfft(ft, tod)
+		t7 =self.dev.time()
+		if not nofft: gutils.apply_window(tod, self.nwin)
+		t8 =self.dev.time()
+		L.print("iN sub win %6.4f fft %6.4f s1 %6.4f mats %6.4f s2 %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6,t8-t7, tod.shape[0], tod.shape[1], maxnmode, len(self.bins)), level=3)
+		return tod
+	def white(self, gtod, inplace=True):
+		self.check_ready()
+		if not inplace: gtod.copy()
+		gutils.apply_window(gtod, self.nwin)
+		gtod *= self.ivar[:,None]
+		gutils.apply_window(gtod, self.nwin)
+		return gtod
+	# Debug functions below. These are not part of the
+	# Nmat interface.
+	def eval_cov(self, d1=None, d2=None, finds=None):
+		"""This debug function evaluates the covariance between detector sets d1 and d2
+		at the given frequency indices."""
+		self.check_ready()
+		nbin, ndet = self.iD.shape
+		nfreq      = self.bins[-1,1]
+		if d1    is None: d1 = self.dev.np.arange(ndet)
+		if d2    is None: d2 = self.dev.np.arange(ndet)
+		if finds is None: fidns = self.dev.np.arange(nfreq)
+		# Evaluate the core cov = D+VEV' for each bin. Our model is
+		C = self.dev.np.zeros((len(d1),len(d2),nbin), self.iD.dtype)
+		for bi, b in enumerate(self.bins):
+			D  = self.dev.np.diag(1/self.iD[bi])[d1][:,d2]
+			V1 = self.V[bi][d1]
+			V2 = self.V[bi][d2]
+			C[:,:,bi] = D + V1.dot(1/self.iE[bi][:,None]*V2.T)
+		# Read this off at the requested indices
+		binds = np.searchsorted(self.bins[:,1], finds, side="right")
+		C = C[:,:,binds]
+		# Modify by the high-res scale
+		C *= self.hbmps[finds//self.bsize_mean]**-2
+		return C
+	def eval_var(self, d=None, finds=None):
+		"""This debug function evaluates the variance for det set d
+		at the given frequency indices."""
+		self.check_ready()
+		nbin, ndet = self.iD.shape
+		nfreq      = self.bins[-1,1]
+		if d     is None: d  = self.dev.np.arange(ndet)
+		if finds is None: fidns = self.dev.np.arange(nfreq)
+		# Evaluate the core cov = D+VEV' for each bin. Our model is
+		ps = self.dev.np.zeros((len(d),nbin), self.iD.dtype)
+		for bi, b in enumerate(self.bins):
+			ps[:,bi] = 1/self.iD[bi,d] + self.dev.np.sum(self.V[bi][d]**2/self.iE[bi],-1)
+		# Read this off at the requested indices
+		binds = np.searchsorted(self.bins[:,1], finds, side="right")
+		ps  = ps[:,binds]
+		# Modify by the high-res scale
+		ps *= self.hbmps[finds//self.bsize_mean]**-2
+		return ps
+	def det_slice(self, sel):
+		ivar = self.ivar[sel]
+		iD   = self.iD[:,sel]
+		V    = [v[sel] for v in self.V]
+		Kh   = []
+		for bi, b in enumerate(self.bins):
+			iK = self.dev.np.diag(self.iE[bi]) + V[bi].T.dot(iD[bi,:,None] * V[bi])
+			Kh.append(np.linalg.cholesky(self.dev.np.linalg.inv(iK)))
+		return NmatAdaptive(
+			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
+			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
+			maxmodes=self.maxmodes, dev=self.dev, hbmps=self.hbmps,
+			bsize_mean=self.bsize_mean, bsize_per=self.bsize_per,
+			bins=self.bins, iD=iD, iE=self.iE, V=V,
+			Kh=Kh, ivar=ivar, nwin=self.nwin, normexp=self.normexp)
+	def inv(self):
+		iE = [1/ie for ie in self.iE]
+		iD = 1/self.iD
+		Kh = []
+		for bi, b in enumerate(self.bins):
+			iK = self.dev.np.diag(iE[bi]) + self.V[bi].T.dot(iD[bi,:,None] * self.V[bi])
+			Kh.append(np.linalg.cholesky(self.dev.np.linalg.inv(iK)))
+		ivar  = 1/self.ivar
+		hbmps = 1/self.nsamp/self.hbmps
+		return NmatAdaptive(
+			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
+			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
+			maxmodes=self.maxmodes, dev=self.dev, hbmps=hbmps,
+			bsize_mean=self.bsize_mean, bsize_per=self.bsize_per,
+			bins=self.bins, iD=iD, iE=iE, V=self.V,
+			Kh=Kh, ivar=ivar, nwin=self.nwin, nsamp=self.nsamp, normexp=self.normexp)
+
 class PseudoNmatGapfill(Nmat):
 	def __init__(self, mask, sys="equ,on=saturn", bsize=256, ivar=None, cuts=None, srate=None, buf="model", dev=None):
 		self.dev   = dev or device.get_device()

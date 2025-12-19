@@ -1039,6 +1039,10 @@ def apply_pointing_model(az, el, roll, model):
 	# Ensure they're arrays, and avoid overwriting. These are
 	# small arrays anyways
 	[az, el, roll] = [np.array(a) for a in [az,el,roll]]
+	# Store first value of el, which we will use later to determine if
+	# we much restore el>90°-ness. We assume that all samples are on the
+	# same side of el=90
+	e0 = el[0]
 	if   model.version == "sat_naive": pass
 	elif model.version == "sat_v1":
 		# Remember, roll = -boresight_angle. That's why there's a minus below
@@ -1082,7 +1086,7 @@ def apply_pointing_model(az, el, roll, model):
 		el    += model.enc_offset_el
 		corot += model.enc_offset_cr
 		try: # Optional el sag
-			Δel = el - model.el_sag_pivot
+			Δel = el     - model.el_sag_pivot
 			el += Δel    * model.el_sag_lin
 			el += Δel**2 * model.el_sag_quad
 		except AttributeError: pass
@@ -1103,6 +1107,19 @@ def apply_pointing_model(az, el, roll, model):
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1
 	else: raise ValueError("Unrecognized model '%s'" % str(model.version))
+	# Restore any el>90°-ness
+	if el0 > np.pi/2 and el[0] < np.pi/2:
+		fix_overpole(az, el, roll, inline=True)
+	return az, el, roll
+
+def fix_overpole(az, el, roll, inline=False):
+	if not inline: az, el, roll = az.copy(), el.copy(), roll.copy()
+	# el is simple, since it doesn't have a wrapping ambiguity.
+	el[:]  = np.pi-el
+	# az and roll will be [-pi,pi] after decompose_lonlat. They will
+	# be [0,2pi] after this. The pointing code shouldn't care either way
+	az   += np.pi
+	roll += np.pi
 	return az, el, roll
 
 # This isn't robust to glitches. Should use a block-median or something

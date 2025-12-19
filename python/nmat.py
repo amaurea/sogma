@@ -593,13 +593,28 @@ class NmatAdaptive(Nmat):
 			bins=self.bins, iD=iD, iE=iE, V=self.V,
 			Kh=Kh, ivar=ivar, nwin=self.nwin, nsamp=self.nsamp, normexp=self.normexp)
 
-# This one somehow made things worse
+# Bleh, units. To keep numbers nice, I want to work in units where
+# the white noise floor has power 1 for all detectors. That is,
+# var(ft[det,white:]) = 1 for all detectors. Let ivar be the per-sample
+# white noise inverse variance per detector. This is typically around 5e-5,
+# corresponding to 250 µK√s. Then, if ft is the raw fourier
+# transform, then it should be multiplied by (ivar/nsamp)**0.5 to get our
+# normalized fourier coefficients nft. When transforming back, we
+# need another factor of 1/nsamp**0.5. So basically:
+#
+# 1. nft = Q  tod, Q  = (ivar/nsamp)** 0.5 F
+# 2. tod = Q" nft, Q" = (ivar/nsamp)**-0.5 F" = (ivar*nsamp)**-0.5 F'
+# 3. Full noise model is N = <tod tod'> = Q" fN" Q"'
+#    => iN = Q' fiN" Q = (ivar/nsamp)**0.5 F' fiN" F (ivar/nsamp)**0.5
+#    = ivar**0.5 F' fiN" F ivar**0.5 / nsamp
+
+
 class NmatAdaptive2(Nmat):
 	def __init__(self, eig_lim=16, single_lim=0.55, window=2, sampvar=1e-2,
 			bsmooth=50, atm_res=2**(1/4), maxmodes=100, dev=None,
 			hbmps=None, bsize_mean=None, bsize_per=None,
 			bins=None, iD=None, iE=None, V=None, Kh=None, ivar=None, nwin=None,
-			nsamp=None, normexp=-1):
+			nsamp=None):
 		self.dev = dev or device.get_device()
 		self.eig_lim    = eig_lim
 		self.single_lim = single_lim
@@ -608,7 +623,6 @@ class NmatAdaptive2(Nmat):
 		self.bsmooth    = bsmooth
 		self.atm_res    = atm_res
 		self.maxmodes   = maxmodes
-		self.normexp    = normexp
 		# These are usually computed in build()
 		self.bsize_mean = bsize_mean
 		self.bsize_per  = bsize_per
@@ -638,9 +652,6 @@ class NmatAdaptive2(Nmat):
 		gutils.apply_window(tod, nwin)
 		ftod = self.dev.pools["ft"].empty((ndet,nfreq), utils.complex_dtype(tod.dtype))
 		self.dev.lib.rfft(tod, ftod)
-		# Normalize to avoid 32-bit overflow in atmospheric region.
-		# Make sure apply and ivar are consistent
-		ftod *= nsamp**self.normexp
 		# Undo window
 		gutils.apply_window(tod, nwin, -1)
 		return self.build_fourier(ftod, srate, nsamp)
@@ -660,11 +671,12 @@ class NmatAdaptive2(Nmat):
 		# This requires nsamp > 2/self.sampvar
 		bsize_mean = max(1,utils.ceil(2/self.sampvar/ndet))
 		bsize_per  = max(1,utils.ceil(2/self.sampvar))
-		ivar  = self.dev.np.mean(1/gutils.downgrade(ps, bsize_per), -1)
-		ivar *= nsamp**(2*self.normexp+1)
-		# Go to units where the white noise level has been divided out
-		ps   *= ivar[:,None]
-		ftod *= ivar[:,None]**0.5
+		ivar  = self.dev.np.mean(1/gutils.downgrade(ps, bsize_per), -1) * nsamp
+		# Use this to go to our normalized units, where the white noise has power=1
+		norm2 = ivar/nsamp
+		ps   *= norm2[:,None]
+		ftod *= norm2[:,None]**0.5
+		# Build the noise model as normal from here
 		mps = self.dev.np.mean(ps,0)    # mean det power
 		mtod= self.dev.np.mean(ftod,0)
 		psm = self.dev.np.abs(mtod)**2  # power of common mode
@@ -738,18 +750,15 @@ class NmatAdaptive2(Nmat):
 		iD = iD.astype(dtype, copy=False)
 		iE = [a.astype(dtype, copy=False) for a in iE]
 		Kh = [a.astype(dtype, copy=False) for a in Kh]
-		# 6. nsamp normalization of hbmps
-		hbmps *= nsamp**self.normexp
-		# (nsamp**normexp)**2 * nsamp = nsamp**(2*normexp+1)
 		self.dev.garbage_collect()
 		# 8. Construct the full noise model
-		return NmatAdaptive(
+		return NmatAdaptive2(
 			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
 			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
 			maxmodes=self.maxmodes, dev=self.dev,
 			hbmps=hbmps, bsize_mean=bsize_mean, bsize_per=bsize_per,
 			bins=bins, iD=iD, iE=iE, V=power.Vs, Kh=Kh, ivar=ivar, nwin=nwin,
-			nsamp=nsamp, normexp=self.normexp)
+			nsamp=nsamp)
 	def apply(self, tod, inplace=True, nofft=False):
 		self.check_ready()
 		t1 = self.dev.time()
@@ -760,8 +769,9 @@ class NmatAdaptive2(Nmat):
 			ft = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))
 			self.dev.lib.rfft(tod, ft)
 		else: ft = tod
-		# Handle the white noise
-		ft *= self.ivar[:,None]
+		# Define our normalized units
+		norm  = (self.ivar/self.nsamp)**0.5
+		ft   *= norm[:,None]
 		# If we don't cast to real here, we get the same result but much slower
 		# real_dtype needed for the nofft case
 		rft = ft.view(utils.real_dtype(tod.dtype))
@@ -787,7 +797,8 @@ class NmatAdaptive2(Nmat):
 		# Second half of high-resolution part
 		self.dev.lib.block_scale(rft, self.hbmps, bsize=self.bsize_mean*2, inplace=True)
 		t6 = self.dev.time()
-		# And finish
+		# Trasnform back
+		ft *= norm[:,None]
 		if not nofft: self.dev.lib.irfft(ft, tod)
 		t7 =self.dev.time()
 		if not nofft: gutils.apply_window(tod, self.nwin)

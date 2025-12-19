@@ -887,6 +887,7 @@ class SignalInfo(Signal):
 
 # Mapmaking function
 config.default("taskdist", "semibrute", "Method used to assign tods to mpi tasks")
+config.default("gapfill_tol", 100.0, "Clip values brighter than this times the RMS when gapfilling")
 def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):
 	if prefix is None: prefix = ""
 	# Skip if we're already done
@@ -953,7 +954,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		socal.autocut(data, dev=dev, id=name)
 		# Remove extreme values in the cut areas. This is gentler than trying
 		# and failing to gapfill with realistic noise
-		gutils.gapfill_extreme(data.tod, data.cuts, dev=dev)
+		gutils.gapfill_extreme(data.tod, data.cuts, dev=dev, tol=config.get("gapfill_tol"))
 		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
 		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
 		t3    = time.time()
@@ -1019,7 +1020,8 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds
 		L.print("Mapping %s" % name)
 		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont)
 
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False):
+config.default("depth1_maxdur", 24, "Max duration in hours for depth-1 maps. Lower values use less memory to store maps. Longer than 24 hours would no longer be depth-1")
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxdur=None, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
@@ -1029,7 +1031,8 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, pref
 	# FIXME: might want obs,+bad here, to make the depth-1 periods independent
 	# of our cuts. But currently that causes a segfault in sqlite?
 	if fullinfo is None: fullinfo = loader.query("obs")
-	periods = gutils.find_scan_periods(fullinfo)
+	maxdur  = config.get("depth1_maxdur")*utils.hour
+	periods = gutils.find_scan_periods(fullinfo, maxdur=maxdur)
 	# Which period each group belongs to. So pinds is [ngroup]
 	gfirst  = np.array([g[0] for g in joint.groups])
 	gpids   = utils.find_range(periods, obsinfo.ctime[gfirst]+obsinfo.dur[gfirst]/2)

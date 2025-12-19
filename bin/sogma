@@ -125,6 +125,7 @@ elif args.nmat == "none":   noise_model = nmat.Nmat(dev=dev)
 elif args.nmat == "new":    noise_model = nmat.NmatAdaptive(dev=dev)
 elif args.nmat == "newb":   noise_model = nmat.NmatAdaptive(dev=dev, maxmodes=200)
 elif args.nmat == "new2":   noise_model = nmat.NmatAdaptive2(dev=dev)
+elif args.nmat == "newtest":noise_model = nmat.NmatAdaptive(dev=dev, sampvar=0.1)
 else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 # Set up the mapmaker
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev)

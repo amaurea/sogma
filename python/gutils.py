@@ -343,7 +343,7 @@ def detdup_cuts(cuts, ndet, ndup):
 		ocut[i*ncut:(i+1)*ncut,0] += i*ndet
 	return ocuts
 
-def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
+def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0, maxdur=None):
 	"""Given an obsinfo as returned by a loader.query(), return the set
 	of contiguous scanning periods in the form [:,{ctime_from,ctime_to}].
 
@@ -384,6 +384,15 @@ def find_scan_periods(obsinfo, ttol=7200, atol=2*utils.degree, mindur=0):
 	# 0pre: 000010001000
 	# cum:  000011112222
 	labels  = np.cumsum(jumps)
+	if maxdur is not None:
+		# Apply maxdur limit. Get the time since the start of each
+		linds   = np.arange(np.max(labels)+1)
+		t1s     = ndimage.minimum(t1, labels, linds)
+		trel    = t2 - t1s[labels]
+		# New sublabel for each multiple of this above maxdur
+		sublabs = utils.floor(trel/maxdur)
+		# Use this to construct final labels
+		labels  = utils.label_multi([labels,sublabs])
 	linds   = np.arange(np.max(labels)+1)
 	t1s     = ndimage.minimum(t1, labels, linds)
 	t2s     = ndimage.maximum(t2, labels, linds)

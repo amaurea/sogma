@@ -1,7 +1,7 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
 from pixell import utils, bunch, bench, sqlite, coordsys, config
 from .. import device, gutils, socut
-from . import socommon
+from . import socommon, minisotodlib
 from .socommon import cmeta_lookup
 
 # We have a "sweeps" member of obsinfo, which encapsulates the
@@ -49,9 +49,8 @@ from .socommon import cmeta_lookup
 
 class SoFastLoader:
 	def __init__(self, context_or_config_or_name, dev=None, mul=32):
-		from sotodlib import core
 		self.context   = socommon.get_expanded_context(context_or_config_or_name)
-		self.obsdb     = core.metadata.ObsDb(self.context["obsdb"])
+		self.obsdb     = sqlite.open(self.context["obsdb"])
 		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
@@ -200,9 +199,8 @@ class SoFastLoader:
 config.default("cuts_optional", False, "If true, it's not an error for the expected cuts to be missing from the preprocess database")
 class FastMeta:
 	def __init__(self, context):
-		from sotodlib import core
 		self.context   = context
-		self.obsfiledb = core.metadata.ObsFileDb(context["obsfiledb"])
+		self.obsfiledb = minisotodlib.ObsFileDb(context["obsfiledb"])
 		# Open the database files we need for later obs lookups
 		# 1. The preprocess archive index. Example:
 		# /global/cfs/cdirs/sobs/sat-iso/preprocessing/satp1_20250108_init/process_archive.sqlite
@@ -234,7 +232,6 @@ class FastMeta:
 			"AMCc.FpgaTopLevel.AppTop.AppCore.RtmCryoDet.RampMaxCnt",
 		])
 	def read(self, subid):
-		from sotodlib import core
 		obsid, wslot, band, det_type = split_subid(subid)
 		# Find which hdf files are relevant for this observation
 		try:
@@ -246,7 +243,7 @@ class FastMeta:
 		with bench.mark("fm_dets"):
 			try: detinfo = self.det_cache.get_dets(subid)
 			except sqlite.sqlite3.OperationalError as e: raise errors.DataMissing(str(e))
-			aman = core.AxisManager(core.LabelAxis("dets", detinfo.channels))
+			aman = minisotodlib.AxisManager(minisotodlib.LabelAxis("dets", detinfo.channels))
 			aman.wrap("det_ids", detinfo.dets, [(0,"dets")])
 			aman.wrap("bands",   detname2band(detinfo.dets), [(0,"dets")])
 		ndet_full = aman.dets.count
@@ -254,7 +251,7 @@ class FastMeta:
 		with bench.mark("fm_detcal"):
 			with h5py.File(dcalfile, "r") as hfile:
 				det_cal = hfile[dcalgroup][()]
-			daman = core.AxisManager(core.LabelAxis("dets",np.char.decode(det_cal["dets:readout_id"])))
+			daman = minisotodlib.AxisManager(minisotodlib.LabelAxis("dets",np.char.decode(det_cal["dets:readout_id"])))
 			good  = np.full(daman.dets.count, True)
 		# Apply bias step cuts
 		good &= det_cal["bg"] >= 0
@@ -288,9 +285,9 @@ class FastMeta:
 		t1 = time.time()
 		with PrepLoader(prepfile, prepgroup) as pl:
 			if pl.samps[1] != 0: print("Nonzero pl offset for %s. Chance to investigate cuts alignment" % subid)
-			paman = core.AxisManager(
-					core.LabelAxis("dets", pl.dets),
-					core.OffsetAxis("samps", count=pl.samps[0], offset=pl.samps[1]))
+			paman = minisotodlib.AxisManager(
+					minisotodlib.LabelAxis("dets", pl.dets),
+					minisotodlib.OffsetAxis("samps", count=pl.samps[0], offset=pl.samps[1]))
 			# A bit awkward to time the time taken in the initialization
 			bench.add("fm_prep_loader", time.time()-t1)
 
@@ -376,13 +373,12 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 		("brot",      "ancil/boresight_enc", "?"),
 		("corot",     "ancil/corotator_enc", "?")]):
 	import fast_g3
-	from sotodlib import core
 	if alloc is None: alloc = fast_g3.DummyAlloc()
 	# Add "!", for mandatory field, to any field that doesn't have
 	# the third entry present
 	def field_pad(f): return (f[0],f[1],"!") if len(f)==2 else f
 	fields = [field_pad(f) for f in fields]
-	aman   = core.AxisManager(detax, sampax)
+	aman   = minisotodlib.AxisManager(detax, sampax)
 	fnames = [finfo[0]          for finfo in finfos]
 	nsamps = [finfo[2]-finfo[1] for finfo in finfos]
 	samps  = (sampax.offset, sampax.offset+sampax.count)
@@ -991,7 +987,6 @@ class WiringCache:
 		return self.cache[fname]
 
 def find_finfo_groups(metas):
-	from sotodlib import core
 	# convert finfos to strings, so we can easily find grups. A bit inelegant, but
 	# no that inefficient. We assume that the finfo lists are already sorted
 	# consistently
@@ -1002,7 +997,7 @@ def find_finfo_groups(metas):
 		group  = order[edges[gi]:edges[gi+1]]
 		finfos = metas[group[0]].finfos
 		samps  = metas[group[0]].aman.samps
-		dets   = core.LabelAxis("dets",np.concatenate([metas[i].aman.dets.vals for i in group]))
+		dets   = minisotodlib.LabelAxis("dets",np.concatenate([metas[i].aman.dets.vals for i in group]))
 		ginfos.append(bunch.Bunch(finfos=finfos, dets=dets, samps=samps, inds=group))
 	return ginfos
 
@@ -1035,14 +1030,14 @@ def polar_2d(x, y):
 # This takes 250 ms! And the quaternion stuff would be tedious
 # (but not difficult as such) to implement on the gpu
 def apply_pointing_model(az, el, roll, model):
-	from so3g.proj import quat
+	import pixell.coordsys as quat
 	# Ensure they're arrays, and avoid overwriting. These are
 	# small arrays anyways
 	[az, el, roll] = [np.array(a) for a in [az,el,roll]]
 	# Store first value of el, which we will use later to determine if
 	# we much restore el>90°-ness. We assume that all samples are on the
 	# same side of el=90
-	e0 = el[0]
+	el0 = el[0]
 	if   model.version == "sat_naive": pass
 	elif model.version == "sat_v1":
 		# Remember, roll = -boresight_angle. That's why there's a minus below

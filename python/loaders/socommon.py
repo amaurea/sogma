@@ -2,6 +2,7 @@
 import re, numpy as np, warnings, os, yaml, contextlib
 from pixell import utils, sqlite, bunch, config
 from .. import device, gutils
+from . import minisotodlib
 
 def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, pre_cols=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the
@@ -381,13 +382,12 @@ def contains_pyfuncs(s):
 	return False
 
 def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
-	from sotodlib import core
 	if output not in ["sqlite", "resultset", "sogma"]:
 		raise ValueError("Unrecognized output format '%s" % str(output))
 	if output == "sqlite":
 		# This format does not support pycode or slices
 		return res_db
-	info   = core.metadata.resultset.ResultSet.from_cursor(res_db.execute("select * from obs"))
+	info   = minisotodlib.ResultSet.from_cursor(res_db.execute("select * from obs"))
 	if output == "resultset" and not pycode:
 		# Skip obsinfo construction if we don't need pycode
 		for sel in slices: info = info[sel]
@@ -534,25 +534,22 @@ def measure_rms(tod, dt=1, bsize=32, nblock=10):
 # The error isn't consistently in the same direction
 # in horizontal coordinates. For now we'll just have to
 # operate with a margin of error
+# [this was before translation from so3g to coordsys, not tested after]
 def make_sweep(ctime, baz0, waz, bel0, off, npoint=6, nocross=True):
-	import so3g
-	from pixell import coordinates
+	from pixell import coordsys
 	# given ctime,baz0,waz,bel [ntod], off[ntod,{xi,eta}], make
 	# make sweeps[ntod,npoint,{ra,dec}]
-	# so3g can't handle per-sample pointing offsets, so it would
-	# force us to loop here. We therefore simply modify the pointing
-	# offsets to we can simply add them to az,el
-	az_off, el = coordinates.euler_rot((0.0, -bel0, 0.0), off.T)
+	coff = coordsys.Coords(q=coordsys.euler(1, -bel0)*coordsys.rotation_xieta(off[:,0], off[:,1]))
+	az_off, el = coff.az, coff.el
 	az1 = baz0+az_off-waz/2
 	az2 = baz0+az_off+waz/2
 	if nocross: az1, az2 = truncate_az_crossing(az1, az2)
 	az  = az1[:,None] + (az2-az1)[:,None]*np.linspace(0,1,npoint)
 	el  = el   [:,None] + az*0
 	ts  = ctime[:,None] + az*0
-	sightline = so3g.proj.coords.CelestialSightLine.az_el(
-		ts.reshape(-1), az.reshape(-1), el.reshape(-1), site="so", weather="typical")
-	pos_equ = np.asarray(sightline.coords()) # [ntot,{ra,dec,cos,sin}]
-	sweep   = pos_equ.reshape(len(ctime),npoint,4)[:,:,:2]
+	cout = coordsys.transform("hor", "equ", coordsys.Coords(az=az.reshape(-1), el=el.reshape(-1)), ctime=ts.reshape(-1), site="so", weather="typical")
+	pos_equ = np.array([cout.ra, cout.dec]).T # [ntot,{ra,dec}]
+	sweep   = pos_equ.reshape(len(ctime),npoint,2)
 	# Make sure we don't have any sudden jumps in ra
 	sweep[:,:,0] = utils.unwind(sweep[:,:,0])
 	return sweep
@@ -692,8 +689,7 @@ def hor_helper(name, obsinfo, dec=None):
 
 # Result-set workaround
 def resultset_subset(resultset, inds):
-	from sotodlib import core
-	return core.metadata.resultset.ResultSet(resultset.keys, [resultset.rows[ind] for ind in inds])
+	return minisotodlib.ResultSet(resultset.keys, [resultset.rows[ind] for ind in inds])
 
 def is_slice(s):
 	return re.match(r"^[+-]?\d*:[+-]?\d*:?[+-]?\d*$", s) is not None

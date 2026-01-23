@@ -703,7 +703,10 @@ def is_slice(s):
 ########################
 
 def find_so(): return os.environ["SOPATH"]
-def find_cdir(telescope): return find_so() + "/metadata/%s/contexts" % telescope
+#def find_cdir(telescope): return find_so() + "/metadata/%s/contexts" % telescope
+# Temporarily switch to my own context directory, since the official one isn't being
+# kept up to date
+def find_cdir(telescope): return find_so() + "/users/sigurdkn/contexts/%s" % telescope
 def find_context(path_or_name, type="preprocess"):
 	if not re.match(r"^\w+$", path_or_name):
 		# Treat it as a path if it contains non-word characters

@@ -275,6 +275,9 @@ def build_hitmaps(obsinfo, gids, geo=None, eltol=1*utils.degree, dtype=np.float6
 			# Select the observations that fall inside this rising/setting range
 			azmask    = (baz[inds]>=az1)&(baz[inds]<az2)
 			subinds   = inds[azmask]
+			# No hits in this az-range for this elevation, so no contribution
+			# to hitmaps
+			if subinds.size == 0: continue
 			# Caclulate original-coordinate pixel box for the observations
 			my_baz    = baz[subinds]
 			my_amp    = obsinfo.waz[subinds]/2

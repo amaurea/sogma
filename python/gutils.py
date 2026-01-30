@@ -1055,4 +1055,4 @@ def robust_mean(arr, axis=-1, quantile=0.1):
 def read_detnames(fname):
 	"""Read a file with detector names into a numpy array with byte-string dtype,
 	compatible with the dets or detids arguments of load and load_multi."""
-	return np.loadtxt(fname, dtype=str).encode()
+	return np.loadtxt(fname, dtype=str, usecols=(0,)).encode()

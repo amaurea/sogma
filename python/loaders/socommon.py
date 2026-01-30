@@ -399,7 +399,7 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 		utils.dict_lookup(flavor_noptc_per_band, info["tube_flavor"]),
 		utils.dict_lookup(flavor_ndark_per_band, info["tube_flavor"]),
 	)
-	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("r","d"),("sweep","d",(6,2))]
+	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("r","d"),("sweep","d",(6,2))]
 	obsinfo = np.zeros(len(info), dtype).view(np.recarray)
 	obsinfo.id    = info["subobs_id"]
 	obsinfo.ndet  = ndet
@@ -410,6 +410,7 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 	# These arrays have a nasty habit of being object dtype
 	obsinfo.baz   = info["az_center"].astype(np.float64) * utils.degree
 	obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
+	obsinfo.roll  = info["roll_center"].astype(np.float64) * utils.degree
 	obsinfo.waz   = info["az_throw" ].astype(np.float64)*2 * utils.degree
 	wafer_centers, obsinfo.r = wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
 	if sweeps:

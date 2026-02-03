@@ -1053,6 +1053,11 @@ def robust_mean(arr, axis=-1, quantile=0.1):
 	return mean, err, ngood
 
 def read_detnames(fname):
-	"""Read a file with detector names into a numpy array with byte-string dtype,
+	"""Read a file with detector names into a numpy array with string dtype,
 	compatible with the dets or detids arguments of load and load_multi."""
-	return np.loadtxt(fname, dtype=str, usecols=(0,)).encode()
+	# Have to silence a warning because dtype=str is implemented with a first
+	# read of up to 5000 lines, from which the field width is inferred. The
+	# problem si that if the files start with a comment, then that line is
+	# skipped (as it should be), but numpy insists on warning about that
+	with utils.nowarn():
+		return np.loadtxt(fname, dtype=str, usecols=0)

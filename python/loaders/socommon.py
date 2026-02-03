@@ -740,7 +740,8 @@ def find_label(cmeta, name, whole=False):
 			if key in entry and entry[key] == name:
 				return entry["db"] if not whole else entry
 def cmeta_lookup(context, name):
-	return find_label(context["metadata"], name).format(**context["tags"])
+	val = find_label(context["metadata"], name)
+	return val.format(**context["tags"]) if val else None
 def read_yaml(fname):
 	with open(fname, "r") as ifile:
 		return yaml.safe_load(ifile)

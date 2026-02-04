@@ -1176,31 +1176,64 @@ def apply_pointing_model(az, el, roll, model):
 		q_tot     = q_enc * q_mir * q_el_roll * q_tel * q_cr_roll * q_rx
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az       *= -1
-	elif model.version in ["lat_v1", "lat_v2"]:
+	# This has a lot in common with v1 implementation-wise, but I keep it separate
+	# to keep them independent. Could factor out some code if we get too many of these though
+	elif model.version == "lat_v1":
 		# Reconstruct the corotator angle
 		corot = el - roll - 60*utils.degree
 		# Apply offsets
 		az    += model.enc_offset_az
 		el    += model.enc_offset_el
 		corot += model.enc_offset_cr
-		try: # Optional el sag
-			Δel = el     - model.el_sag_pivot
-			el += Δel    * model.el_sag_lin
-			el += Δel**2 * model.el_sag_quad
-		except AttributeError: pass
+		# Main part
 		q_lonlat     = quat.rotation_lonlat(-az, el)
 		q_mir_center = ~quat.rotation_xieta(model.mir_center_xi0, model.mir_center_eta0)
 		q_el_roll    = quat.euler(2, el - 60*utils.degree)
 		q_el_axis_center = ~quat.rotation_xieta(model.el_axis_center_xi0, model.el_axis_center_eta0)
 		q_cr_roll    = quat.euler(2, -corot)
 		q_cr_center  = ~quat.rotation_xieta(model.cr_center_xi0, model.cr_center_eta0)
-		q_tot        = q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
-		try: # Optional base tilt
-			phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
-			amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
-			q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
-			q_tot  = q_base * q_tot
-		except AttributeError: pass
+		q_presag     = q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
+		# Back to angles for the el sag. We also save the corotator angle for later (see bottom)
+		maz, el, roll = quat.decompose_lonlat(q_presag)
+		# Now apply the el sag
+		Δel = el     - model.el_sag_pivot
+		el += Δel    * model.el_sag_lin
+		el += Δel**2 * model.el_sag_quad
+		# Back to quaternions for the final base tilt part
+		q_postsag = quat.rotation_lonlat(maz, el, roll)
+		# Base tilt is a bit more complicated then the others
+		phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
+		amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
+		q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
+		# Compose into the full model
+		q_tot  = q_base * q_postsag
+		# Extract the final coordinates.
+		az, el, roll = quat.decompose_lonlat(q_tot)
+		az          *= -1
+	elif model.version == "lat_v2":
+		# Reconstruct the corotator angle
+		corot = el - roll - 60*utils.degree
+		# Apply offsets
+		az    += model.enc_offset_az
+		el    += model.enc_offset_el
+		corot += model.enc_offset_cr
+		# El sag. Should the quadratic term preserve the sign?
+		Δel = el     - model.el_sag_pivot
+		el += Δel    * model.el_sag_lin
+		el += Δel**2 * model.el_sag_quad
+		# Main part
+		q_lonlat     = quat.rotation_lonlat(-az, el)
+		q_mir_center = ~quat.rotation_xieta(model.mir_center_xi0, model.mir_center_eta0)
+		q_el_roll    = quat.euler(2, el - 60*utils.degree)
+		q_el_axis_center = ~quat.rotation_xieta(model.el_axis_center_xi0, model.el_axis_center_eta0)
+		q_cr_roll    = quat.euler(2, -corot)
+		q_cr_center  = ~quat.rotation_xieta(model.cr_center_xi0, model.cr_center_eta0)
+		# Base tilt is a bit more complicated
+		phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
+		amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
+		q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
+		# Compose into the full model
+		q_tot  = q_base * q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
 		# Finally back to coordinates
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1

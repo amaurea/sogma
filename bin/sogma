@@ -34,6 +34,8 @@ parser.add_argument(      "--elmod",   type=int, default=0)
 parser.add_argument(      "--precon",  type=str, default="ivar")
 parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
 parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
+parser.add_argument(      "--ocomps",  type=str, default="0,1,2")
+parser.add_argument(      "--cut-type",type=str, default="poly")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -49,6 +51,7 @@ dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
 dump       = [int(w) for w in args.dump.split(",")]
+ocomps     = utils.parse_ints(args.ocomps)
 # Set up our device
 dev = device.get_device(args.device)
 # Set up our logging
@@ -111,12 +114,20 @@ for name in args.output.split(","):
 	elif name == "cut":   cut_out += ["map"]
 	elif name == "elmod": elmod_out = ["map"]
 	else:                 map_out += [name]
-# Set up the signals we will solve for
+# Set up the signals we will solve for. I'm using SignalMapMulti almost all the time.
+# Should I make that the only case here? This would simplify things, at the cost of
+# some extra overhead for the non-multi case. Could also make SignalMapMulti automatically
+# forward in that case, hiding the complexity there.
 if joint.joint:
-	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=dtype_map, sys=args.sys, autocrop=args.autocrop, outputs=map_out, precon=args.precon)
+	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=dtype_map, sys=args.sys, autocrop=args.autocrop, outputs=map_out, precon=args.precon, ocomps=ocomps)
 else:
-	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype_map, sys=args.sys, autocrop=args.autocrop, outputs=map_out, precon=args.precon)
-signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out)
+	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype_map, sys=args.sys, autocrop=args.autocrop, outputs=map_out, precon=args.precon, ocomps=ocomps)
+if args.cut_type == "poly":
+	signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out)
+	#signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out, order=20)
+elif args.cut_type == "full":
+	signal_cut = mapmaking.SignalCutFull(comm_per, dev=dev, outputs=cut_out)
+else: raise ValueError("Unrecognized cut type '%s'" % str(args.cut_type))
 signal_info= mapmaking.SignalInfo(comm_per, dev=dev)
 signals    = [signal_cut, signal_map, signal_info]
 if args.elmod > 0:

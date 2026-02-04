@@ -210,6 +210,9 @@ class FastMeta:
 		# 2. The det_cal index. Example:
 		# /global/cfs/cdirs/sobs/metadata/satp1/manifests/det_cal/satp1_det_cal_240312m/det_cal_local.sqlite
 		self.dcal_index = sqlite.open(cmeta_lookup(context, "det_cal"))
+		# 2b. Optional relcal/flatfield. Same structure as detcal
+		rcal_file = cmeta_lookup(context, "relcal")
+		self.rcal_cache = RelcalCache(rcal_file) if rcal_file else None
 		# 3. The detector info
 		smurf_info = SmurfInfo(sqlite.open(cmeta_lookup(context, "smurf")))
 		match_info = AssignmentInfo(sqlite.open(cmeta_lookup(context, "assignment")))
@@ -272,6 +275,12 @@ class FastMeta:
 		with bench.mark("fm_merge"):
 			daman.restrict("dets", daman.dets.vals[good])
 			aman.merge(daman)
+		# Optional flatfield. Indexed by det_id, similar to focal plane
+		if self.rcal_cache:
+			det_ids, rcal = self.rcal_cache.get(subid)
+			ainds, rinds  = utils.common_inds([aman.det_ids, det_ids])
+			aman.restrict("dets", aman.dets.vals[ainds])
+			aman.wrap("relcal", rcal[rinds], [(0,"dets")])
 		# 3. Load the focal plane information
 		with bench.mark("fm_fplane"):
 			fp_info = self.fp_cache.get_by_subid(subid, self.det_cache)
@@ -306,10 +315,10 @@ class FastMeta:
 					paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
 			with bench.mark("fm_cuts"):
 				optional = config.get("cuts_optional")
-				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags", optional=optional),[(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag", optional=optional),  [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags",optional=optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag",  optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
-				#paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps", optional=optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps",  optional=optional), [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag", optional=optional),      [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional=optional), [(0,"dets"),(1,"samps")])
 
@@ -458,7 +467,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 
 	with bench.mark("calibrate", tfun=dev.time):
 		# Calibrate to CMB µK
-		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None] # * meta.aman.relcal[:,None]
+		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None]
+		if "relcal" in meta.aman: phase_to_cmb *= meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
 
 	#with bench.mark("deproject sinel", tfun=dev.time):
@@ -726,6 +736,7 @@ class Subid:
 	def __init__(self, obsid, wslot, band, type="OPTC"):
 		self.obsid, self.wslot, self.band, self.type = obsid, wslot, band, type
 		self.subid = ":".join(self)
+		self.ctime = obsid2ctime(self.obsid)
 	def __len__(self): return 4
 	def __iter__(self):
 		yield self.obsid
@@ -734,6 +745,7 @@ class Subid:
 		yield self.type
 
 def split_subid(subid): return Subid(*subid.split(":"))
+def obsid2ctime(obsid): return float(obsid.split("_")[1])
 
 def detset2wafer_name(detset): return "_".join(detset.split("_")[:2])
 
@@ -882,6 +894,38 @@ class AcalCache:
 		"""Either get("ufm_mv13:f150") or get("ufm_mv13", "f150") work"""
 		if band is not None: wafer_band = stream_id + ":" + band
 		return self.lookup[wafer_band]
+
+class RelcalCache:
+	def __init__(self, fname):
+		self.fname  = fname
+		self.cache  = {}
+		# Build the time-cache
+		with sqlite.open(fname) as sfile:
+			query = trange_fmt(sfile, "select {t1}, {t2}, files.name, dataset from map inner join files on file_id = files.id")
+			# Get the mapping from time-range to hdf-file and dataset
+			self.index = list(sfile.execute(query))
+	def find_entry(self, t):
+		for i, entry in enumerate(self.index):
+			if entry[0] <= t and t < entry[1]:
+				return entry
+		# Return latest entry by default
+		return entry
+	def get(self, subid):
+		# Infer the time from the subid
+		info  = split_subid(subid)
+		entry = self.find_entry(info.ctime)
+		fname, group = entry[2:4]
+		# Make file-name relative
+		fname = os.path.join(os.path.dirname(self.fname),fname)
+		key = (fname, group)
+		if key not in self.cache:
+			with h5py.File(fname, "r") as hfile:
+				data = hfile[group][()]
+				self.cache[key] = (
+					np.char.decode(data["dets:det_id"]),
+					data["relcal"]
+				)
+		return self.cache[key]
 
 # This takes 0.3 s the first time and 0 s later.
 # Considering that the python version takes 0.3 ms,
@@ -1127,31 +1171,64 @@ def apply_pointing_model(az, el, roll, model):
 		q_tot     = q_enc * q_mir * q_el_roll * q_tel * q_cr_roll * q_rx
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az       *= -1
-	elif model.version in ["lat_v1", "lat_v2"]:
+	# This has a lot in common with v1 implementation-wise, but I keep it separate
+	# to keep them independent. Could factor out some code if we get too many of these though
+	elif model.version == "lat_v1":
 		# Reconstruct the corotator angle
 		corot = el - roll - 60*utils.degree
 		# Apply offsets
 		az    += model.enc_offset_az
 		el    += model.enc_offset_el
 		corot += model.enc_offset_cr
-		try: # Optional el sag
-			Δel = el     - model.el_sag_pivot
-			el += Δel    * model.el_sag_lin
-			el += Δel**2 * model.el_sag_quad
-		except AttributeError: pass
+		# Main part
 		q_lonlat     = quat.rotation_lonlat(-az, el)
 		q_mir_center = ~quat.rotation_xieta(model.mir_center_xi0, model.mir_center_eta0)
 		q_el_roll    = quat.euler(2, el - 60*utils.degree)
 		q_el_axis_center = ~quat.rotation_xieta(model.el_axis_center_xi0, model.el_axis_center_eta0)
 		q_cr_roll    = quat.euler(2, -corot)
 		q_cr_center  = ~quat.rotation_xieta(model.cr_center_xi0, model.cr_center_eta0)
-		q_tot        = q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
-		try: # Optional base tilt
-			phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
-			amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
-			q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
-			q_tot  = q_base * q_tot
-		except AttributeError: pass
+		q_presag     = q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
+		# Back to angles for the el sag. We also save the corotator angle for later (see bottom)
+		maz, el, roll = quat.decompose_lonlat(q_presag)
+		# Now apply the el sag
+		Δel = el     - model.el_sag_pivot
+		el += Δel    * model.el_sag_lin
+		el += Δel**2 * model.el_sag_quad
+		# Back to quaternions for the final base tilt part
+		q_postsag = quat.rotation_lonlat(maz, el, roll)
+		# Base tilt is a bit more complicated then the others
+		phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
+		amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
+		q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
+		# Compose into the full model
+		q_tot  = q_base * q_postsag
+		# Extract the final coordinates.
+		az, el, roll = quat.decompose_lonlat(q_tot)
+		az          *= -1
+	elif model.version == "lat_v2":
+		# Reconstruct the corotator angle
+		corot = el - roll - 60*utils.degree
+		# Apply offsets
+		az    += model.enc_offset_az
+		el    += model.enc_offset_el
+		corot += model.enc_offset_cr
+		# El sag. Should the quadratic term preserve the sign?
+		Δel = el     - model.el_sag_pivot
+		el += Δel    * model.el_sag_lin
+		el += Δel**2 * model.el_sag_quad
+		# Main part
+		q_lonlat     = quat.rotation_lonlat(-az, el)
+		q_mir_center = ~quat.rotation_xieta(model.mir_center_xi0, model.mir_center_eta0)
+		q_el_roll    = quat.euler(2, el - 60*utils.degree)
+		q_el_axis_center = ~quat.rotation_xieta(model.el_axis_center_xi0, model.el_axis_center_eta0)
+		q_cr_roll    = quat.euler(2, -corot)
+		q_cr_center  = ~quat.rotation_xieta(model.cr_center_xi0, model.cr_center_eta0)
+		# Base tilt is a bit more complicated
+		phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
+		amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
+		q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
+		# Compose into the full model
+		q_tot  = q_base * q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
 		# Finally back to coordinates
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1

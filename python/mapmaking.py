@@ -187,7 +187,7 @@ class SignalMap(Signal):
 	"""Signal describing a sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
 			outputs=["map","ivar"], precon="ivar", ext="fits", dtype=np.float32, ibuf=None, obuf=None,
-			sys=None, interpol=None, autocrop=False):
+			sys=None, interpol=None, autocrop=False, ocomps=None):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
 		to equatorial coordinates."""
 		Signal.__init__(self, name, ofmt, outputs, ext)
@@ -197,7 +197,11 @@ class SignalMap(Signal):
 		self.dtype = dtype
 		self.interpol = interpol
 		self.data  = {}
-		self.comps = "TQU"
+		# The Stokes components we will *output*. This only affects the
+		# disk writes, not the solution or memory use
+		self.ocomps= (0,1,2) if ocomps is None else utils.astuple(ocomps)
+		# Number of Stokes components we solve for. Our low-level code
+		# only supports 3
 		self.ncomp = 3
 		self.comm  = comm
 		self.autocrop = autocrop
@@ -389,13 +393,14 @@ class SignalMap(Signal):
 			oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
 			done  = done and os.path.exists(oname)
 		return done
-	def write(self, prefix, m, tag="map", suffix="", force=False, extra={}):
+	def write(self, prefix, m, tag="map", suffix="", force=False, extra={}, oslice=None):
 		if not force and tag not in self.outputs: return
 		oname = self.ofmt.format(name=self.name)
 		oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
 		omap  = self.tiledist.dmap2omap(m)
 		if self.comm.rank == 0:
-			enmap.write_map(oname, omap, extra=extra)
+			if oslice is None: oslice = np.ix_(*(self.ocomps,)*(omap.ndim-2))
+			enmap.write_map(oname, omap[oslice], extra=extra)
 		return oname
 	def write_misc(self, prefix):
 		# Need the if test here despite write also testing, because
@@ -418,10 +423,12 @@ class SignalMap(Signal):
 class SignalMapMulti(Signal):
 	"""Signal describing a multiband sky map."""
 	def __init__(self, shape, wcs, bands, comm, dev=None, name="sky", ofmt="{name}", outputs=["map","ivar"],
-			ext="fits", dtype=np.float32, ibuf=None, obuf=None, sys=None, interpol=None, precon="ivar", autocrop=False):
+			ext="fits", dtype=np.float32, ibuf=None, obuf=None, sys=None, interpol=None, precon="ivar", autocrop=False,
+			ocomps=None):
 		self.mapsigs = [
 			SignalMap(shape, wcs, comm, dev=dev, name=band + "_" + name, ofmt=ofmt, outputs=outputs,
-				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, sys=sys, interpol=interpol, precon=precon, autocrop=autocrop)
+				ext=ext, dtype=dtype, ibuf=ibuf, obuf=obuf, sys=sys, interpol=interpol, precon=precon,
+				autocrop=autocrop, ocomps=ocomps)
 			for band in bands]
 		# Must happen after self.mapsigs has been created
 		Signal.__init__(self, name, ofmt, outputs, ext)
@@ -516,10 +523,10 @@ class SignalMapMulti(Signal):
 			if not mapsig.written(prefix):
 				return False
 		return True
-	def write(self, prefix, m, tag="map", suffix="", force=False):
+	def write(self, prefix, m, tag="map", suffix="", force=False, oslice=None):
 		onames = []
 		for bi, band in enumerate(self.bands):
-			oname = self.mapsigs[bi].write(prefix, m[bi], tag=tag, suffix=suffix, force=force)
+			oname = self.mapsigs[bi].write(prefix, m[bi], tag=tag, suffix=suffix, force=force, oslice=oslice)
 			onames.append(oname)
 		return ", ".join(onames)
 	def write_misc(self, prefix):
@@ -914,7 +921,7 @@ config.default("taskdist", "semibrute", "Method used to assign tods to mpi tasks
 # TODO: Investigate best value of this. I had 100 before, but 0.1 has worked better in
 # recent depth1 tests. Why did 100 seem necessary before, and isn't 0.1 very low, basically
 # just linear gapfilling?
-config.default("gapfill_tol", 0.1, "Clip values brighter than this times the RMS when gapfilling")
+config.default("gapfill_tol", 3.0, "Clip values brighter than this times the RMS when gapfilling")
 def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	if prefix is None: prefix = ""
 	# Skip if we're already done

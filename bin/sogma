@@ -1,4 +1,4 @@
-#!/usr/bin/env python -u
+#!/usr/bin/env -S python -u
 import numpy as np, os, time, sys
 from pixell import config, enmap, utils, mpi, colors, bench
 from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils, soeph
@@ -32,6 +32,8 @@ parser.add_argument("-o", "--output",  type=str, default="auto")
 parser.add_argument(      "--sel",     type=str, default=":")
 parser.add_argument(      "--elmod",   type=int, default=0)
 parser.add_argument(      "--precon",  type=str, default="ivar")
+parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
+parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
 args = parser.parse_args()
 
 # Should some of this be factored out into an
@@ -67,6 +69,9 @@ obsinfo = loader.query(args.query)
 if len(obsinfo) == 0:
 	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
 	sys.exit(1)
+# Optional detector restriction
+dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
+detids = gutils.read_detnames(args.detids) if args.detids is not None else None
 # joint gives subobs to map jointly. It has entries
 # .names[ngroup]     Name of each group
 # .groups[ngroup][:] Indices into obsinfo for ach group member
@@ -131,11 +136,11 @@ else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev)
 
 if   args.mode == "full":
-	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont)
+	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "individual":
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "depth1":
-	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont)
+	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "dump":
-	mapmaking.dump_tod(loader, obsinfo, noise_model, comm_all, dev=dev, joint=joint, prefix=prefix, ignore=args.ignore)
+	mapmaking.dump_tod(loader, obsinfo, noise_model, comm_all, dev=dev, joint=joint, prefix=prefix, ignore=args.ignore, dets=dets, detids=detids)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

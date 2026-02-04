@@ -121,7 +121,6 @@ class Simplecut:
 			nper = np.bincount(self.dets, minlength=self.ndet)
 			offs = gutils.cumsum0(nper)
 			index_map2[:,1] = np.repeat(offs, nper)
-		index_map2[:,1]  = self.dets
 		index_map2[:,2]  = self.starts
 		index_map2[:,3]  = self.starts+self.lens
 		return index_map2

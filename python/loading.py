@@ -18,6 +18,9 @@ from . import device
 # database, so having them as independent functions is wasteful. Let's make a
 # class that can be queried.
 
+# FIXME: SimpleLoader and SotodlibLoader are out of data.
+# Misisng new query system, load_multi and det-restriction
+
 def Loader(dbfile, type="auto", dev=None, mul=32):
 	if type == "auto":
 		if dbfile.endswith(".txt"): type = "simple"

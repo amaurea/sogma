@@ -592,6 +592,20 @@ class NmatAdaptive(Nmat):
 			bsize_mean=self.bsize_mean, bsize_per=self.bsize_per,
 			bins=self.bins, iD=iD, iE=iE, V=self.V,
 			Kh=Kh, ivar=ivar, nwin=self.nwin, nsamp=self.nsamp, normexp=self.normexp)
+	def write(self, fname):
+		b = bunch.Bunch(
+			type="NmatAdaptive",
+			eig_lim=self.eig_lim, single_lim=self.single_lim, window=self.window,
+			sampvar=self.sampvar, bsmooth=self.bsmooth, atm_res=self.atm_res,
+			maxmodes=self.maxmodes, hbmps=self.dev.get(self.hbmps),
+			bsize_mean=self.bsize_mean, bsize_per=self.bsize_per,
+			bins=self.bins, iD=self.dev.get(self.iD),
+			ivar=self.dev.get(self.ivar), nwin=self.nwin, nsamp=self.nsamp, normexp=self.normexp,
+		)
+		for name in ["iE", "V", "Kh"]:
+			for i, v in enumerate(getattr(self, name)):
+				b["%s%02d" % (name,i)] = self.dev.get(v)
+		bunch.write(fname, b)
 
 # Bleh, units. To keep numbers nice, I want to work in units where
 # the white noise floor has power 1 for all detectors. That is,
@@ -1155,7 +1169,7 @@ def find_modes_single(cov, ndof, eig_lim=None, single_lim=0, nmax_frac=0.1, depr
 	if return_eigs: return v, e
 	else: return v
 
-def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=0.55, nper=50, nmax=100, D_tol=0.1, wtype=np.float32):
+def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=0.55, nper=10, nmax=100, D_tol=0.1, wtype=np.float32, debug=False):
 	"""Decompose the noise covariance per bin into D+VEV'.
 	For narrow bins, eigenvectors are measured globally,
 	and a few strong ones are used per bin. For wide bins,
@@ -1170,6 +1184,9 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 	if weight is not None: ft /= weight
 	nglob = gV.shape[1]
 	nmax  = min(nmax, ndet//2)
+
+	if debug: moo = bunch.Bunch(Vtot=gV.get())
+
 	# Output arrays
 	Ds, Es, Vs = [], [], []
 	for bi, b in enumerate(bins):
@@ -1183,21 +1200,41 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 			if nmask < bsize:
 				ndof  -= 2*nmask
 				cov   *= (bsize-nmask)/bsize
-		budget_E = bsize
 		# How many vectors can we afford to measure?
+		# We use the smallest of nmax, bsize and a calculated degree-of-freedom budget,
+		# with a minimum of 1
+		budget_E = min(bsize, nmax, max(1,(ndof-nper*ndet)//nper))
+		#if budget_E < bsize: print(bi, bsize, budget_E)
 		# Measure as many amplitudes as we can afford
 		# C = VEV' => E = (V'V)"V'CV(V'V)"'. V ortho, so this is just E = V'CV
 		E     = ap.einsum("dm,de,em->m", gV, cov, gV)
 		E     = np.diag(gV.T.dot(cov).dot(gV))
-		inds  = ap.argsort(E)[-budget_E:][-nmax:]
+		inds  = ap.argsort(E)[-budget_E:]
 		E, V  = E[inds], gV[:,inds]
+
+		if debug and bi == 19:
+			moo["ft"] = ft[:,b[0]:b[1]].get()
+			moo["cov"] = cov.get()
+			moo["inds"] = inds.get()
+			moo["E"] = E.get()
+			moo["V"] = V.get()
+
 		# Finally measure the remaining uncorrelated power
 		cov  = project_out_from_matrix(cov, V)
 		D    = ap.diag(cov)
-		# Disallow unrealistically low per-detector noise. This can happen if we
-		# have overfitted the vectors. That shouldn't happen, and I try to avoid it above,
-		# but if it does happen, we don't want things to break
+
+		if debug and bi == 19:
+			moo["cov_deproj"] = cov.get()
+			moo["D"] = D.get()
+
+		# We know that the uncorrelated noise shouldn't be less than the
+		# white noise floor, but if we have overfitting, we can end up much lower than
 		D    = ap.maximum(D, ap.median(D[D>0])*D_tol)
+
+		if debug and bi == 19:
+			moo["D_cap"] = D.get()
+			bunch.write("test_moo.hdf", moo)
+
 		# budget_V = max(0,utils.floor((ndof/nper-ndet)/(ndet+1)))
 		#print("A %3d %6d %6d %12.3e %12.3e %12.3e %12.3e %5d %5d %4d" % (bi, b[0], b[1], ap.min(D), ap.quantile(D, 0.9), ap.min(E), ap.max(E), budget_E, budget_V, V.shape[1]))
 		Ds.append(D.astype(dtype, copy=False))

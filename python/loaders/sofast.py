@@ -63,11 +63,11 @@ class SoFastLoader:
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
-	def load(self, subid, catch="expected"):
+	def load(self, subid, catch="expected", dets=None, detids=None):
 		catch_list = catch2list(catch)
 		try:
 			with bench.mark("load_meta"):
-				meta = self.fast_meta.read(subid)
+				meta = self.fast_meta.read(subid, dets=dets, detids=detids)
 				if meta.aman.dets.count == 0:
 					raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
 			# Load the raw data
@@ -86,7 +86,7 @@ class SoFastLoader:
 		# Record any non-fatal errors
 		obs.errors = []
 		return obs
-	def load_multi(self, subids, order="band", samprange=None, catch="expected"):
+	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None):
 		"""Load multiple concurrent subids into a single obs"""
 		# FIXME: This is inefficient:
 		# * bands and dark detectors for the same wafer are stored in the same files,
@@ -115,7 +115,7 @@ class SoFastLoader:
 		for si, subid in enumerate(subids):
 			try:
 				with bench.mark("load_meta"):
-					meta = self.fast_meta.read(subid)
+					meta = self.fast_meta.read(subid, dets=dets, detids=detids)
 					if meta.aman.dets.count == 0: raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
 					metas.append(meta)
 				mids .append(subid)
@@ -167,6 +167,7 @@ class SoFastLoader:
 					otot.boresight = obs.boresight
 					otot.hwp       = obs.hwp
 					otot.site      = obs.site
+					otot.overpole  = obs.overpole
 					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
 				# Handle the simple append cases
 				for field, axis in append_fields:
@@ -231,7 +232,7 @@ class FastMeta:
 			"AMCc.SmurfProcessor.Filter.Disable",
 			"AMCc.FpgaTopLevel.AppTop.AppCore.RtmCryoDet.RampMaxCnt",
 		])
-	def read(self, subid):
+	def read(self, subid, dets=None, detids=None):
 		obsid, wslot, band, det_type = split_subid(subid)
 		# Find which hdf files are relevant for this observation
 		try:
@@ -243,9 +244,13 @@ class FastMeta:
 		with bench.mark("fm_dets"):
 			try: detinfo = self.det_cache.get_dets(subid)
 			except sqlite.sqlite3.OperationalError as e: raise errors.DataMissing(str(e))
+			# Optionally restrict by requested detectors
+			good = np.full(len(detinfo.channels), True)
+			if dets   is not None: good &= np.isin(detinfo.channels, dets,   assume_unique=True)
+			if detids is not None: good &= np.isin(detinfo.dets,     detids, assume_unique=True)
 			aman = minisotodlib.AxisManager(minisotodlib.LabelAxis("dets", detinfo.channels))
-			aman.wrap("det_ids", detinfo.dets, [(0,"dets")])
-			aman.wrap("bands",   detname2band(detinfo.dets), [(0,"dets")])
+			aman.wrap("det_ids", detinfo.dets[good], [(0,"dets")])
+			aman.wrap("bands",   detname2band(detinfo.dets[good]), [(0,"dets")])
 		ndet_full = aman.dets.count
 		# 2. Load the necessary info from det_cal
 		with bench.mark("fm_detcal"):
@@ -303,8 +308,9 @@ class FastMeta:
 				optional = config.get("cuts_optional")
 				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags", optional=optional),[(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag", optional=optional),  [(0,"dets"),(1,"samps")])
-				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag", optional=optional),      [(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
+				#paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps", optional=optional), [(0,"dets"),(1,"samps")])
+				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag", optional=optional),      [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional=optional), [(0,"dets"),(1,"samps")])
 
 			# TODO: Remove the noise_mapmaking part once the transition is complete
@@ -408,7 +414,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Merge the cuts. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
 		cuts = socut.Sampcut.merge([meta.aman[name] for name in
-			["cuts_glitch","cuts_2pi","cuts_slow"]])#,"cuts_jump","cuts_turn"]])
+			["cuts_glitch","cuts_2pi","cuts_slow","cuts_smurf"]])#,"cuts_jump","cuts_turn"]])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 	# Find when we're actually scanning
 	i1, i2 = socommon.find_scanning(data.az)
@@ -418,6 +424,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	timestamps, signal, cuts, az, el = [a[...,i1:i2] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[i1:i2] if "hwp_angle" in meta.aman else None
 	ninit = data.dets.count
+	overpole = el[0]>90
 
 	# prev_obs lets us pass in the result of calibrate run on
 	# a different set of detectors for the same observation.
@@ -473,15 +480,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Deglitch and dejump
 	w = 10
 	with bench.mark("deglitch", tfun=dev.time):
-		cuts.gapfill(signal, w=w, dev=dev)
+		cuts.dejump(signal, w=w, dev=dev)
 		#deglitch_commonsep(signal, cuts, w=w, dev=dev)
 
-	# 100 ms for this :(
 	with bench.mark("deslope", tfun=dev.time):
 		with dev.pools["ft"].as_allocator():
 			gutils.deslope(signal, w=w, dev=dev, inplace=True)
 
-	# FFT stuff should definitely be on the gpu. 640 ms
 	with bench.mark("fft", tfun=dev.time):
 		ftod = dev.pools["ft"].zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
 		dev.lib.rfft(signal, ftod)
@@ -553,6 +558,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	res.cuts         = ocuts
 	res.site         = "so"
 	res.response     = None
+	res.overpole     = overpole # whether el was originally > 90°. TODO: update the other loaders
 	# Test per-detector response
 	#res.response     = dev.np.zeros((2,len(res.tod)),res.tod.dtype)
 	#res.response[0]  = 2
@@ -768,7 +774,7 @@ class FplaneCache:
 		entry = self.find_entry(wafer_name, t)
 		key   = (entry[2],entry[3])
 		if key not in self.fp_cache:
-			fname = os.path.dirname(self.fname) + "/" + entry[2]
+			fname = os.path.join(os.path.dirname(self.fname),entry[2])
 			with h5py.File(fname,"r") as hfile:
 				self.fp_cache[key] = hfile[entry[3]][()]
 		return self.fp_cache[key]
@@ -778,6 +784,21 @@ class FplaneCache:
 		ctime      = float(toks.obsid.split("_")[1])
 		wafer_name = detset2wafer_name(det_cache.get_detsets(toks.obsid)[toks.wslot])
 		return self.get_by_wafer(wafer_name, ctime)
+
+# How to handle per-obs pointing model?
+# Storage:
+#  1. One dataset per entry, like current setup. Wasteful
+#  2. One big table. Could grow pretty big. But I'd probably cache it all anyway..
+#  3. Table per time-range. Probably best approach. Lets us keep the same sqlite
+#     format as currently. Only the reading code would need to change.
+# Table format would be
+#  subid params...
+# which can be stored as a structured array
+#
+# We only have data for deep56, which is observed for a fraction of each day.
+# Should there be one entry in the sqlite per day, with each entry pointing to the
+# same table? No, unnecessary complication. There just won't be any entries in the
+# table for the missing data.
 
 class PointingModelCache:
 	def __init__(self, fname):
@@ -798,16 +819,50 @@ class PointingModelCache:
 		hfname, gname = entry[2:4]
 		key   = (hfname, gname)
 		if key not in self.cache:
-			fname = os.path.dirname(self.fname) + "/" + hfname
+			fname = os.path.join(os.path.dirname(self.fname),hfname)
 			with h5py.File(fname, "r") as hfile:
-				param_str = hfile[gname].attrs["_scalars"]
-				params    = bunch.Bunch(**json.loads(param_str))
-				self.cache[key] = params
+				# We have two formats:
+				# 1. Saianeesh's static pointing model, where the parameters
+				#    are in json.loads(hfile[gname].attrs["_scalars"]),
+				#    which apply to all entries that map to this time-range
+				# 2. My per-obs pointing model, where hfile[gname]
+				#    is a numpy structured array that needs to be indexed by
+				#    subid
+				d = hfile[gname]
+				if isinstance(d, h5py.Group):
+					# Saianeesh static format
+					param_str = hfile[gname].attrs["_scalars"]
+					params    = bunch.Bunch(**json.loads(param_str))
+					self.cache[key] = ("static", params)
+				elif isinstance(d, h5py.Dataset):
+					# Sigurd per-subid format. Precompute a hash map
+					table = d[()]
+					index = {name.decode():i for i,name in enumerate(table["subid"])}
+					self.cache[key] = ("subid", index, table)
+				else: raise ValueError("%s/%s is neither a group or dataset" % (fname, gname))
 		return self.cache[key]
 	def get_by_subid(self, subid):
 		toks  = split_subid(subid)
 		ctime = float(toks.obsid.split("_")[1])
-		return self.get_by_time(ctime)
+		# Take into account the two formats
+		match = self.get_by_time(ctime)
+		if   match[0] == "static": return match[1]
+		elif match[0] == "subid":
+			# Look up row in table, and reformat it as bunch
+			#print("%s in pointing: %d" % (str(subid), str(subid) in match[1]))
+			row = match[2][match[1][str(subid)]]
+			return pointing_row_to_params(row)
+		else:
+			raise ValueError("Unrecognized PointingModelCache entry '%s'" % str(match[0]))
+
+def pointing_row_to_params(row):
+	params = bunch.Bunch()
+	for name in row.dtype.names[1:]:
+		val = row[name]
+		if isinstance(val, bytes):
+			val = val.decode()
+		params[name] = val
+	return params
 
 class AcalCache:
 	def __init__(self, fname):
@@ -934,35 +989,35 @@ def get_prepfile(indexdb, subid):
 		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' LIMIT 1;" % (toks.obsid, toks.wslot)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in preprocess index" % subid)
-	return os.path.dirname(indexdb.fname) + "/" + fname, gname
+	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_dcalfile(indexdb, subid):
 	toks = split_subid(subid)
 	query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' LIMIT 1;" % (toks.obsid)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in det_cal index" % subid)
-	return os.path.dirname(indexdb.fname) + "/" + fname, gname
+	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_matchfile(indexdb, detset):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:detset] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:detset] = '%s' LIMIT 1;" % (detset)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in det match index" % detset)
-	return os.path.dirname(indexdb.fname) + "/" + fname, gname
+	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_smurffile(indexdb, detset):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:detset] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:detset] = '%s' LIMIT 1;" % (detset)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in smurf index" % subid)
-	return os.path.dirname(indexdb.fname) + "/" + fname, gname
+	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_wafer_file(waferdb, wafer_name):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:stream_id] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:stream_id] = '%s' LIMIT 1;" % (wafer_name)
 	try: fname, gname = next(waferdb.execute(query))[:2]
 	except StopIteration: raise KeyError("%s not found in wafer index" % wafer_name)
-	return os.path.dirname(waferdb.fname) + "/" + fname, gname
+	return os.path.join(os.path.dirname(waferdb.fname),fname), gname
 
 def get_acalfile(indexdb):
-	return os.path.dirname(indexdb.fname) + "/" + list(indexdb.execute("SELECT name FROM files INNER JOIN map ON files.id = map.file_id WHERE map.dataset = 'abscal'"))[0][0]
+	return os.path.join(os.path.dirname(indexdb.fname),list(indexdb.execute("SELECT name FROM files INNER JOIN map ON files.id = map.file_id WHERE map.dataset = 'abscal'"))[0][0])
 
 def read_wiring_status(fname, parse=True):
 	import fast_g3
@@ -1030,15 +1085,14 @@ def polar_2d(x, y):
 # This takes 250 ms! And the quaternion stuff would be tedious
 # (but not difficult as such) to implement on the gpu
 def apply_pointing_model(az, el, roll, model):
+	"""Apply the given pointing model to az, el, roll, returning corrected values.
+	The coordinates will also be normalized to -pi/2 <= el <= pi/2, see fix_overpole"""
 	import pixell.coordsys as quat
 	# Ensure they're arrays, and avoid overwriting. These are
 	# small arrays anyways
 	[az, el, roll] = [np.array(a) for a in [az,el,roll]]
-	# Store first value of el, which we will use later to determine if
-	# we much restore el>90°-ness. We assume that all samples are on the
-	# same side of el=90
-	el0 = el[0]
-	if   model.version == "sat_naive": pass
+	if   model.version == "sat_naive":
+		if el[0] > np.pi/2: fix_overpole(az, el, roll, inline=True)
 	elif model.version == "sat_v1":
 		# Remember, roll = -boresight_angle. That's why there's a minus below
 		# Simple offsets
@@ -1102,9 +1156,6 @@ def apply_pointing_model(az, el, roll, model):
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1
 	else: raise ValueError("Unrecognized model '%s'" % str(model.version))
-	# Restore any el>90°-ness
-	if el0 > np.pi/2 and el[0] < np.pi/2:
-		fix_overpole(az, el, roll, inline=True)
 	return az, el, roll
 
 def fix_overpole(az, el, roll, inline=False):

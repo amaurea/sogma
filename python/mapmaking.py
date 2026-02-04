@@ -51,6 +51,25 @@ class MLMapmaker:
 		else:
 			try:
 				iN = noise_model.build(gtod, srate=srate, obs=obs)
+				#iN.write("test_iN.hdf")
+				#gtod0 = gtod.copy()
+				#ft   = self.dev.lib.rfft(gtod)
+				#iNft = iN.apply(ft.copy(), nofft=True)
+				#ps = self.dev.get(gutils.downgrade(self.dev.np.mean(self.dev.np.abs(iNft)**2,0),10))
+				#f  = gutils.downgrade(np.fft.rfftfreq(gtod.shape[1], 1/srate),10)
+				#np.savetxt("test_ps_iNd.txt", np.array([f,ps]).T, fmt="%15.7e")
+				#chisq = self.dev.np.sum(self.dev.np.conj(ft)*iNft,0)
+				#print(self.dev.np.std(chisq.real))
+				#print(self.dev.np.std(chisq.imag))
+				#chisq = self.dev.get(gutils.downgrade(chisq.real,10))
+				#np.savetxt("test_chisq.txt", np.array([f,chisq]).T, fmt="%15.7e")
+
+				#df = srate/gtod.shape[1]
+				#i  = int(0.25/df)
+				#print(i)
+				#np.save("test_ft_025.npy", self.dev.get(ft[:,i-10:i+10]))
+				#np.save("test_iNft_025.npy", self.dev.get(iNft[:,i-10:i+10]))
+				#1/0
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise gutils.RecoverableError(msg)
@@ -788,6 +807,11 @@ class SignalInfo(Signal):
 		az,     waz   = cenw(obs.boresight[1])
 		el,     wel   = cenw(obs.boresight[0])
 		roll,   wroll = cenw(obs.boresight[2])
+		# Restore overpoleness
+		if obs.overpole:
+			el   = np.pi-el
+			az   = utils.rewind(az+np.pi)
+			roll = utils.rewind(roll+np.pi)
 		# Detector info
 		dsens = (iN.ivar*srate)**-0.5
 		# Center and radius per band
@@ -887,8 +911,11 @@ class SignalInfo(Signal):
 
 # Mapmaking function
 config.default("taskdist", "semibrute", "Method used to assign tods to mpi tasks")
-config.default("gapfill_tol", 100.0, "Clip values brighter than this times the RMS when gapfilling")
-def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):
+# TODO: Investigate best value of this. I had 100 before, but 0.1 has worked better in
+# recent depth1 tests. Why did 100 seem necessary before, and isn't 0.1 very low, basically
+# just linear gapfilling?
+config.default("gapfill_tol", 0.1, "Clip values brighter than this times the RMS when gapfilling")
+def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	if prefix is None: prefix = ""
 	# Skip if we're already done
 	if cont and (os.path.exists(prefix + ".empty") or all([signal.written(prefix) for signal in mapmaker.signals])):
@@ -936,7 +963,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
 		try:
-			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch)
+			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids)
 			# I keep calculating this. It should be a standard member of data
 			# Should probably promote data to a full class
 			srate = (len(data.ctime)-1)/(data.ctime[-1]-data.ctime[0])
@@ -1000,7 +1027,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		for signal, val in zip(mapmaker.signals, step.x):
 			signal.write(prefix, val)
 
-def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False):
+def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work."""
 	if joint is None:
@@ -1018,10 +1045,10 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds
 		name    = joint.names[ind]
 		subpre  = prefix + name.replace(":","_") + "_"
 		L.print("Mapping %s" % name)
-		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont)
+		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids)
 
 config.default("depth1_maxdur", 24, "Max duration in hours for depth-1 maps. Lower values use less memory to store maps. Longer than 24 hours would no longer be depth-1")
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxdur=None, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False):
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxdur=None, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
@@ -1064,11 +1091,11 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, pref
 		name    = "%10.0f" % periods[pid][0]
 		subpre  = prefix + name + "_"
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(my_inds)))
-		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont)
+		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids)
 
 # Mapmaking function
 def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
-		tdown=500, fdown=250, fdown_lowf=10, fmax_lowf=4, prealloc=True, dev=None, ignore="recover"):
+		tdown=500, fdown=250, fdown_lowf=10, fmax_lowf=4, prealloc=True, dev=None, ignore="recover", dets=None, detids=None):
 	if prefix is None: prefix = ""
 	# Groups is a list of obsinfo entries that should be mapped jointly
 	# (as a big super-tod with full noise correlations)
@@ -1100,7 +1127,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		subpre = prefix + name.replace(":","_") + "_"
 		t1     = time.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind])
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids)
 		except etypes as e:
 			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue

@@ -1018,6 +1018,10 @@ def apply_vecs2(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 			# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
 			# 1. divtmp = iD V      [ndet,nmode]
 			print("A", dev.np.std(V[bi]))
+			print("B", V[bi].shape)
+			print("C", V[bi].flags)
+			import pdb
+			pdb.set_trace()
 			1/0
 			# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
 			dev.lib.sdgmm("R", nmode, ndet, V[bi], nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)

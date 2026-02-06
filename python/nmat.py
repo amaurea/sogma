@@ -413,7 +413,6 @@ class NmatAdaptive(Nmat):
 		bins_atm     = find_atm_bins(smooth_bps, bsize=bsize_smooth, step=self.atm_res)
 		# Add a final all-the-rest bin
 		bins_atm     = np.concatenate([bins_atm,[[bins_atm[-1,1],nfreq]]],0)
-		print("nspike", len(bins_spike), "natm", len(bins_atm))
 		# Want to exclude the spikes from the atmospheric model.
 		# Since we model the freq-bins as independent and zero-mean,
 		# we can just zero out the spike regions after measuring
@@ -1016,21 +1015,13 @@ def apply_vecs2(ftod, iD, V, Vinds,  Kh, bins, tmp, vtmp, divtmp, dev=None, out=
 			out[:,i1:i2] *= iD[bi,:,None]
 		else:
 			# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
-			# 0. Extract the relevant part of V into vtmp
+			# 0. Extract the relevant part of V into vtmp. This takes 5 ms total,
+			# an almost 10% increase in the run-time of nmat.apply(). And that includes time
+			# for the fft :(
 			dev.np.take(V, Vinds[bi], axis=1, out=vtmp[:,:nmode])
 			# 1. divtmp = iD V      [ndet,nmode]
-			moo = vtmp[:,:nmode].copy()
-			print("new")
-			print("A", dev.np.std(moo))
-			print("B", moo.shape)
-			print("C", moo.flags)
 			# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
-			print("divtmp befor", dev.np.std(divtmp[:,:nmode]))
-			print("args", nmode, ndet, dev.np.std(moo), nmode, dev.np.std(iD[bi]), maxnmode)
-			dev.lib.sdgmm("R", nmode, ndet, moo, nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
-			 #dev.lib.sdgmm("R", nmode, ndet, moo, maxnmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
-			print("divtmp after", dev.np.std(divtmp[:,:nmode]))
-			1/0
+			dev.lib.sdgmm("R", nmode, ndet, vtmp[:,:nmode], maxnmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
 			# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
 			dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
 			# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
@@ -1221,7 +1212,7 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 		inds  = ap.argsort(E)[-budget_E:]
 		E, v  = E[inds], V[:,inds]
 		# Finally measure the remaining uncorrelated power
-		cov  = project_out_from_matrix(cov, V)
+		cov  = project_out_from_matrix(cov, v)
 		D    = ap.diag(cov)
 		# We know that the uncorrelated noise shouldn't be less than the
 		# white noise floor, but if we have overfitting, we can end up much lower than

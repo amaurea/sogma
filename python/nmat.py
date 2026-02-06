@@ -1020,11 +1020,11 @@ def apply_vecs2(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 			print("A", dev.np.std(V[bi]))
 			print("B", V[bi].shape)
 			print("C", V[bi].flags)
-			import pdb
-			pdb.set_trace()
-			1/0
 			# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
+			print("divtmp befor", dev.np.std(divtmp[:,:nmode]))
 			dev.lib.sdgmm("R", nmode, ndet, V[bi], nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
+			print("divtmp after", dev.np.std(divtmp[:,:nmode]))
+			1/0
 			# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
 			dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
 			# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK

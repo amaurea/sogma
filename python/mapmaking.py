@@ -51,6 +51,17 @@ class MLMapmaker:
 		else:
 			try:
 				iN = noise_model.build(gtod, srate=srate, obs=obs)
+				## Measure the size of the noise model
+				#tot = 0
+				#for key in ["iD", "iE", "V", "Kh", "ivar", "hbmps"]:
+				#	val  = getattr(iN,key)
+				#	if not isinstance(val, list): val = []
+				#	size = 0
+				#	for sub in val:
+				#		size += sub.size*sub.itemsize
+				#	tot += size
+				#	print("%-5s %8.5f" % (key,  size/1e9))
+				#print("%-5s %8.5f" % ("total", tot/1e9))
 				#iN.write("test_iN.hdf")
 				#gtod0 = gtod.copy()
 				#ft   = self.dev.lib.rfft(gtod)

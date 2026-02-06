@@ -440,6 +440,9 @@ class NmatAdaptive(Nmat):
 		else:
 			bins  = np.array(bins_atm)
 			power = atm_power
+
+		print("AA", atm_power.Ds[0][0], spike_power.Ds[0][0], power.Ds[0][0])
+
 		# 5. Precompute Kh and iD
 		nbin = len(bins)
 		iD = 1/self.dev.np.array(power.Ds).astype(wtype, copy=False) # [nbin,ndet]
@@ -1017,11 +1020,14 @@ def apply_vecs2(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 		else:
 			# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
 			# 1. divtmp = iD V      [ndet,nmode]
+			print("old")
 			print("A", dev.np.std(V[bi]))
 			print("B", V[bi].shape)
 			print("C", V[bi].flags)
 			# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
 			print("divtmp befor", dev.np.std(divtmp[:,:nmode]))
+			print("args", nmode, ndet, dev.np.std(V[bi]), nmode, dev.np.std(iD[bi]), maxnmode)
+			print("bi", bi, "iD[bi][0]", iD[bi][0])
 			dev.lib.sdgmm("R", nmode, ndet, V[bi], nmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
 			print("divtmp after", dev.np.std(divtmp[:,:nmode]))
 			1/0

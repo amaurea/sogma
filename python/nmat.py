@@ -1019,6 +1019,8 @@ def apply_vecs2(ftod, iD, V, Vinds,  Kh, bins, tmp, vtmp, divtmp, dev=None, out=
 			# 0. Extract the relevant part of V into vtmp
 			dev.np.take(V, Vinds[bi], axis=1, out=vtmp[:,:nmode])
 			# 1. divtmp = iD V      [ndet,nmode]
+			print("A", dev.np.std(vtmp[:,:nmode]))
+			1/0
 			# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
 			dev.lib.sdgmm("R", nmode, ndet, vtmp[:,:nmode], maxnmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
 			# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK

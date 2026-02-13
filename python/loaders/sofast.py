@@ -421,6 +421,8 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 			i += chunk.shape[-1]
 	return aman
 
+# This config moved to loading.py because sofast is only imported conditionally
+#config.default("deproj_el", 1.0, "El-amplitude above which to fit and subtract a sin(el) signal per detector, in arcmin. The value zero is special, and diables the filter.")
 def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	from pixell import fft
 	if dev is None: dev = device.get_device()
@@ -475,11 +477,12 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		if "relcal" in meta.aman: phase_to_cmb *= meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
 
-	#with bench.mark("deproject sinel", tfun=dev.time):
-	#	elrange = utils.minmax(el[::100])
-	#	if elrange[1]-elrange[0] > 1*utils.arcmin:
-	#		print("FIXME deprojecting el")
-	#		deproject_sinel(signal, el, dev=dev)
+	with bench.mark("filter sinel", tfun=dev.time):
+		deproj_el = config.get("deproj_el")
+		if deproj_el > 0:
+			elrange = utils.minmax(el[::100])
+			if elrange[1]-elrange[0] > deproj_el*utils.arcmin:
+				deproject_el(signal, el, dev=dev)
 
 	#with bench.mark("autocal", tfun=dev.time):
 	#	autocal_elmod(signal, el, roll, meta.aman.focal_plane, dev=dev)
@@ -1250,29 +1253,48 @@ def fix_overpole(az, el, roll, inline=False):
 	roll += np.pi
 	return az, el, roll
 
-# This isn't robust to glitches. Should use a block-median or something
-# if that's a problem
-def deproject_sinel(signal, el, nmode=2, dev=None):
+def deproject_el(signal, el, natm=2, nel=2, bsize=1000, dev=None):
 	ndet, nsamp = signal.shape
 	if dev is None: dev = device.get_device()
-	# Sky signal should go as 1/sin(el)
-	depth = 1/dev.np.sin(dev.np.asarray(el, dtype=signal.dtype))
-	# Build a basis
-	depth -= dev.np.mean(depth)
-	B   = dev.np.zeros((nmode,nsamp),signal.dtype)
-	def nmat(x):
-		fx = dev.lib.rfft(x)
-		fx[...,:100] = 0
-		return dev.lib.irfft(fx, x.copy())
-	for i in range(nmode): B[i] = depth**(i+1)
-	rhs = dev.np.einsum("mi,di->md",B,nmat(signal))
-	div = dev.np.einsum("mi,ni->mn",B,nmat(B))
-	idiv   = dev.np.linalg.inv(div)
-	coeffs = idiv.dot(rhs)
-	# Subtract the el-dependent parts. signal = -coeffs.T matmul B + signal
-	# But fortran is column-major, so it's -coeffs
-	#utils.call_help(dev.lib.sgemm, "N", "N", nsamp, ndet, nmode, -1, B, B.shape[1], coeffs, coeffs.shape[1], 1, signal, signal.shape[1])
-	signal -= dev.np.einsum("md,mi->di", coeffs, B)
+	# Originally did this with fft iN and a single fit per
+	# detector, but that was not robust to glitches etc.
+	# Will use a block-based approach instead. Each block
+	# should be long enough to measure the pattern, but
+	# short enough not to have too much correlated noise.
+	# Will fit amplitude in all the blocks, then take the
+	# median per detector.
+	nblock = nsamp//bsize
+	# El-basis which will be subtracted in the end
+	el      = dev.np.array(el)
+	E       = dev.np.zeros((nel, nsamp),signal.dtype)
+	E[0]    = el - dev.np.mean(el)
+	for i in range(1, nel): E[i] = E[0]*E[i-1]
+	# Full basis to fit for, in blocks
+	B       = dev.np.zeros((nel+natm,nblock,bsize),signal.dtype)
+	# legbasis takes the maximum order, which is 1 less than the number
+	# of basis functions
+	B[nel:] = gutils.legbasis(natm-1, bsize, ap=dev.np)[:,None,:]
+	B[:nel] = E[:,:nblock*bsize].reshape(nel,nblock,bsize)
+	# No noise weighting - the atm-modes should absorb the noise
+	# Fit for the amplitudes
+	btod    = signal[:,:nblock*bsize].reshape(ndet,nblock,bsize)
+	rhs     = dev.np.einsum("mbs,dbs->dmb", B, btod)
+	div     = dev.np.einsum("mbs,nbs->mnb", B, B)
+	idiv    = dev.np.linalg.inv(div.T).T
+	#idiv    = gutils.inv3(div, sym=True)
+	amps    = dev.np.einsum("mnb,dnb->dmb", idiv, rhs)
+	amps    = dev.np.median(amps,-1)
+	# Ok, we hopefully have a good amplitude per detector now
+	#print("amps0", dev.np.sort(amps[:,0]))
+	#print("amps1", dev.np.sort(amps[:,1]))
+	# signal = -amp*E + signal. F=> signal = -E*amp + signal
+	#print("std A", dev.np.std(signal))
+	# This will only subtract nel modes, even though E and amps contain more
+	moo = signal[0].copy()
+	dev.lib.sgemm("N", "N", nsamp, ndet, nel, -1, E, E.shape[1], amps, amps.shape[1], 1, signal, signal.shape[1])
+	#print("std B", dev.np.std(signal))
+	#bunch.write("test.hdf", bunch.Bunch(tod1=dev.get(moo), tod2=dev.get(signal[0]), E=dev.get(E)))
+	#1/0
 
 #def autocal_elmod(signal, bel, roll, xieta, nmode=2, bsize=2000, tol=0.1, dev=None):
 #	if dev is None: dev = device.get_device()

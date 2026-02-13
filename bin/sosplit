@@ -306,6 +306,7 @@ def build_hitmaps(obsinfo, gids, geo=None, eltol=1*utils.degree, dtype=np.float6
 	return hitmaps
 
 def sanitize_targ_cum(cumhits, targhits, mask, tol=1e-1):
+
 	avg_targ   = np.sum(targhits*mask,(-2,-1))/np.sum(mask,(-2,-1))
 	minval     = (avg_targ * tol)[:,None,None]
 	targhits   = np.maximum(targhits, minval)

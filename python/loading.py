@@ -1,4 +1,4 @@
-from pixell import utils
+from pixell import utils, config
 import numpy as np
 from . import device
 
@@ -20,6 +20,9 @@ from . import device
 
 # FIXME: SimpleLoader and SotodlibLoader are out of data.
 # Misisng new query system, load_multi and det-restriction
+
+# Hack: repeated here because the actual loaders don't get imported until later
+config.default("deproj_el", 1.0, "El-amplitude above which to fit and subtract a sin(el) signal per detector, in arcmin. The value zero is special, and diables the filter.")
 
 def Loader(dbfile, type="auto", dev=None, mul=32):
 	if type == "auto":

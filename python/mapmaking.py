@@ -216,8 +216,8 @@ class SignalMap(Signal):
 		self.ncomp = 3
 		self.comm  = comm
 		self.autocrop = autocrop
-		if precon not in ["ivar", "div"]:
-			raise ValueError("precon must be 'ivar' or 'div'")
+		if precon not in ["ivar", "div", "flat"]:
+			raise ValueError("precon must be 'ivar', 'div' or 'flat'")
 		self.prec_mode = precon
 		self.dev   = dev or device.get_device()
 		# Set up our internal tiling
@@ -347,7 +347,7 @@ class SignalMap(Signal):
 				self.hits  = self.hits[:,0]
 		# Build ivar or div. This is a bit messy
 		with mybench.mark("iprec"):
-			if self.prec_mode == "ivar":
+			if self.prec_mode in ["ivar","flat"]:
 				gliprec = [self.calc_hits(weight=True, name=self.prec_mode)]
 			else:
 				gliprec = self.calc_div(weight=True, name=self.prec_mode)
@@ -357,6 +357,13 @@ class SignalMap(Signal):
 			if self.prec_mode == "ivar":
 				self.iprec = self.iprec[0][:,0]  # [ntile,ty,tx]
 				self.ivar  = self.iprec
+			elif self.prec_mode == "flat":
+				self.ivar  = self.iprec[0][:,0]
+				self.iprec = self.ivar.copy()
+				exposed    = self.iprec!=0
+				nexp       = np.sum(exposed)
+				if nexp > 0: self.iprec[:] = np.mean(self.iprec[exposed])
+				else:        self.iprec[:] = 1
 			else:
 				self.iprec = np.moveaxis(self.iprec,0,1) # [ntile,3,3,ty,tx]
 				self.ivar  = self.iprec[:,0,0] # still needed for the time-map
@@ -394,6 +401,7 @@ class SignalMap(Signal):
 	def precalc_free (self, id): self.data[id].pmap.precalc_free()
 	def precon(self, map):
 		return gutils.apply_prec(self.prec, map)
+		#return map * np.mean(self.prec[self.prec!=0])
 	def to_work(self, gmap): return self.tiledist.dmap2gwmap(gmap, buf=self.ibuf)
 	def from_work(self, glmap): return self.tiledist.gwmap2dmap(glmap)
 	def owork(self): return self.tiledist.gwmap(self.obuf, dtype=self.dtype)
@@ -572,7 +580,7 @@ class SignalCutFull(Signal):
 		# Build our RHS
 		obs_rhs = self.dev.np.zeros(pcut.ndof, self.dtype)
 		pcut.backward(iNd, obs_rhs)
-		obs_rhs = obs_rhs.get()
+		obs_rhs = self.dev.get(obs_rhs)
 		# Build our preconditioner.
 		obs_div = self.dev.np.ones(pcut.ndof, self.dtype)
 		iNd[:]   = 0
@@ -928,7 +936,7 @@ class SignalInfo(Signal):
 	valid_outputs = ["info"]
 
 # Mapmaking function
-config.default("taskdist", "semibrute", "Method used to assign tods to mpi tasks")
+config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
 # TODO: Investigate best value of this. I had 100 before, but 0.1 has worked better in
 # recent depth1 tests. Why did 100 seem necessary before, and isn't 0.1 very low, basically
 # just linear gapfilling?
@@ -952,6 +960,8 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		taskdist = config.get("taskdist")
 		if taskdist == "simple":
 			dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
+		elif taskdist == "ra":
+			dist = tiling.distribute_tods_ra(obsinfo[gfirst], comm.size)
 		elif taskdist == "semibrute":
 			dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
 		else:
@@ -1160,6 +1170,11 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		twcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[dt*tdown,1])
 		enmap.write_map(subpre + "tod.fits", enmap.enmap(otod, twcs))
 
+		# FIXME
+		print(data.keys())
+		bunch.write(subpre + "test.hdf", bunch.Bunch(tod=dev.get(data.tod), bore=data.boresight, dets=data.detids, t=data.ctime))
+		1/0
+
 		# Output ps
 		ft   = dev.lib.rfft(data.tod)
 		nsamp= data.tod.shape[1]
@@ -1189,7 +1204,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		v    = dev.np.einsum("ddb->db", fcov)**-0.5
 		fcorr= fcov*v[:,None,:]*v[None,:,:]
 		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
-		enmap.write_map(subpre + "corr_lowf.fits", enmap.enmap(fcorr, fwcs))
+		enmap.write_map(subpre + "corr_lowf.fits", enmap.enmap(dev.get(fcorr), fwcs))
 		del bft, cbft
 
 		# Same, but high resolution, for a subset of detectors
@@ -1202,12 +1217,32 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		v    = dev.np.sum(dev.np.abs(bft)**2,-1)**-0.5
 		fcorr= fcov*v[::thin,None,:]*v[None,:,:]
 		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		enmap.write_map(subpre + "corr_lowf2.fits", enmap.enmap(fcorr, fwcs))
+		enmap.write_map(subpre + "corr_lowf2.fits", enmap.enmap(dev.get(fcorr), fwcs))
 		del bft, cbft
 
-		## Build the noise model
-		#ft2  = ft.copy()
-		#iN   = noise_model.build_fourier(ft2, srate=1/dt, nsamp=data.tod.shape[1])
+		# Build the noise model
+		ft2  = ft.copy()
+		iN   = noise_model.build_fourier(ft2, srate=1/dt, nsamp=data.tod.shape[1])
+		# Apply it. Unhealthy modes should stand out here
+		iN.apply(ft2, nofft=True)
+
+		ps   = dev.np.abs(ft2)**2
+		ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
+		df   = 1/(dt*data.tod.shape[1])
+		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
+		enmap.write_map(subpre + "iNps.fits", enmap.enmap(ops, fwcs))
+
+		# Output high-res ps for low freq
+		ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
+		nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		ops  = ops[:,:nbin]
+		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		enmap.write_map(subpre + "iNps_lowf.fits", enmap.enmap(ops, fwcs))
+		del ps
+
+
+
+
 		#d2   = dev.np.arange(ndet)
 		#d1   = d2[::thin]
 		#finds= dev.np.arange(nbin*fdown_lowf)

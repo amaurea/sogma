@@ -40,6 +40,7 @@ class NmatDebug(Nmat):
 		self.alpha = alpha
 		self.fknee = fknee
 		self.profile = profile
+		self.nwin  = 0
 		self.ready = ivar is not None
 	def build(self, tod, srate, **kwargs):
 		nsamp  = tod.shape[1]

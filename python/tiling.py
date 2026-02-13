@@ -422,6 +422,27 @@ def distribute_tods_simple(obsinfo, nsplit):
 		weights = np.ones(nsplit),
 	)
 
+def distribute_tods_ra(obsinfo, nsplit, verbose=False):
+	"""Split tods by the typical ra value. This isn't optimal, but it's
+	fast and robust, unlike distribute_tods_semibrute, that sometimes fails
+	and leaves things very unbalanced."""
+	ntod  = len(obsinfo)
+	# Handle special cases
+	if nsplit == 1: return bunch.Bunch(owner=np.zeros(ntod,int), weight=np.ones(ntod))
+	if ntod <= nsplit: return bunch.Bunch(owner=np.arange(ntod), weight=np.ones(ntod))
+	ra     = np.mean(obsinfo.sweep[:,:,0],-1)
+	order  = np.argsort(ra)
+	weight = obsinfo.ndet*obsinfo.nsamp
+	cweight= np.cumsum(weight)
+	owner  = np.minimum(utils.floor(cweight*nsplit/cweight[-1]),nsplit-1)
+	# If any ends up empty, just fall back to unweighted
+	nper   = np.bincount(owner, minlength=nsplit)
+	if np.any(nper==0):
+		owner = np.arange(len(weight))*nsplit//len(weight)
+	nper   = np.bincount(owner, minlength=nsplit)
+	wper   = np.bincount(owner, weight, minlength=nsplit)
+	return bunch.Bunch(owner=owner, weights=wper)
+
 def distribute_tods_semibrute(obsinfo, nsplit, npass=2, niter=10, verbose=False):
 	"""Split into nsplit groups such that the groups are
 	are approximately maximally-separated in state-space,

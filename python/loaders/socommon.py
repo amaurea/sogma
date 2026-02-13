@@ -3,6 +3,17 @@ import re, numpy as np, warnings, os, yaml, contextlib
 from pixell import utils, sqlite, bunch, config
 from .. import device, gutils
 
+# Bugs:
+#  * Since the query parsing and evaluation is done in two passes, first
+#    for a plain obsdb and then for a subobsdb, negative queries involving
+#    things that aren't fully determined at the obsdb level only partially
+#    work, and it might not be obvious when they don't work!
+#    It's hard to implement things properly when things like not((complicated)or(other ocmplicated))
+#    can occur, especially with my current token-based approach where the not doesn't know what
+#    expression it's being applied to.
+#    This parsing stuff is getting brittle and hard to maintain. The long-term solution is
+#    probably a proper parser.
+
 def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, pre_cols=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the
 	query and return a new SQL object (pointing to a temporary
@@ -72,6 +83,7 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		* idfile: The path to a file with a plain list of obsids or subids, or None if
 		  the simple_query didn't refer to one.
 	"""
+	issub  = "band" in cols
 	# A Simple Query is a comma-separated list of constraints.
 	# Each constraint can be just a tag name, or a full expression
 	# 1. Translate ,-separation into ()and()
@@ -115,80 +127,97 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 	# Translate python code chunks into a single statement
 	pycode = " & ".join(["(%s)" % tok for tok in pycode])
 	# This helper function handles more specific band selection if available
-	if "band" in cols: bandsel = lambda ftag, flavor: "(band = '%s')" % ftag
-	else:              bandsel = lambda ftag, flavor: "(tube_flavor = '%s')" % flavor
+	if issub: bandsel = lambda ftag, flavor: "(band = '%s')" % ftag
+	else:     bandsel = lambda ftag, flavor: "(tube_flavor = '%s')" % flavor
 	# 3. Loop through all referenced fields, and expand them if necessary.
 	otoks = []
 	prep_sel = {"set": False, "good": True, "bad": False}
+	query = expand_query_subids(query)
+	# Allow us to use & and | as shorthands for ' and ' and ' or '
+	query = utils.replace_outside(r"\|", " or ",  query, start="'\"", end="'\"")
+	query = utils.replace_outside(r"&", " and ", query, start="'\"", end="'\"")
 	for tok, isname in fieldname_iter(query):
-		# Split out unary op
-		if len(tok) > 0 and tok[0] in "+-~":
-			op, tok = tok[0], tok[1:]
-		else: op = " "
-		# Handle our formats
-		if not isname: pass
-		# Restrict as much as we can given any subobs constraints.
-		# This isn't very much, since obsdb doesn't operate on the subobs level
-		elif re.match(r"ws\d", tok):
-			tok = tag_op("instr(wafer_slots_list, '%s')" % tok, op)
-		elif tok in ["f030","f040"]: tok = tag_op(bandsel(tok, 'lf'),  op)
-		elif tok in ["f090","f150"]: tok = tag_op(bandsel(tok, 'mf'),  op)
-		elif tok in ["f220","f280"]: tok = tag_op(bandsel(tok, 'uhf'), op)
-		# Optics tube
-		elif tok in ["c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6"]:
-			tok = tag_op("(tube_slot = '%s')" % tok, op)
-		# Pseudo-tags
-		elif tok == "obs": tok = tag_op("(type='obs')", op)
-		elif tok == "cmb": tok = tag_op("(type='obs' and subtype='cmb')", op)
-		elif tok == "night": tok = tag_op("(mod(timestamp/3600,24) not between 11 and 23)", op)
-		elif tok == "day": tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
-		elif tok.upper() in ["DARK","OPTC"]:
-			if "det_type" in cols: tok = tag_op("(det_type = '%s')" % tok.upper(), op)
-			else:                  tok = "1"
-			det_type_set = True
-		# Aliases
-		elif tok == "t":   tok = "timestamp"
-		elif tok == "baz": tok = "az_center"
-		elif tok == "bel": tok = "el_center"
-		elif tok == "roll": tok = "roll_center"
-		elif tok == "waz": tok = "az_throw"
-		elif tok == "wel": tok = "el_throw"
-		elif tok == "dur": tok = "duration"
-		elif tok == "nsamp": tok = "n_samples"
-		# Constants
-		elif tok == "tcorot": tok = "1749513600"
-		elif tok == "tfoc2":  tok = "1756684800"
-		# Don't interpret columns as tags if they conflict
-		elif tok in cols: pass
-		# Actual tags
-		elif tok in tags:
-			tok = tag_op("(obs_id in (select obs_id from tags where (tag = '%s')))" % tok, op)
-		# Planet pseudo-tag
-		elif tok == "planet":
-			# The or 0 handles the case where there are no planets defined
-			sel = "(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)"
-			tok = tag_op("(obs_id in (select obs_id from tags where %s))" % sel, op)
-		else:
-			# Stuff that doesn't fit in. These are more limited than the others,
-			# and can't be parts of complicated expressions.
-			eq = "!=" if op in "-~" else "="
-			if tok == "good":
-				if   op == " ": prep_sel["good"], prep_sel["bad"] = True, False
-				elif op == "+": prep_sel["good"] = True
-				elif op == "-": prep_sel["good"] = False
-				elif op == "~": prep_sel["good"], prep_sel["bad"] = False, True
-				prep_sel["set"]   = True
-			elif tok == "bad":
-				if   op == " ": prep_sel["bad"], prep_sel["good"] = True, False
-				elif op == "+": prep_sel["bad"] = True
-				elif op == "-": prep_sel["bad"] = False
-				elif op == "~": prep_sel["bad"], prep_sel["good"] = False, True
-				prep_sel["set"]   = True
-			# Unknown tag
+		# If this is not some sort of field, then we leave it mostly as is
+		if not isname:
+			# We didn't do this above because ~ is treated specially for fields
+			if issub: tok = utils.replace_outside(r"~", " not ", tok, start="'\"", end="'\"")
 			else:
-				raise ValueError("Name '%s' not a recognized tag or obs table column!" % str(tok))
-			# Handled separately, so just replace with a 1
-			tok = "1"
+				# FIXME! Negation partially broken at the non-subobs-level. Not just right here
+				# I should probably switch to a proper parser instead of this brittle
+				# regex-based tokenization
+				pass
+		else:
+			# Split out unary op
+			if len(tok) > 0 and tok[0] in "+-~":
+				op, tok = tok[0], tok[1:]
+			else: op = " "
+			# Handle our formats
+			# Restrict as much as we can given any subobs constraints.
+			# This isn't very much, since obsdb doesn't operate on the subobs level
+			if re.match(obsid_fmt, tok):
+				tok = "(obs_id = '%s')" % tok
+			elif re.match(r"ws\d", tok):
+				tok = tag_op("instr(wafer_slots_list, '%s')" % tok, op, noneg=not issub)
+			elif tok in ["f030","f040"]: tok = tag_op(bandsel(tok, 'lf'),  op, noneg=not issub)
+			elif tok in ["f090","f150"]: tok = tag_op(bandsel(tok, 'mf'),  op, noneg=not issub)
+			elif tok in ["f220","f280"]: tok = tag_op(bandsel(tok, 'uhf'), op, noneg=not issub)
+			# Optics tube
+			elif tok in ["c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6"]:
+				tok = tag_op("(tube_slot = '%s')" % tok, op)
+			# Pseudo-tags
+			elif tok == "obs": tok = tag_op("(type='obs')", op)
+			elif tok == "cmb": tok = tag_op("(type='obs' and subtype='cmb')", op)
+			elif tok == "night": tok = tag_op("(mod(timestamp/3600,24) not between 11 and 23)", op)
+			elif tok == "day": tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
+			elif tok.upper() in ["DARK","OPTC"]:
+				if "det_type" in cols: tok = tag_op("(det_type = '%s')" % tok.upper(), op)
+				else:                  tok = "1"
+				det_type_set = True
+			# Aliases
+			elif tok == "&":   tok = " and "
+			elif tok == "|":   tok = " or "
+			elif tok == "t":   tok = "timestamp"
+			elif tok == "baz": tok = "az_center"
+			elif tok == "bel": tok = "el_center"
+			elif tok == "roll": tok = "roll_center"
+			elif tok == "waz": tok = "az_throw"
+			elif tok == "wel": tok = "el_throw"
+			elif tok == "dur": tok = "duration"
+			elif tok == "nsamp": tok = "n_samples"
+			# Constants
+			elif tok == "tcorot": tok = "1749513600"
+			elif tok == "tfoc2":  tok = "1756684800"
+			# Don't interpret columns as tags if they conflict
+			elif tok in cols: pass
+			# Actual tags
+			elif tok in tags:
+				tok = tag_op("(obs_id in (select obs_id from tags where (tag = '%s')))" % tok, op)
+			# Planet pseudo-tag
+			elif tok == "planet":
+				# The or 0 handles the case where there are no planets defined
+				sel = "(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)"
+				tok = tag_op("(obs_id in (select obs_id from tags where %s))" % sel, op)
+			else:
+				# Stuff that doesn't fit in. These are more limited than the others,
+				# and can't be parts of complicated expressions.
+				eq = "!=" if op in "-~" else "="
+				if tok == "good":
+					if   op == " ": prep_sel["good"], prep_sel["bad"] = True, False
+					elif op == "+": prep_sel["good"] = True
+					elif op == "-": prep_sel["good"] = False
+					elif op == "~": prep_sel["good"], prep_sel["bad"] = False, True
+					prep_sel["set"]   = True
+				elif tok == "bad":
+					if   op == " ": prep_sel["bad"], prep_sel["good"] = True, False
+					elif op == "+": prep_sel["bad"] = True
+					elif op == "-": prep_sel["bad"] = False
+					elif op == "~": prep_sel["bad"], prep_sel["good"] = False, True
+					prep_sel["set"]   = True
+				# Unknown tag
+				else:
+					raise ValueError("Name '%s' not a recognized tag or obs table column!" % str(tok))
+				# Handled separately, so just replace with a 1
+				tok = "1"
 		otoks.append(tok)
 	query = "".join(otoks) if len(otoks) > 0 else "1"
 	# Add default OPTC (non-dark) detector selection
@@ -218,10 +247,12 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		query += " and 0"
 	return bunch.Bunch(where=query, join=pjoin, idfile=idfile, pycode=pycode, slices=slices)
 
-def tag_op(expr, op):
+def tag_op(expr, op, noneg=False):
 	if   op in " ": return expr # standard
 	elif op in "+": return "1"  # + enables, but everything enabled by default
-	elif op in "-~": return "not " + expr # - removes from set, ~ complements. Same for boolean
+	elif op in "-~":
+		if noneg: return "1"
+		else: return "not " + expr # - removes from set, ~ complements. Same for boolean
 	else: raise ValueError("Invalid tag op '%s'" % str(op))
 
 # FIXME: when splitting bands, we must remember that this
@@ -301,7 +332,39 @@ planets = ["mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune",
 
 ##### Helpers #####
 
+obsid_fmt = re.compile(r"\bobs_\w+")
+subid_fmt = re.compile(r"\bobs_\w+(:\w+)*")
+
 def get_tags(db): return [row[0] for row in db.execute("select distinct tag from tags")]
+
+def preproc_fieldnames(fiter, quote="'\""):
+	"""Given a fieldname_iter, expand some fields like obs_ids and subids,
+	and split non-fieldnames to make further substitutions easier. This needs
+	to be a separate function because the main logic in parse_query can't change
+	the number of things to iterate over"""
+	def subid_expand(match): return "("+match.group(0).replace(":","&")+")"
+	for tok, isname in fiter:
+		if isname: yield tok, isname
+		else:
+			subtoks = utils.split_by_group(tok, start=quote, end=quote)
+			for stok in subtoks:
+				if len(stok) == 0: continue
+				elif stok[0] in quote: yield stok, False
+				else:
+					# Ok, we have an unquoted section that's not recognized as a field name.
+					# Split any subids into segments
+					stok = re.subn(subid_fmt, subid_expand, stok)[0]
+					# Split by whitespace and some punctuation
+					for elem in re.split(r"(&|\||\band\b|\bor\b|\(|\)| +)", stok):
+						yield elem, False
+
+def expand_query_subids(query, quote="'\""):
+	"""Given a query, expand a subid=obs:ws:band into individual fields
+	surrounded by (). This is necessary because they form a single unit,
+	while standard tokenization in fieldname_iter would break things like
+	subid1|subid2"""
+	def subid_expand(match): return "("+match.group(0).replace(":","&")+")"
+	return utils.replace_outside(subid_fmt, subid_expand, query, start=quote, end=quote)
 
 def fieldname_iter(query, quote="'\""):
 	toks = utils.split_by_group(query, start=quote, end=quote)
@@ -597,6 +660,9 @@ def point_hit(point, sweep, dur, r, pad=1.0*utils.degree):
 	pra, pdec = point[good].T
 	eff_rad   = r[good]/np.cos(pdec)
 	speed     = 15*utils.degree/utils.hour
+	# Make sure the point is on the right wrap, using the middle of our
+	# coverage as reference
+	pra  = utils.rewind(pra, ref=ra+speed*dur[good]/2)
 	dec_hit   = (pdec>dec1[good]-r[good]-pad)&(pdec<dec2[good]+r[good]+pad)
 	ra_hit    = (pra>ra-eff_rad-pad)&(pra<ra+speed*dur[good]+eff_rad+pad)
 	was_hit[good] = ra_hit & dec_hit

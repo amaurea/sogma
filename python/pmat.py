@@ -367,7 +367,6 @@ class PointingFit:
 		t2 = self.dev.time()
 		pointing = self.dev.pools["pointing"].empty(coeffs.shape[:-1]+B.shape[1:], B.dtype, reset=reset_buffer)
 		t3 = self.dev.time()
-		#coeffs.dot(B, out=pointing)
 		# coeffs[{y,x,psi},ndet,ndof]*B[ndof,nsamp] => pointing[{y,x,psi},ndet,nsamp]
 		# Cublas is column-major though, so we're doing pointing = B*coeffs
 		npre = coeffs.shape[0]*coeffs.shape[1]

@@ -52,36 +52,6 @@ class MLMapmaker:
 		else:
 			try:
 				iN = noise_model.build(gtod, srate=srate, obs=obs)
-				## Measure the size of the noise model
-				#tot = 0
-				#for key in ["iD", "iE", "V", "Kh", "ivar", "hbmps"]:
-				#	val  = getattr(iN,key)
-				#	if not isinstance(val, list): val = []
-				#	size = 0
-				#	for sub in val:
-				#		size += sub.size*sub.itemsize
-				#	tot += size
-				#	print("%-5s %8.5f" % (key,  size/1e9))
-				#print("%-5s %8.5f" % ("total", tot/1e9))
-				#iN.write("test_iN.hdf")
-				#gtod0 = gtod.copy()
-				#ft   = self.dev.lib.rfft(gtod)
-				#iNft = iN.apply(ft.copy(), nofft=True)
-				#ps = self.dev.get(gutils.downgrade(self.dev.np.mean(self.dev.np.abs(iNft)**2,0),10))
-				#f  = gutils.downgrade(np.fft.rfftfreq(gtod.shape[1], 1/srate),10)
-				#np.savetxt("test_ps_iNd.txt", np.array([f,ps]).T, fmt="%15.7e")
-				#chisq = self.dev.np.sum(self.dev.np.conj(ft)*iNft,0)
-				#print(self.dev.np.std(chisq.real))
-				#print(self.dev.np.std(chisq.imag))
-				#chisq = self.dev.get(gutils.downgrade(chisq.real,10))
-				#np.savetxt("test_chisq.txt", np.array([f,chisq]).T, fmt="%15.7e")
-
-				#df = srate/gtod.shape[1]
-				#i  = int(0.25/df)
-				#print(i)
-				#np.save("test_ft_025.npy", self.dev.get(ft[:,i-10:i+10]))
-				#np.save("test_iNft_025.npy", self.dev.get(iNft[:,i-10:i+10]))
-				#1/0
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise gutils.RecoverableError(msg)
@@ -95,7 +65,6 @@ class MLMapmaker:
 		# Add the observation to each of our signals
 		for signal in self.signals:
 			signal.add_obs(id, obs, iN, gtod)
-		# TODO: update our stats/info here
 		t6 = self.dev.time()
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
@@ -116,7 +85,6 @@ class MLMapmaker:
 		owork = [signal.owork()    for signal in self.signals]
 		t2 = self.dev.time()
 		for di, data in enumerate(self.data):
-			# This is the main place that needs to change for the GPU implementation
 			ta1  = self.dev.time()
 			gtod = self.dev.pools["tod"].empty([data.ndet, data.nsamp], self.dtype)
 			ta2  = self.dev.time()
@@ -222,8 +190,6 @@ class SignalMap(Signal):
 		to equatorial coordinates."""
 		Signal.__init__(self, name, ofmt, outputs, ext)
 		self.sys   = sys or "cel"
-		#if self.sys not in ["cel","equ","hor"]:
-		#	raise NotImplementedError("Coordinate system rotation not implemented yet")
 		self.dtype = dtype
 		self.interpol = interpol
 		self.data  = {}
@@ -512,12 +478,10 @@ class SignalMapMulti(Signal):
 			mapsig.prepare()
 			self.dof.add(mapsig.dof)
 		self.rhs = [mapsig.rhs for mapsig in self.mapsigs]
-		## Harmonize the output pixelization, so all bands cover the same pixels.
-		## This makes plotting easier, but also means we can't have different
-		## resolution for the different band maps. But to allow that, we would need
-		## to pass in multiple geometries anyway, which we don't do. So this doesn't
-		## make us less general than we already area.
-		## This is a bit hacky, since it messes with the internals of TileDistribution.
+		# TODO: Harmonize output pixelization here? Mabye not. If we don't
+		# we leave open the possibility of having different resolutions per band
+		# in the future. Below is a first attempt that didn't work, and I didn't debug
+		# further. This is a bit hacky, since it messes with the internals of TileDistribution.
 		#pixboxes = np.array([mapsig.tiledist.pixbox for mapsig in self.mapsigs])
 		#pixbox   = np.array([np.min(pixboxes[:,0,:],0),np.max(pixboxes[:,1,:],0)])
 		#for mi, mapsig in enumerate(self.mapsigs):
@@ -1189,11 +1153,6 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		twcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[dt*tdown,1])
 		enmap.write_map(subpre + "tod.fits", enmap.enmap(otod, twcs))
 
-		# FIXME
-		print(data.keys())
-		bunch.write(subpre + "test.hdf", bunch.Bunch(tod=dev.get(data.tod), bore=data.boresight, dets=data.detids, t=data.ctime))
-		1/0
-
 		# Output ps
 		ft   = dev.lib.rfft(data.tod)
 		nsamp= data.tod.shape[1]
@@ -1258,9 +1217,6 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
 		enmap.write_map(subpre + "iNps_lowf.fits", enmap.enmap(ops, fwcs))
 		del ps
-
-
-
 
 		#d2   = dev.np.arange(ndet)
 		#d1   = d2[::thin]

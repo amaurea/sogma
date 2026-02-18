@@ -322,7 +322,6 @@ class FastMeta:
 				paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps",  optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("jumps_2pi",   read_cuts(pl, "jumps_2pi/jump_flag",  optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("jumps_slow",  read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
-				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag", optional=optional),      [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional=optional), [(0,"dets"),(1,"samps")])
 
 			# TODO: Remove the noise_mapmaking part once the transition is complete
@@ -479,17 +478,6 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None]
 		if "relcal" in meta.aman: phase_to_cmb *= meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
-
-	# This was moved to socal
-	#with bench.mark("filter sinel", tfun=dev.time):
-	#	deproj_el = config.get("deproj_el")
-	#	if deproj_el > 0:
-	#		elrange = utils.minmax(el[::100])
-	#		if elrange[1]-elrange[0] > deproj_el*utils.arcmin:
-	#			deproject_el(signal, el, dev=dev)
-
-	#with bench.mark("autocal", tfun=dev.time):
-	#	autocal_elmod(signal, el, roll, meta.aman.focal_plane, dev=dev)
 
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
@@ -734,17 +722,6 @@ class DetCache:
 				)
 			self.detset_cache[obsid][sinfo.wslot] = dset
 		self.done.add(obsid)
-
-#def split_bands(dets):
-#	bdets = {}
-#	for di, det in enumerate(dets):
-#		m = re.match(r"^\w+_(f\d\d\d|DARK)_.*$", det)
-#		if not m: continue
-#		band = m.group(1)
-#		if band not in bdets:
-#			bdets[band] = []
-#		bdets[band].append(di)
-#	return [(band, np.array(bdets[band])) for band in bdets]
 
 class Subid:
 	def __init__(self, obsid, wslot, band, type="OPTC"):
@@ -1259,105 +1236,6 @@ def fix_overpole(az, el, roll, inline=False):
 	az   += np.pi
 	roll += np.pi
 	return az, el, roll
-
-## This is handled in socal, so not needed here
-#def deproject_el(signal, el, natm=2, nel=2, bsize=1000, dev=None):
-#	ndet, nsamp = signal.shape
-#	if dev is None: dev = device.get_device()
-#	nblock = nsamp//bsize
-#	# El-basis which will be subtracted in the end
-#	el      = dev.np.array(el)
-#	E       = dev.np.zeros((nel, nsamp),signal.dtype)
-#	E[0]    = el - dev.np.mean(el)
-#	for i in range(1, nel): E[i] = E[0]*E[i-1]
-#	# Full basis to fit for, in blocks
-#	B       = dev.np.zeros((nel+natm,nblock,bsize),signal.dtype)
-#	# legbasis takes the maximum order, which is 1 less than the number
-#	# of basis functions
-#	B[nel:] = gutils.legbasis(natm-1, bsize, ap=dev.np)[:,None,:]
-#	B[:nel] = E[:,:nblock*bsize].reshape(nel,nblock,bsize)
-#	# No noise weighting - the atm-modes should absorb the noise
-#	# Fit for the amplitudes
-#	btod    = signal[:,:nblock*bsize].reshape(ndet,nblock,bsize)
-#	rhs     = dev.np.einsum("mbs,dbs->dmb", B, btod)
-#	div     = dev.np.einsum("mbs,nbs->mnb", B, B)
-#	idiv    = dev.np.linalg.inv(div.T).T
-#	amps    = dev.np.einsum("mnb,dnb->dmb", idiv, rhs)
-#	amps    = dev.np.median(amps,-1)
-#	dev.lib.sgemm("N", "N", nsamp, ndet, nel, -1, E, E.shape[1], amps, amps.shape[1], 1, signal, signal.shape[1])
-
-#def autocal_elmod(signal, bel, roll, xieta, nmode=2, bsize=2000, tol=0.1, dev=None):
-#	if dev is None: dev = device.get_device()
-#	assert nmode >= 2, "autocal_elmod needs nmode >= 2. The first two modes are an offset (discarded) and a slope (used for calibration)"
-#	ndet, nsamp = signal.shape
-#	# f (bel) = a * 1/sin(f(bel)) = a * 1/sin(f(bel0)) + a * f'(bel0) * Δbel + ...
-#	# Let's call 1/sin(el) = x, and 1/sin(bel) = bx, and x = g(bx)
-#	# f (bx) = a*g(bx) = a*g(bx0) + a*g'(bx0)*Δbx + ...
-#	# Could expand around middle of xieta instad of boresight, but nice to have
-#	# a standard location for all runs.
-#	bx = 1/np.sin(bel)
-#	# Need d(det_x)/dbx for each detector. Will use finite difference over the whole
-#	# elevation range as representative. We assume constant roll
-#	belrange = utils.minmax(bel)
-#	bx1, bx2 = 1/np.sin(belrange)
-#	roll = np.mean(roll)
-#	x1 = 1/np.sin(calc_det_el(belrange[0], roll, xieta))
-#	x2 = 1/np.sin(calc_det_el(belrange[1], roll, xieta))
-#	gprime = (x2-x1)/(bx2-bx1)
-#	print(gprime)
-#	Δbx = dev.np.array(bx-0.5*(bx1+bx2))
-#	# With this, the tod should be const + a*g'*Δbx in each block
-#	# Build the blocks
-#	nblock = nsamp//bsize
-#	btod   = signal[:,:nblock*bsize].reshape(ndet,nblock,bsize)
-#	bΔbx   = Δbx[:nblock*bsize].reshape(nblock,bsize)
-#	# Build basis
-#	B     = dev.np.zeros((nmode,nblock,bsize), btod.dtype)
-#	B[:]  = bΔbx
-#	for i in range(nmode): B[i] **= i
-#	# Fit in blocks
-#	rhs   = dev.np.einsum("mbs,dbs->bdm", B, btod) # [nblock,ndet,nmode]
-#	div   = dev.np.einsum("mbs,nbs->bmn", B, B)   # [nblock,nmode,nmode]
-#	# Reduce to blocks with healthy determinant
-#	det   = dev.np.linalg.det(div)
-#	good  = det > 0
-#	if dev.np.sum(good) == 0: raise ValueError("elmod calibration failed for all blocks. Is elevation actually varying?")
-#	good  = det > dev.np.median(det[good])*tol
-#	if dev.np.sum(good) == 0: raise ValueError("elmod calibration failed for all blocks. Is elevation actually varying?")
-#	rhs, div = rhs[good], div[good]
-#	# Solve the remaining blocks
-#	idiv  = dev.np.linalg.inv(div)
-#	amps  = dev.np.einsum("bmn,bdn->bdm", idiv, rhs) # [nblock,ndet,nmode]
-#	slope = dev.get(amps[:,:,1]) # µK [nblock,ndet]
-#	# slope = a*g'. Divide out g' to get a
-#	ba    = slope/gprime # µK [nblock,ndet]
-#	# Use blocks to get robust mean and error
-#	a, da = robust_mean(ba, 0)
-#	
-#	np.savetxt("test_elgain.txt", np.array([
-#		a, da, gprime, xieta[:,0], xieta[:,1]]).T, fmt="%15.7e")
-#	np.savetxt("test_elgain_t.txt", ba, fmt="%15.7e")
-#	1/0
-#
-#
-#
-#def calc_det_el(bel, roll, xieta):
-#	bel, roll, xi, eta = np.broadcast_arrays(bel, roll, *xieta.T[:2])
-#	# Boresight
-#	bore = coordsys.Coords(az=bel*0, el=bel, roll=roll)
-#	# Focal plane
-#	q    = coordsys.rotation_xieta(xi, eta)
-#	el   = (bore*q).el
-#	return el
-#
-#def robust_mean(arr, axis=-1, quantile=0.1):
-#	axis= axis%arr.ndim
-#	arr = np.sort(arr, axis=axis)
-#	n   = utils.nint(arr.shape[axis]*quantile)
-#	arr = arr[(slice(None),)*axis+(slice(n,-n),)]
-#	mean= np.mean(arr, axis)
-#	err = np.std(arr, axis)/arr.shape[axis]**0.5
-#	return mean, err
 
 # The idea of this was to effectively gapfill using the
 # common mode. Maybe it could work, but in my test, it

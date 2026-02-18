@@ -247,6 +247,8 @@ def elmod_cal(obs, nel=2, natm=2, bsize=1000, tol=0.1, prefix=None, minamp=None,
 
 def measure_el_response(obs, nel=2, natm=2, bsize=1000, tol=0.1, dev=None):
 	if dev is None: dev = device.get_device()
+	# TODO: This function allocates some medium-sized
+	# gpu buffers. Consider using pools. ft is free
 	ndet, nsamp = obs.tod.shape
 	nmode= nel+natm
 	bel  = obs.boresight[0]

@@ -31,6 +31,10 @@ class MLMapmaker:
 		self.ready    = False
 		for signal in self.signals:
 			signal.reset()
+	def new(self):
+		signals = [signal.new() for signal in self.signals]
+		return MLMapmaker(signals=signals, dev=self.dev, noise_model=self.noise_model,
+			outputs=self.outputs, dtype=self.dtype, verbose=self.verbose)
 	def add_obs(self, id, obs, deslope=True, noise_model=None):
 		# Prepare our tod
 		t1 = self.dev.time()
@@ -164,6 +168,7 @@ class Signal:
 	def reset(self):
 		self.dof   = None
 		self.ready = False
+	def new(self): return Signal(self.name, self.ofmt, self.outputs, self.ext)
 	def add_obs(self, id, obs, iN, iNd): pass
 	def prepare(self): self.ready = True
 	def forward (self, id, tod, x): pass
@@ -225,6 +230,14 @@ class SignalMap(Signal):
 		self.ids      = []
 		self.tiledist = None
 		self.drhs  = self.dev.lib.DynamicMap(*self.fshape, self.dtype)
+		for name in ["rhs", "hits", "ivar", "tmap", "iprec", "dof"]:
+			if hasattr(self, name):
+				delattr(self, name)
+	def new(self): return SignalMap(self.shape, self.wcs, self.comm,
+			dev=self.dev, name=self.name, ofmt=self.ofmt, outputs=self.outpus,
+			precon=self.precon, ext=self.ext, dtype=self.dtype, ibuf=self.ibuf,
+			obuf=self.obuf, sys=self.sys, interpol=self.interpol, autocrop=self.autocrop,
+			ocomps=ocomps)
 	def add_obs(self, id, obs, iN, iNd, pmap=None, pcut=None):
 		"""Add and process an observation, building the pointing matrix
 		and our part of the RHS. "obs" should be an Observation axis manager,
@@ -444,6 +457,12 @@ class SignalMapMulti(Signal):
 		self.ready = False
 	def reset(self):
 		for mapsig in self.mapsigs: mapsig.reset()
+	def new(self):
+		ref = self.mapsigs[0]
+		return SignalMapMulti(ref.shape, ref.wcs, self.bands, ref.comm, dev=ref.dev,
+			name=self.name, ofmt=self.ofmt, outputs=self.outputs, ext=self.ext, dtype=ref.dtype,
+			ibuf=ref.ibuf, obuf=ref.obuf, sys=ref.sys, interpol=ref.interol, precon=ref.precon,
+			autocorp=ref.autocrop)
 	def add_obs(self, id, obs, iN, iNd):
 		# Find the det-ranges for each of our bands in obs
 		band_info = []
@@ -555,6 +574,9 @@ class SignalCutFull(Signal):
 		self.rhs   = []
 		self.idiv  = []
 		self.data  = {}
+	def new(self):
+		return SignalCutFull(self.comm, dev=self.dev, name=self.name, ofmt=self.ofmt,
+			dtype=self.dtype, outputs=self.outpus)
 	def add_obs(self, id, obs, iN, iNd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
 		iN a noise model, representing the inverse noise covariance matrix,
@@ -644,6 +666,9 @@ class SignalCutPoly(SignalCutFull):
 			raise NotImplementedError("SignalCutPoly precons other than 'none' currently don't work")
 		if precon == "leginv":
 			self.ibases = gutils.leginverses(self.basis)
+	def new(self):
+		return SignalCutPoly(self.comm, dev=self.dev, order=self.order, bsize=self.bsize,
+			precon=self.precon, name=self.name, ofmt=self.ofmt, dtype=self.dtype, outputs=self.outpus)
 	def add_obs(self, id, obs, iN, iNd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
 		iN a noise model, representing the inverse noise covariance matrix,
@@ -704,6 +729,9 @@ class SignalElMod(Signal):
 		self.rhs   = []
 		self.idiv  = []
 		self.data  = {}
+	def new(self):
+		return SignalElMod(self.comm, order=self.order, dev=self.dev, name=self.name, ofmt=self.ofmt,
+			dtype=self.dtype, outputs=self.outputs)
 	def add_obs(self, id, obs, iN, iNd):
 		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
 		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
@@ -805,6 +833,7 @@ class SignalInfo(Signal):
 	def reset(self):
 		self.info  = []
 		self.ready = False
+	def new(self): return SignalInfo(self.comm, dev=self.dev)
 	def add_obs(self, id, obs, iN, iNd):
 		srate = (len(obs.ctime)-1)/(obs.ctime[-1]-obs.ctime[0])
 		# Get the scanning info. These are *after* the pointing
@@ -921,9 +950,18 @@ class SignalInfo(Signal):
 
 	valid_outputs = ["info"]
 
+# Multipass mapmaking
+# 1. In mapmaker.add_obs, evaluate model into extra tod. Subtract before
+#    gapfilling and building noise model. Then add back in
+# 2. In mapmaker.solve, use previous x as x0
+# To do this, we need a way to evaluate old model in the context of
+# a new mapmaker. Easiest if I can create a new empty mapmaker based
+# on the old one.
+
 # Mapmaking function
 config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
 def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
+	mapmaker.new()
 	if prefix is None: prefix = ""
 	# Skip if we're already done
 	if cont and (os.path.exists(prefix + ".empty") or all([signal.written(prefix) for signal in mapmaker.signals])):

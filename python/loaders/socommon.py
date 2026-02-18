@@ -603,7 +603,7 @@ def make_sweep(ctime, baz0, waz, bel0, off, npoint=6, nocross=True):
 	from pixell import coordsys
 	# given ctime,baz0,waz,bel [ntod], off[ntod,{xi,eta}], make
 	# make sweeps[ntod,npoint,{ra,dec}]
-	coff = coordsys.Coords(q=coordsys.euler(1, -bel0)*coordsys.rotation_xieta(off[:,0], off[:,1]))
+	coff = coordsys.Coords(q=coordsys.euler(1, np.pi/2-bel0)*coordsys.rotation_xieta(off[:,0], off[:,1]))
 	az_off, el = coff.az, coff.el
 	az1 = baz0+az_off-waz/2
 	az2 = baz0+az_off+waz/2

@@ -241,7 +241,7 @@ def elmod_cal(obs, nel=2, natm=2, bsize=1000, tol=0.1, prefix=None, minamp=None,
 			dump_elmod_fit(prefix + "elcal.txt", fit)
 		if "tdump" in tasks:
 			dump_elmod_tfit(prefix + "telcal.txt", fit)
-	except ValueError
+	except ValueError:
 		return False
 	return "cal" in tasks
 

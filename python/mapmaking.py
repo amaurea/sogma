@@ -923,10 +923,6 @@ class SignalInfo(Signal):
 
 # Mapmaking function
 config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
-# TODO: Investigate best value of this. I had 100 before, but 0.1 has worked better in
-# recent depth1 tests. Why did 100 seem necessary before, and isn't 0.1 very low, basically
-# just linear gapfilling?
-config.default("gapfill_tol", 3.0, "Clip values brighter than this times the RMS when gapfilling")
 def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	if prefix is None: prefix = ""
 	# Skip if we're already done
@@ -996,7 +992,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		socal.autocut(data, dev=dev, id=name)
 		# Remove extreme values in the cut areas. This is gentler than trying
 		# and failing to gapfill with realistic noise
-		gutils.gapfill_extreme(data.tod, data.cuts, dev=dev, tol=config.get("gapfill_tol"))
+		data.cuts.gapfill(data.tod)
 		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
 		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
 		t3    = time.time()

@@ -18,11 +18,8 @@ from . import device
 # database, so having them as independent functions is wasteful. Let's make a
 # class that can be queried.
 
-# FIXME: SimpleLoader and SotodlibLoader are out of data.
+# FIXME: SimpleLoader and SotodlibLoader are out of date.
 # Misisng new query system, load_multi and det-restriction
-
-# Hack: repeated here because the actual loaders don't get imported until later
-config.default("deproj_el", 1.0, "El-amplitude above which to fit and subtract a sin(el) signal per detector, in arcmin. The value zero is special, and diables the filter.")
 
 def Loader(dbfile, type="auto", dev=None, mul=32):
 	if type == "auto":

@@ -319,9 +319,9 @@ class FastMeta:
 			with bench.mark("fm_cuts"):
 				optional = config.get("cuts_optional")
 				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags",optional=optional), [(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_2pi",    read_cuts(pl, "jumps_2pi/jump_flag",  optional=optional), [(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_slow",   read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps",  optional=optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("jumps_2pi",   read_cuts(pl, "jumps_2pi/jump_flag",  optional=optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("jumps_slow",  read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_jump",   read_cuts(pl, "jumps/jump_flag", optional=optional),      [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional=optional), [(0,"dets"),(1,"samps")])
 
@@ -422,21 +422,24 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 	return aman
 
 # This config moved to loading.py because sofast is only imported conditionally
-#config.default("deproj_el", 1.0, "El-amplitude above which to fit and subtract a sin(el) signal per detector, in arcmin. The value zero is special, and diables the filter.")
 def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	from pixell import fft
 	if dev is None: dev = device.get_device()
-	# Merge the cuts. Easier to deal with just a single cuts object
+	# Merge the cuts and jumps separately. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
-		cuts = socut.Sampcut.merge([meta.aman[name] for name in
-			["cuts_glitch","cuts_2pi","cuts_slow","cuts_smurf"]])#,"cuts_jump","cuts_turn"]])
+		cut_names  = [key for key in meta.aman.keys() if key.startswith("cuts_")]
+		jump_names = [key for key in meta.aman.keys() if key.startswith("jumps_")]
+		raw_cuts  = socut.Sampcut.merge([meta.aman[name] for name in cut_names])
+		jumps     = socut.Sampcut.merge([meta.aman[name] for name in jump_names])
+		# These are what will be passed to the mapmaker in the end
+		cuts   = socut.Sampcut.merge([raw_cuts, jumps])
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
 	# Find when we're actually scanning
 	i1, i2 = socommon.find_scanning(data.az)
 	# Adjust to fourier-friendly length
 	nsamp = fft.fft_len((i2-i1)//mul, factors=dev.lib.fft_factors)*mul
 	i2    = i1+nsamp
-	timestamps, signal, cuts, az, el = [a[...,i1:i2] for a in [data.timestamps,data.signal,cuts,data.az,data.el]]
+	timestamps, signal, cuts, raw_cuts, jumps, az, el = [a[...,i1:i2] for a in [data.timestamps,data.signal,cuts,raw_cuts,jumps,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[i1:i2] if "hwp_angle" in meta.aman else None
 	ninit = data.dets.count
 	overpole = el[0]>90
@@ -477,12 +480,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		if "relcal" in meta.aman: phase_to_cmb *= meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
 
-	with bench.mark("filter sinel", tfun=dev.time):
-		deproj_el = config.get("deproj_el")
-		if deproj_el > 0:
-			elrange = utils.minmax(el[::100])
-			if elrange[1]-elrange[0] > deproj_el*utils.arcmin:
-				deproject_el(signal, el, dev=dev)
+	# This was moved to socal
+	#with bench.mark("filter sinel", tfun=dev.time):
+	#	deproj_el = config.get("deproj_el")
+	#	if deproj_el > 0:
+	#		elrange = utils.minmax(el[::100])
+	#		if elrange[1]-elrange[0] > deproj_el*utils.arcmin:
+	#			deproject_el(signal, el, dev=dev)
 
 	#with bench.mark("autocal", tfun=dev.time):
 	#	autocal_elmod(signal, el, roll, meta.aman.focal_plane, dev=dev)
@@ -497,8 +501,11 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Deglitch and dejump
 	w = 10
 	with bench.mark("deglitch", tfun=dev.time):
-		cuts.dejump(signal, w=w, dev=dev)
-		#deglitch_commonsep(signal, cuts, w=w, dev=dev)
+		# A bit dangerous to do these one by one. What happens if there's a cut
+		# right at the edge of a jump? The dejumping would fail. Hopefully this
+		# is rare
+		jumps.dejump(signal, w=w, dev=dev)
+		raw_cuts.gapfill(signal, w=w, dev=dev)
 
 	with bench.mark("deslope", tfun=dev.time):
 		with dev.pools["ft"].as_allocator():
@@ -1253,48 +1260,31 @@ def fix_overpole(az, el, roll, inline=False):
 	roll += np.pi
 	return az, el, roll
 
-def deproject_el(signal, el, natm=2, nel=2, bsize=1000, dev=None):
-	ndet, nsamp = signal.shape
-	if dev is None: dev = device.get_device()
-	# Originally did this with fft iN and a single fit per
-	# detector, but that was not robust to glitches etc.
-	# Will use a block-based approach instead. Each block
-	# should be long enough to measure the pattern, but
-	# short enough not to have too much correlated noise.
-	# Will fit amplitude in all the blocks, then take the
-	# median per detector.
-	nblock = nsamp//bsize
-	# El-basis which will be subtracted in the end
-	el      = dev.np.array(el)
-	E       = dev.np.zeros((nel, nsamp),signal.dtype)
-	E[0]    = el - dev.np.mean(el)
-	for i in range(1, nel): E[i] = E[0]*E[i-1]
-	# Full basis to fit for, in blocks
-	B       = dev.np.zeros((nel+natm,nblock,bsize),signal.dtype)
-	# legbasis takes the maximum order, which is 1 less than the number
-	# of basis functions
-	B[nel:] = gutils.legbasis(natm-1, bsize, ap=dev.np)[:,None,:]
-	B[:nel] = E[:,:nblock*bsize].reshape(nel,nblock,bsize)
-	# No noise weighting - the atm-modes should absorb the noise
-	# Fit for the amplitudes
-	btod    = signal[:,:nblock*bsize].reshape(ndet,nblock,bsize)
-	rhs     = dev.np.einsum("mbs,dbs->dmb", B, btod)
-	div     = dev.np.einsum("mbs,nbs->mnb", B, B)
-	idiv    = dev.np.linalg.inv(div.T).T
-	#idiv    = gutils.inv3(div, sym=True)
-	amps    = dev.np.einsum("mnb,dnb->dmb", idiv, rhs)
-	amps    = dev.np.median(amps,-1)
-	# Ok, we hopefully have a good amplitude per detector now
-	#print("amps0", dev.np.sort(amps[:,0]))
-	#print("amps1", dev.np.sort(amps[:,1]))
-	# signal = -amp*E + signal. F=> signal = -E*amp + signal
-	#print("std A", dev.np.std(signal))
-	# This will only subtract nel modes, even though E and amps contain more
-	moo = signal[0].copy()
-	dev.lib.sgemm("N", "N", nsamp, ndet, nel, -1, E, E.shape[1], amps, amps.shape[1], 1, signal, signal.shape[1])
-	#print("std B", dev.np.std(signal))
-	#bunch.write("test.hdf", bunch.Bunch(tod1=dev.get(moo), tod2=dev.get(signal[0]), E=dev.get(E)))
-	#1/0
+## This is handled in socal, so not needed here
+#def deproject_el(signal, el, natm=2, nel=2, bsize=1000, dev=None):
+#	ndet, nsamp = signal.shape
+#	if dev is None: dev = device.get_device()
+#	nblock = nsamp//bsize
+#	# El-basis which will be subtracted in the end
+#	el      = dev.np.array(el)
+#	E       = dev.np.zeros((nel, nsamp),signal.dtype)
+#	E[0]    = el - dev.np.mean(el)
+#	for i in range(1, nel): E[i] = E[0]*E[i-1]
+#	# Full basis to fit for, in blocks
+#	B       = dev.np.zeros((nel+natm,nblock,bsize),signal.dtype)
+#	# legbasis takes the maximum order, which is 1 less than the number
+#	# of basis functions
+#	B[nel:] = gutils.legbasis(natm-1, bsize, ap=dev.np)[:,None,:]
+#	B[:nel] = E[:,:nblock*bsize].reshape(nel,nblock,bsize)
+#	# No noise weighting - the atm-modes should absorb the noise
+#	# Fit for the amplitudes
+#	btod    = signal[:,:nblock*bsize].reshape(ndet,nblock,bsize)
+#	rhs     = dev.np.einsum("mbs,dbs->dmb", B, btod)
+#	div     = dev.np.einsum("mbs,nbs->mnb", B, B)
+#	idiv    = dev.np.linalg.inv(div.T).T
+#	amps    = dev.np.einsum("mnb,dnb->dmb", idiv, rhs)
+#	amps    = dev.np.median(amps,-1)
+#	dev.lib.sgemm("N", "N", nsamp, ndet, nel, -1, E, E.shape[1], amps, amps.shape[1], 1, signal, signal.shape[1])
 
 #def autocal_elmod(signal, bel, roll, xieta, nmode=2, bsize=2000, tol=0.1, dev=None):
 #	if dev is None: dev = device.get_device()

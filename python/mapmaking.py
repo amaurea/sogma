@@ -1,11 +1,11 @@
 import numpy as np, os, warnings
-import time
+import time, h5py
 from pixell import utils, bunch, enmap, colors, wcsutils, bench, config
 from . import nmat, pmat, tiling, gutils, device, socal
 from .logging import L
 
 class MLMapmaker:
-	def __init__(self, signals=[], dev=None, noise_model=None, dtype=np.float32, verbose=False):
+	def __init__(self, signals=[], dev=None, noise_model=None, outputs=[], dtype=np.float32, verbose=False):
 		"""Initialize a Maximum Likelihood Mapmaker.
 		Arguments:
 		* signals: List of Signal-objects representing the models that will be solved
@@ -21,6 +21,7 @@ class MLMapmaker:
 		self.dtype    = dtype
 		self.verbose  = verbose
 		self.noise_model = noise_model or nmat.NmatDetvecs(dev=dev)
+		self.set_outputs(outputs)
 		self.reset()
 	def reset(self):
 		"""Reset the mapmaker, as if it had just been constructed. Also
@@ -99,7 +100,7 @@ class MLMapmaker:
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
 		self.data.append(bunch.Bunch(id=id, ndet=len(obs.dets), nsamp=len(ctime),
-			dets=obs.dets, iN=iN))
+			dets=obs.dets, detids=obs.detids, iN=iN))
 	def prepare(self):
 		if self.ready: return
 		t1 = self.dev.time()
@@ -155,6 +156,24 @@ class MLMapmaker:
 			x  = self.dof.unzip(solver.x)
 			t2 = time.time()
 			yield bunch.Bunch(i=solver.i, err=solver.err, x=x, t=t2-t1)
+	def set_outputs(self, outputs):
+		self.outputs= check_outputs(outputs, self.valid_outputs, self.__class__.__name__)
+	def write(self, prefix, x, tag=None, suffix="", force=False):
+		for signal, val in zip(self.signals, x):
+			signal.write(prefix, val, tag=tag, suffix=suffix, force=force)
+	def write_misc(self, prefix):
+		# Forward to our signals
+		for signal in self.signals:
+			signal.write_misc(prefix)
+		# Then output our own stuff
+		if "nmat" in self.outputs:
+			for di, data in enumerate(self.data):
+				fname = "%s%s_%s.hdf" % (prefix, "nmat", data.id.replace(":","_"))
+				data.iN.write(fname)
+				# Hack, add in detector ids
+				with h5py.File(fname, "r+") as hfile:
+					hfile["detids"] = np.char.encode(data.detids)
+	valid_outputs = ["nmat"]
 
 class Signal:
 	"""This class represents a thing we want to solve for, e.g. the sky, ground, cut samples, etc."""
@@ -190,7 +209,7 @@ class Signal:
 	def set_outputs(self, outputs):
 		self.outputs= check_outputs(outputs, self.valid_outputs, self.__class__.__name__)
 	def written(self, prefix): raise NotImplementedError
-	def write   (self, prefix, x, tag="dummy", suffix="", force=False): pass
+	def write   (self, prefix, x, tag=None, suffix="", force=False): pass
 	def write_misc(self, prefix): pass
 	valid_outputs = []
 
@@ -412,7 +431,8 @@ class SignalMap(Signal):
 			oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
 			done  = done and os.path.exists(oname)
 		return done
-	def write(self, prefix, m, tag="map", suffix="", force=False, extra={}, oslice=None):
+	def write(self, prefix, m, tag=None, suffix="", force=False, extra={}, oslice=None):
+		if tag is None: tag = "map"
 		if not force and tag not in self.outputs: return
 		oname = self.ofmt.format(name=self.name)
 		oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
@@ -542,7 +562,7 @@ class SignalMapMulti(Signal):
 			if not mapsig.written(prefix):
 				return False
 		return True
-	def write(self, prefix, m, tag="map", suffix="", force=False, oslice=None):
+	def write(self, prefix, m, tag=None, suffix="", force=False, oslice=None):
 		onames = []
 		for bi, band in enumerate(self.bands):
 			oname = self.mapsigs[bi].write(prefix, m[bi], tag=tag, suffix=suffix, force=force, oslice=oslice)
@@ -632,7 +652,8 @@ class SignalCutFull(Signal):
 		if self.comm is not None:
 			done = self.comm.allreduce(done)==self.comm.size
 		return done
-	def write(self, prefix, m, tag="map", suffix="", force=False):
+	def write(self, prefix, m, tag=None, suffix="", force=False):
+		if tag is None: tag = "map" # e.g. cut_map as opposed to cut_ivar
 		if not force and tag not in self.outputs: return
 		import h5py
 		if self.comm is None:
@@ -767,7 +788,8 @@ class SignalElMod(Signal):
 	def owork(self): return self.dev.np.zeros(self.rhs.shape, self.rhs.dtype)
 	# have [id][ndet,order] values. Best as just a text file with
 	# one line per tod and columns of det-order?
-	def write(self, prefix, m, tag="map", suffix="", force=False):
+	def write(self, prefix, m, tag=None, suffix="", force=False):
+		if tag is None: tag = "map" # e.g. cut_map as opposed to cut_ivar
 		if not force and tag not in self.outputs: return
 		# Collect info on root node
 		my_ids   = np.array([id for id in self.data])
@@ -990,6 +1012,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		name   = joint.names[ind]
 		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
+		moo = []
 		try:
 			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids)
 			# I keep calculating this. It should be a standard member of data
@@ -1034,8 +1057,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 
 	mapmaker.prepare()
 	# Write rhs and ivar
-	for signal in mapmaker.signals:
-		signal.write_misc(prefix)
+	mapmaker.write_misc(prefix)
 
 	# Solve the equation system
 	step = None
@@ -1043,17 +1065,14 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		# Dump if we're in dump-list, or a multiple of the last entry, but not if
 		# we're on the final iteration anyway, since that would be redundant with
 		# the final result
-		will_dump = len(dump) > 0 and (step.i in dump or (dump[-1] != 0 and step.i % dump[-1] == 0)) and step.i != maxiter
-		if will_dump:
-			for signal, val in zip(mapmaker.signals, step.x):
-				signal.write(prefix, val, suffix="%04d" % step.i)
+		will_dump = len(dump) > 0 and (step.i in dump or (dump[-1] != 0 and step.i % dump[-1] == 0))
+		if will_dump: mapmaker.write(prefix, step.x, suffix="%04d" % step.i)
 		# Safest to print this *after* writing, so the user can safely abort
 		# when they see the message
 		L.print("CG %4d %15.7e  %6.3f s%s" % (step.i, step.err, step.t, " (write)" if will_dump else ""), id=0, level=1, color=colors.lgreen)
 	# Write the final result, unless we didn't do a single CG step
 	if step is not None:
-		for signal, val in zip(mapmaker.signals, step.x):
-			signal.write(prefix, val)
+		mapmaker.write(prefix, step.x)
 
 def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker

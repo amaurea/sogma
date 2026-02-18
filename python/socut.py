@@ -125,6 +125,7 @@ class Simplecut:
 		index_map2[:,3]  = self.starts+self.lens
 		return index_map2
 
+
 # This class represents cut ranges relative to the tod start, after
 # any offsets in the OffsetAxis in the axismanager have been applied.
 # So it's directly compatible with the signal array
@@ -181,6 +182,25 @@ class Sampcut:
 		for bi, bin in enumerate(self.bins):
 			bind[bin[0]:bin[1]] = bi
 		return bind
+	def invert(self):
+		"""Assumes sorted"""
+		obins, oranges = [], []
+		for di, (b1,b2) in enumerate(self.bins):
+			n  = b2-b1
+			o1 = len(oranges)
+			# Nothing cut → everything cut
+			if n == 0: oranges.append((0, self.nsamp))
+			else:
+				# Handle first
+				oranges.append((0, self.ranges[b1,0]))
+				# The middle part
+				for b in range(b1,b2-1):
+					oranges.append((self.ranges[b,1], self.ranges[b+1,0]))
+				# And the end
+				oranges.append((self.ranges[b2-1,1], self.nsamp))
+			o2 = len(oranges)
+			obins.append((o1,o2))
+		return Sampcut(bins=obins, ranges=oranges, nsamp=self.nsamp)
 	@staticmethod
 	def merge(cuts):
 		return merge_sampcuts(cuts)

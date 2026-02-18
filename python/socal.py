@@ -218,9 +218,9 @@ def dump_cmod_fit(fname, fit):
 def dump_cmod_tfit(fname, fit):
 	np.savetxt(fname, fit.ba, fmt="%8.5f")
 
-config.default("elmod_cal", "cal,clean", "Comma-separated list of what to do with the elevation modulation gain fit. If it contains 'cal', then it will be used to flatfield the tod. If it contains 'dump', then the fit will be dumped to individual files. If it contains neither of these, then no elmod fit will be performed. If the elvation is not actually modulated, then nothing will be done")
+config.default("elmod_cal", "clean", "Comma-separated list of what to do with the elevation modulation gain fit. If it contains 'cal', then it will be used to flatfield the tod. If it contains 'dump', then the fit will be dumped to individual files. If it contains neither of these, then no elmod fit will be performed. If the elvation is not actually modulated, then nothing will be done")
 config.default("elmod_minamp", 1, "elmod_cal is skipped if the elevation amplitude is less than this, in arcminutes")
-def elmod_cal(obs, nmode=2, bsize=2000, tol=0.1, prefix=None, minamp=None, dev=None):
+def elmod_cal(obs, nel=2, natm=2, bsize=1000, tol=0.1, prefix=None, minamp=None, dev=None):
 	"""Do elevation-modulation auto-calibration if elevation is actually modulated (determined by
 	minamp), and config:elmod_cal has turned this on. Otherwise does nothing"""
 	tasks = config.get("elmod_cal").split(",")
@@ -231,7 +231,7 @@ def elmod_cal(obs, nmode=2, bsize=2000, tol=0.1, prefix=None, minamp=None, dev=N
 	if elamp < minamp: return False
 	# Ok, do a fit
 	try:
-		fit = measure_el_response(obs, dev=dev)
+		fit = measure_el_response(obs, nel=nel, natm=natm, bsize=bsize, tol=tol, dev=dev)
 		if "clean" in tasks:
 			deproj_el_response(obs.tod, fit, dev=dev)
 		if "cal" in tasks:
@@ -241,14 +241,14 @@ def elmod_cal(obs, nmode=2, bsize=2000, tol=0.1, prefix=None, minamp=None, dev=N
 			dump_elmod_fit(prefix + "elcal.txt", fit)
 		if "tdump" in tasks:
 			dump_elmod_tfit(prefix + "telcal.txt", fit)
-	except ValueError:
+	except ValueError
 		return False
 	return "cal" in tasks
 
-def measure_el_response(obs, nmode=2, bsize=2000, tol=0.1, dev=None):
+def measure_el_response(obs, nel=2, natm=2, bsize=1000, tol=0.1, dev=None):
 	if dev is None: dev = device.get_device()
-	assert nmode >= 2, "elmod_cal needs nmode >= 2. The first two modes are an offset (discarded) and a slope (used for calibration)"
 	ndet, nsamp = obs.tod.shape
+	nmode= nel+natm
 	bel  = obs.boresight[0]
 	# Assume const roll. Have to think about how to handle non-const roll if necessary
 	roll = np.mean(obs.boresight[2,::100])
@@ -272,11 +272,14 @@ def measure_el_response(obs, nmode=2, bsize=2000, tol=0.1, dev=None):
 	# Build the blocks
 	nblock = nsamp//bsize
 	btod   = obs.tod[:,:nblock*bsize].reshape(ndet,nblock,bsize)
-	bΔbx   = Δbx[:nblock*bsize].reshape(nblock,bsize)
-	# Build basis
+	# Build basis. First el-part
 	B     = dev.np.zeros((nmode,nblock,bsize), btod.dtype)
-	B[:]  = bΔbx
-	for i in range(nmode): B[i] **= i
+	E     = dev.np.zeros((nel,nsamp), btod.dtype)
+	E[:]  = Δbx
+	for i in range(1,nel): E[i] **= i+1
+	B[:nel] = E[:,:nblock*bsize].reshape(nel,nblock,bsize)
+	# Then atm part
+	B[nel:] = gutils.legbasis(natm-1, bsize, ap=dev.np)[:,None,:]
 	# Fit in blocks
 	rhs   = dev.np.einsum("mbs,dbs->bdm", B, btod) # [nblock,ndet,nmode]
 	div   = dev.np.einsum("mbs,nbs->bmn", B, B)   # [nblock,nmode,nmode]
@@ -289,12 +292,16 @@ def measure_el_response(obs, nmode=2, bsize=2000, tol=0.1, dev=None):
 	rhs, div = rhs[good], div[good]
 	# Solve the remaining blocks
 	idiv  = dev.np.linalg.inv(div)
-	amps  = dev.np.einsum("bmn,bdn->bdm", idiv, rhs) # [nblock,ndet,nmode]
-	slope = dev.get(amps[:,:,1]) # µK [nblock,ndet]
+	bamps = dev.np.einsum("bmn,bdn->bdm", idiv, rhs) # [nblock,ndet,nmode]
+	# Discard nuisance part of the fit
+	bamps = dev.get(bamps[:,:,:nel])
+	B     = B[:nel]
+	# average over blocks
+	amps, damps, n = gutils.robust_mean(bamps, 0)
 	# slope = a*g'. Divide out g' to get a
-	ba    = slope/gprime/1e6 # K [nblock,ndet]
+	ba    = bamps[:,:,0]/gprime/1e6 # K [nblock,ndet]
 	# Use blocks to get robust mean and error
-	a, da, n = gutils.robust_mean(ba, 0)
+	a, da = amps[:,0], damps[:,0]
 	# Build flatfield
 	gain = np.full(ndet, 1, obs.tod.dtype)
 	# flatfield per band, since the atm response should be freq-dependent
@@ -303,16 +310,16 @@ def measure_el_response(obs, nmode=2, bsize=2000, tol=0.1, dev=None):
 		inds       = order[edges[bi]:edges[bi+1]]
 		band_a     = a[inds]
 		gain[inds] = np.median(band_a)/band_a
-	# sanity checks here?
-	return bunch.Bunch(a=a, da=da, n=n, gprime=gprime, gain=gain, ba=ba,
-		bands=obs.bands, detids=obs.detids, xieta=xieta, Δbx=Δbx)
+	return bunch.Bunch(a=a, da=da, n=n, amps=amps, damps=damps,
+		gprime=gprime, gain=gain, ba=ba, bands=obs.bands, detids=obs.detids, xieta=xieta, E=E)
 
 def deproj_el_response(tod, fit, dev=None):
 	if dev is None: dev = device.get_device()
 	ndet, nsamp = tod.shape
-	amp = dev.np.array(fit.a*fit.gprime)
-	# tod[d,i] += amp[d,1]*Δbx[1,s] => tod[i,d] += Δbx[s,1]*amp[1,d]
-	dev.lib.sgemm("N", "N", nsamp, ndet, 1, -1, fit.Δbx[None], nsamp, amp[:,None], 1, 1, tod, nsamp)
+	nel  = fit.amps.shape[1]
+	amps = dev.np.array(fit.amps) # ndet,nel
+	# tod[d,i] += amps[d,m]*B[m,s] => tod[i,d] += B[i,m]*amps[m,d]
+	dev.lib.sgemm("N", "N", nsamp, ndet, nel, -1, fit.E, nsamp, amps, nel, 1, tod, nsamp)
 
 def calc_det_el(bel, roll, xieta):
 	bel, roll, xi, eta = np.broadcast_arrays(bel, roll, *xieta.T[:2])

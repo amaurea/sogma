@@ -106,13 +106,14 @@ if comm_all.rank == 0:
 # support. For now, any field mentioned refers to SignalMap, except for "cut",
 # which enables cut output. "auto" sets up output of map and ivar for full maps,
 # and adds a time-map for short-duration maps.
-map_out, cut_out, info_out, elmod_out = [], [], True, []
+map_out, cut_out, info_out, elmod_out, ml_out = [], [], True, [], []
 for name in args.output.split(","):
 	if name == "auto":
 		map_out += ["map","ivar"]
 		if args.mode in ["depth1","individual"]: map_out += ["time"]
 	elif name == "cut":   cut_out += ["map"]
 	elif name == "elmod": elmod_out = ["map"]
+	elif name == "nmat":  ml_out  += ["nmat"]
 	else:                 map_out += [name]
 # Set up the signals we will solve for. I'm using SignalMapMulti almost all the time.
 # Should I make that the only case here? This would simplify things, at the cost of
@@ -144,7 +145,7 @@ elif args.nmat == "new2":   noise_model = nmat.NmatAdaptive2(dev=dev)
 elif args.nmat == "newtest":noise_model = nmat.NmatAdaptive(dev=dev, sampvar=0.1)
 else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 # Set up the mapmaker
-mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev)
+mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev, outputs=ml_out)
 
 if   args.mode == "full":
 	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)

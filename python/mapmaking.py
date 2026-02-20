@@ -29,6 +29,7 @@ class MLMapmaker:
 		self.datas    = [] # internal metadata for each obs, in same order
 		self.datamap  = {} # map from id to data. Useful in accum in multipass
 		self.dof      = MultiZipper()
+		self.x        = None # last solution from solve(). Useful in multipass
 		self.ready    = False
 		for signal in self.signals:
 			signal.reset()
@@ -51,11 +52,11 @@ class MLMapmaker:
 		# to think about buffers used by the signals. SignalMap uses ibuf and obuf, but
 		# these don't get overwritten before the prepare() step
 		if signal_guess:
-			evaluator = signal_guess.evaluator()
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
-			evaluator.forward(model, id)
+			signal_guess.forward(model, id)
 			gtod -= model
 		if deslope:
+			# Deslope must happen here, since it's the noise that must be periodic, not the signal
 			gutils.deslope(gtod, w=5, inplace=True)
 		t3 = self.dev.time()
 		# Allow the user to override the noise model on a per-obs level
@@ -73,9 +74,8 @@ class MLMapmaker:
 		# Undo subtraction
 		if signal_guess:
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
-			evaluator.forward(model, id)
+			signal_guess.forward(model, id)
 			gtod += model
-			del evaluator
 		t4 = self.dev.time()
 		# And apply it to the tod
 		gtod = iN.apply(gtod)
@@ -102,12 +102,12 @@ class MLMapmaker:
 		L.print("Prep sys %6.3f" % (t2-t1), level=2)
 		self.ready = True
 	def accumulator(self): return Accumulator(self.signals, datas=self.datamap)
-	def evalulator(self, x=None):
+	def evaluator(self, x=None):
 		if x is None: x = self.x
 		return Evaluator(self.signals, self.dof.unzip(x), datas=self.datamap)
 	def A(self, x):
 		t1 = self.dev.time()
-		evaluator   = self.evaluator()
+		evaluator   = self.evaluator(x)
 		accumulator = self.accumulator()
 		t2 = self.dev.time()
 		for di, data in enumerate(self.datas):
@@ -146,6 +146,7 @@ class MLMapmaker:
 			x  = self.dof.unzip(solver.x)
 			t2 = time.time()
 			yield bunch.Bunch(i=solver.i, err=solver.err, x=x, t=t2-t1)
+		self.x = solver.x
 	def set_outputs(self, outputs):
 		self.outputs= check_outputs(outputs, self.valid_outputs, self.__class__.__name__)
 	def write(self, prefix, x, tag=None, suffix="", force=False):
@@ -165,9 +166,18 @@ class MLMapmaker:
 					hfile["detids"] = np.char.encode(data.detids)
 	valid_outputs = ["nmat"]
 
+# TODO: Should decide on consistent termiology for the solved degrees of freedom.
+# Right now I have:
+# * solver.x and mapmaker.x: plain 1d numpy array
+# * solution.x and Evaluator.vals: unzipped version of x
+# Tempted to just let x always be the 1d thing, and to not auto-unzip in solution
+# since that has some overhead, instead officially requiring mapmaker.unzip for that.
+# If so, should evaluator also use a flat array? If so, it will need access to dof
+
 class Evaluator:
 	def __init__(self, signals, vals, datas=None):
 		self.signals = signals
+		self.vals    = vals
 		self.work    = [signal.to_work(val) for signal,val in zip(signals, vals)]
 		self.datas   = datas
 	def forward(self, tod, data, setup=True, free=False):
@@ -175,19 +185,18 @@ class Evaluator:
 		for si, signal in reversed(list(enumerate(self.signals))):
 			if setup: signal.precalc_setup(data.id)
 			signal.forward(data.id, tod, self.work[si])
-			if free: signal.precalc_free()
+			if free: signal.precalc_free(data.id)
 
 class Accumulator:
 	def __init__(self, signals, datas=None):
 		self.signals = signals
 		self.work    = [signal.owork() for signal in signals]
-		self.idmap   = idmap
 	def backward(self, tod, data, setup=False, free=True):
 		if isinstance(data, str): data = self.datas[data]
 		for si, signal in enumerate(self.signals):
 			if setup: signal.precalc_setup(data.id)
 			signal.backward(data.id, tod, self.work[si])
-			if free: signal.precalc_free()
+			if free: signal.precalc_free(data.id)
 
 class Signal:
 	"""This class represents a thing we want to solve for, e.g. the sky, ground, cut samples, etc."""
@@ -228,7 +237,7 @@ class Signal:
 	def write_misc(self, prefix): pass
 	valid_outputs = []
 
-config.default("xdown", 10, help="Temporal and spatial downgrade-factor for crosslink map")
+config.default("xdown", 10, "Temporal and spatial downgrade-factor for crosslink map")
 class SignalMap(Signal):
 	"""Signal describing a sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
@@ -279,7 +288,7 @@ class SignalMap(Signal):
 			if hasattr(self, name):
 				delattr(self, name)
 	def new(self): return SignalMap(self.shape, self.wcs, self.comm,
-			dev=self.dev, name=self.name, ofmt=self.ofmt, outputs=self.outpus,
+			dev=self.dev, name=self.name, ofmt=self.ofmt, outputs=self.outputs,
 			precon=self.precon, ext=self.ext, dtype=self.dtype, ibuf=self.ibuf,
 			obuf=self.obuf, sys=self.sys, interpol=self.interpol, autocrop=self.autocrop,
 			ocomps=ocomps)
@@ -538,9 +547,9 @@ class SignalMapMulti(Signal):
 	def new(self):
 		ref = self.mapsigs[0]
 		return SignalMapMulti(ref.shape, ref.wcs, self.bands, ref.comm, dev=ref.dev,
-			name=self.name, ofmt=self.ofmt, outputs=self.outputs, ext=self.ext, dtype=ref.dtype,
-			ibuf=ref.ibuf, obuf=ref.obuf, sys=ref.sys, interpol=ref.interol, precon=ref.precon,
-			autocorp=ref.autocrop)
+			name=self.name, ofmt=self.ofmt, outputs=ref.outputs, ext=self.ext, dtype=ref.dtype,
+			ibuf=ref.ibuf, obuf=ref.obuf, sys=ref.sys, interpol=ref.interpol, precon=ref.prec_mode,
+			autocrop=ref.autocrop)
 	def add_obs(self, id, obs, iN, iNd):
 		# Find the det-ranges for each of our bands in obs
 		band_info = []
@@ -654,7 +663,7 @@ class SignalCutFull(Signal):
 		self.data  = {}
 	def new(self):
 		return SignalCutFull(self.comm, dev=self.dev, name=self.name, ofmt=self.ofmt,
-			dtype=self.dtype, outputs=self.outpus)
+			dtype=self.dtype, outputs=self.outputs)
 	def add_obs(self, id, obs, iN, iNd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
 		iN a noise model, representing the inverse noise covariance matrix,
@@ -741,12 +750,12 @@ class SignalCutPoly(SignalCutFull):
 		self.basis  = gutils.legbasis(order, bsize)
 		self.prec   = precon
 		if precon != "none":
-			raise NotImplementedError("SignalCutPoly precons other than 'none' currently don't work")
+			raise NotImplementedError("SignalCutPoly precons other than 'none' currently don't work, but got '%s'" % str(precon))
 		if precon == "leginv":
 			self.ibases = gutils.leginverses(self.basis)
 	def new(self):
 		return SignalCutPoly(self.comm, dev=self.dev, order=self.order, bsize=self.bsize,
-			precon=self.precon, name=self.name, ofmt=self.ofmt, dtype=self.dtype, outputs=self.outpus)
+			precon=self.prec, name=self.name, ofmt=self.ofmt, dtype=self.dtype, outputs=self.outputs)
 	def add_obs(self, id, obs, iN, iNd):
 		"""Add and process an observation. "obs" should be an Observation axis manager,
 		iN a noise model, representing the inverse noise covariance matrix,
@@ -1098,7 +1107,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		t4    = time.time()
 		L.print("Processed %d %s in %6.3f. Read %6.3f Autocal %6.3f Add %6.3f" % (ind, name, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
 
-	nobs = comm.allreduce(len(mapmaker.data))
+	nobs = comm.allreduce(len(mapmaker.datas))
 	if nobs == 0:
 		L.print("No tods survived!", id=0, level=0, color=colors.red)
 		# Mark as done by making an .empty-file. This is used by cont
@@ -1113,7 +1122,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 
 	# Solve the equation system
 	step = None
-	x0   = signal_guess.x0 if signal_guess else None
+	x0   = mapmaker.dof.zip(signal_guess.vals) if signal_guess else None
 	for step in mapmaker.solve(maxiter=maxiter, maxerr=maxerr, x0=x0):
 		# Dump if we're in dump-list, or a multiple of the last entry, but not if
 		# we're on the final iteration anyway, since that would be redundant with
@@ -1163,14 +1172,15 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 	# being the same between passes.
 	if inds is None: inds = distribute_tasks(obsinfo, joint, comm)
 	# Ok, onto the actual mapmaking passes
-	prev_mapmaker = None
+	prev_evaluator = None
 	for ipass in range(npass):
 		pass_prefix = make_prefix(prefix, ipass)
 		mapmaker    = make_map_core(mapmaker.new(), loader, obsinfo, comm, joint=joint, inds=inds, prefix=pass_prefix,
-			dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=precalloc, ignore=ignore, cont=False,
-			dets=dets, detids=detids, signal_guess=prev_mapmaker)
+			dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=prealloc, ignore=ignore, cont=False,
+			dets=dets, detids=detids, signal_guess=prev_evaluator)
 		if not mapmaker: return None
-		prev_mapmaker = mapmaker
+		if ipass < npass-1:
+			prev_evaluator = mapmaker.evaluator()
 	return mapmaker
 
 def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], npass=1, maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):

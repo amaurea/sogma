@@ -381,7 +381,7 @@ class SignalMap(Signal):
 		self.obuf.reset()
 		fshape, fwcs = enmap.downgrade_geometry(self.fshape, self.fwcs, down)
 		pixbox = self.pixbox
-		if pixbox != "auto": pixbox = utils.floor(pixbox/down)
+		if not utils.streq(pixbox,"auto"): pixbox = utils.floor(pixbox/down)
 		# Dyamic map, since we don't have the LocalPixelization for this downgraded case
 		dxlink = self.dev.lib.DynamicMap(*fshape, self.dtype)
 		for i, id in enumerate(self.ids):
@@ -393,11 +393,11 @@ class SignalMap(Signal):
 			tod = self.dev.pools["tod"].full((ndet,nsamp), 1, d.tod_dtype)
 			d.iN.white(tod)
 			d.pcut.clear(tod)
-			d.pmap.backward(tod, dxlink)
+			pmap.backward(tod, dxlink)
 			t2  = time.time()
-			L.print("Init map %s %d %6.3f %s" % ("xlink", weight, t2-t1,id), level=2)
+			L.print("Init map %s %6.3f %s" % ("xlink", t2-t1, id), level=2)
 		# Finish the dynamic map
-		glxlink   = self.dxlink.finalize(); del self.dxlink
+		glxlink   = dxlink.finalize(); del dxlink
 		xtiledist = tiling.TileDistribution(fshape, fwcs,
 				glxlink.pixelization, self.comm, pixbox=pixbox, dev=self.dev)
 		return glxlink, xtiledist

@@ -57,7 +57,7 @@ ocomps     = utils.parse_ints(args.ocomps)
 dev = device.get_device(args.device)
 # Set up our logging
 verbosity  = args.verbose-args.quiet
-L = logging.Logger(dev, id=comm_all.rank, level=verbosity, fmt="{id:3d} {t:9.4f} {mem:7.4f} {dmem_pools:7.4f} {dmem_rest:7.4f} {dmem_unknown:7.4f} {msg:s}").setdefault()
+L = logging.Logger(dev, id=comm_all.rank, level=verbosity, fmt="{id:3d} {t:8.3f} {mem:5.2f} {dmem_pools:5.2f} {dmem_rest:5.2f} {dmem_unknown:5.2f} {msg:s}").setdefault()
 bench.set_verbose(verbosity >= 3)
 L.print("Init", level=0, id=0, color=colors.lgreen)
 # Benchmarking

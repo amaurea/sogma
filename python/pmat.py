@@ -74,10 +74,13 @@ class PmatMap:
 			return self.dev.lib.PointingPlan(self.preplan, pointing)
 	def variant(self, step=1, down=1, Δpolang=0):
 		res = copy.copy(self)
-		res.pfit = res.pfit.variant(step=step, down=down, Δpolang=Δpolang)
+		res.pfit    = res.pfit.variant(step=step, down=down, Δpolang=Δpolang)
+		res.preplan = res.dev.lib.PointingPrePlan(res.pfit.eval(), res.pfit.shape[-2], res.pfit.shape[-1], periodic_xcoord=True)
+		res.plan    = None
+		res.pointing = None
 		# We don't need the others, but oh well
-		res.ctime = res.ctime[::step]
-		res.bore  = res.bore[:,::step]
+		res.ctime = gutils.decimate_tod(res.ctime, step, contiguous=False)
+		res.bore  = gutils.decimate_tod(res.bore,  step, contiguous=False)
 		res.polang= res.polang+Δpolang
 		return res
 
@@ -415,7 +418,7 @@ class PointingFit:
 		pixs[:2]  = (pos_equ[:2]-self.p0[:,None,None])/self.dp[:,None,None]
 		pixs[2]   = utils.unwind(pos_equ[2])
 		return pixs # [{y,x,psi},ndet,nsamp], on cpu
-	def variant(self, step=1, down=1, Δpolang=0):
+	def variant(self, step=1, down=1, Δpolang=0, mul=32):
 		"""Return a new PointingFit representing the same pointing as this one,
 		but decimated by a factor `step` in time and a factor `down` in space,
 		and with the polarization angles increased by `Δpolang`. The new PointingFit's
@@ -424,8 +427,8 @@ class PointingFit:
 		# Downsampling
 		if step != 1:
 			# Subsamp isn't used after the initialization, so we don't need to update it
-			if res.store_basis: res.B = res.dev.np.ascontiguousarray(res.B[:,::step])
-			else: res.ref_pixs = res.dev.np.ascontiguousarray(res.ref_pixs[:,::step])
+			if res.store_basis: res.B = gutils.decimate_tod(res.B, step, mul=mul)
+			else: res.ref_pixs = gutils.decimate_tod(res.ref_pixs, step, mul=mul)
 		# Downgrading. Support separate y and x factors. Compatible with enmap downgrade,
 		# so requries integer factors
 		res.coeffs = res.coeffs.copy()
@@ -436,9 +439,9 @@ class PointingFit:
 			res.nphi   = utils.nint(360/np.abs(res.wcs.wcs.cdelt[0]))
 			res.dp     = res.wcs.wcs.cdelt[::-1]*utils.degree # [{dec,ra}]
 			# Ok, the main one. Scale the y,x polynomial coefficients
-			res.coeffs[:2] /= down[:,None,None]
+			res.coeffs[:2] /= self.dev.np.array(down[:,None,None])
 		# Polangle offset
-		res.coeffs[2,:,0] += Δpolang
+		res.coeffs[2,:,0] += self.dev.np.array(Δpolang)
 		return res
 
 def normalize(x):

@@ -26,7 +26,8 @@ class MLMapmaker:
 	def reset(self):
 		"""Reset the mapmaker, as if it had just been constructed. Also
 		resets its signals, so it's ready to make new maps."""
-		self.data     = []
+		self.datas    = [] # internal metadata for each obs, in same order
+		self.datamap  = {} # map from id to data. Useful in accum in multipass
 		self.dof      = MultiZipper()
 		self.ready    = False
 		for signal in self.signals:
@@ -35,18 +36,28 @@ class MLMapmaker:
 		signals = [signal.new() for signal in self.signals]
 		return MLMapmaker(signals=signals, dev=self.dev, noise_model=self.noise_model,
 			outputs=self.outputs, dtype=self.dtype, verbose=self.verbose)
-	def add_obs(self, id, obs, deslope=True, noise_model=None):
+	def add_obs(self, id, obs, deslope=True, noise_model=None, signal_guess=None):
 		# Prepare our tod
 		t1 = self.dev.time()
 		ctime  = obs.ctime
 		srate  = (len(ctime)-1)/(ctime[-1]-ctime[0])
 		tod    = obs.tod.astype(self.dtype, copy=False)
 		t2 = self.dev.time()
-		if deslope:
-			utils.deslope(tod, w=5, inplace=True)
-		t3 = self.dev.time()
 		gtod = self.dev.pools["tod"].array(tod)
 		del tod
+		# If we have a signal guess, then temporarily subtract that when gapfilling
+		# and building the noise model. Safe to use the ft buffer here, though we'll have
+		# to rebuild it just after, since the noise model overwrites it. We also have
+		# to think about buffers used by the signals. SignalMap uses ibuf and obuf, but
+		# these don't get overwritten before the prepare() step
+		if signal_guess:
+			evaluator = signal_guess.evaluator()
+			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
+			evaluator.forward(model, id)
+			gtod -= model
+		if deslope:
+			gutils.deslope(gtod, w=5, inplace=True)
+		t3 = self.dev.time()
 		# Allow the user to override the noise model on a per-obs level
 		if noise_model is None: noise_model = self.noise_model
 		# Build the noise model from the obs unless a fully
@@ -59,6 +70,12 @@ class MLMapmaker:
 			except Exception as e:
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise gutils.RecoverableError(msg)
+		# Undo subtraction
+		if signal_guess:
+			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
+			evaluator.forward(model, id)
+			gtod += model
+			del evaluator
 		t4 = self.dev.time()
 		# And apply it to the tod
 		gtod = iN.apply(gtod)
@@ -72,8 +89,9 @@ class MLMapmaker:
 		t6 = self.dev.time()
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
-		self.data.append(bunch.Bunch(id=id, ndet=len(obs.dets), nsamp=len(ctime),
+		self.datas.append(bunch.Bunch(id=id, ndet=len(obs.dets), nsamp=len(ctime),
 			dets=obs.dets, detids=obs.detids, iN=iN))
+		self.datamap[id] = self.datas[-1]
 	def prepare(self):
 		if self.ready: return
 		t1 = self.dev.time()
@@ -83,30 +101,30 @@ class MLMapmaker:
 		t2 = self.dev.time()
 		L.print("Prep sys %6.3f" % (t2-t1), level=2)
 		self.ready = True
+	def accumulator(self): return Accumulator(self.signals, datas=self.datamap)
+	def evalulator(self, x=None):
+		if x is None: x = self.x
+		return Evaluator(self.signals, self.dof.unzip(x), datas=self.datamap)
 	def A(self, x):
 		t1 = self.dev.time()
-		iwork = [signal.to_work(m) for signal,m in zip(self.signals,self.dof.unzip(x))]
-		owork = [signal.owork()    for signal in self.signals]
+		evaluator   = self.evaluator()
+		accumulator = self.accumulator()
 		t2 = self.dev.time()
-		for di, data in enumerate(self.data):
+		for di, data in enumerate(self.datas):
 			ta1  = self.dev.time()
 			gtod = self.dev.pools["tod"].empty([data.ndet, data.nsamp], self.dtype)
 			ta2  = self.dev.time()
-			for si, signal in reversed(list(enumerate(self.signals))):
-				signal.precalc_setup(data.id)
-				signal.forward(data.id, gtod, iwork[si])
+			evaluator.forward(gtod, data)
 			ta3 = self.dev.time()
 			data.iN.apply(gtod)
 			ta4 = self.dev.time()
-			for si, signal in enumerate(self.signals):
-				signal.backward(data.id, gtod, owork[si])
-				signal.precalc_free(data.id)
+			accumulator.backward(gtod, data)
 			ta5 = self.dev.time()
 			self.dev.garbage_collect()
 			ta6 = self.dev.time()
 			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f gc %6.4f %s %4d %6d" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, ta6-ta5, data.id, *gtod.shape), level=2)
 		t3 = self.dev.time()
-		result = self.dof.zip([signal.from_work(w) for signal,w in zip(self.signals,owork)])
+		result = self.dof.zip([signal.from_work(w) for signal,w in zip(self.signals,accumulator.work)])
 		t4 = self.dev.time()
 		L.print("A prep %6.3f PNP %6.3f finish %6.3f" % (t2-t1, t3-t2, t4-t3), level=2)
 		return result
@@ -117,10 +135,10 @@ class MLMapmaker:
 		t2 = self.dev.time()
 		L.print("M %6.3f" % (t2-t1), level=2)
 		return result
-	def solve(self, maxiter=500, maxerr=1e-6):
+	def solve(self, maxiter=500, maxerr=1e-6, x0=None):
 		self.prepare()
 		rhs    = self.dof.zip([signal.rhs for signal in self.signals])
-		solver = utils.CG(self.A, rhs, M=self.M, dot=self.dof.dot)
+		solver = utils.CG(self.A, rhs, M=self.M, dot=self.dof.dot, x0=x0)
 		#solver = utils.Minres(self.A, rhs, dot=self.dof.dot)
 		while solver.i < maxiter and solver.err > maxerr:
 			t1 = time.time()
@@ -139,13 +157,37 @@ class MLMapmaker:
 			signal.write_misc(prefix)
 		# Then output our own stuff
 		if "nmat" in self.outputs:
-			for di, data in enumerate(self.data):
+			for di, data in enumerate(self.datas):
 				fname = "%s%s_%s.hdf" % (prefix, "nmat", data.id.replace(":","_"))
 				data.iN.write(fname)
 				# Hack, add in detector ids
 				with h5py.File(fname, "r+") as hfile:
 					hfile["detids"] = np.char.encode(data.detids)
 	valid_outputs = ["nmat"]
+
+class Evaluator:
+	def __init__(self, signals, vals, datas=None):
+		self.signals = signals
+		self.work    = [signal.to_work(val) for signal,val in zip(signals, vals)]
+		self.datas   = datas
+	def forward(self, tod, data, setup=True, free=False):
+		if isinstance(data, str): data = self.datas[data]
+		for si, signal in reversed(list(enumerate(self.signals))):
+			if setup: signal.precalc_setup(data.id)
+			signal.forward(data.id, tod, self.work[si])
+			if free: signal.precalc_free()
+
+class Accumulator:
+	def __init__(self, signals, datas=None):
+		self.signals = signals
+		self.work    = [signal.owork() for signal in signals]
+		self.idmap   = idmap
+	def backward(self, tod, data, setup=False, free=True):
+		if isinstance(data, str): data = self.datas[data]
+		for si, signal in enumerate(self.signals):
+			if setup: signal.precalc_setup(data.id)
+			signal.backward(data.id, tod, self.work[si])
+			if free: signal.precalc_free()
 
 class Signal:
 	"""This class represents a thing we want to solve for, e.g. the sky, ground, cut samples, etc."""
@@ -186,11 +228,12 @@ class Signal:
 	def write_misc(self, prefix): pass
 	valid_outputs = []
 
+config.default("xdown", 10, help="Temporal and spatial downgrade-factor for crosslink map")
 class SignalMap(Signal):
 	"""Signal describing a sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
 			outputs=["map","ivar"], precon="ivar", ext="fits", dtype=np.float32, ibuf=None, obuf=None,
-			sys=None, interpol=None, autocrop=False, ocomps=None):
+			sys=None, interpol=None, autocrop=False, ocomps=None, xdown=None):
 		"""Signal describing a sky map in the coordinate system given by "sys", which defaults
 		to equatorial coordinates."""
 		Signal.__init__(self, name, ofmt, outputs, ext)
@@ -214,6 +257,8 @@ class SignalMap(Signal):
 		self.shape,  self.wcs = shape, wcs
 		self.fshape, self.fwcs, self.pixbox = tiling.infer_fullsky_geometry(shape, wcs)
 		if autocrop: self.pixbox = "auto"
+		# Temporal and spatial downgrade factor for optional xlink map
+		self.xdown = int(config.get("xdown", xdown))
 		# Buffers to use
 		self.ibuf = self.dev.pools[name+"_iwork"]
 		self.obuf = self.dev.pools[name+"_owork"]
@@ -320,6 +365,33 @@ class SignalMap(Signal):
 				L.print("Init map %s [%d,:] %d %6.3f %s" % (name, ci, weight, t2-t1,id), level=2)
 			gldiv.append(omap)
 		return gldiv
+	def calc_xlink(self, step=1, down=1):
+		"""Calculate the crosslinking, optionally downgraded by a factor down and
+		downsampled in time by a factor step to speed up calculation and reduce disk
+		requirements."""
+		self.obuf.reset()
+		fshape, fwcs = enmap.downgrade_geometry(self.fshape, self.fwcs, down)
+		pixbox = self.pixbox
+		if pixbox != "auto": pixbox = utils.floor(pixbox/down)
+		# Dyamic map, since we don't have the LocalPixelization for this downgraded case
+		dxlink = self.dev.lib.DynamicMap(*fshape, self.dtype)
+		for i, id in enumerate(self.ids):
+			d    = self.data[id]
+			# Downsampled, downgraded pmap with all detectors having polang = 0
+			pmap = d.pmap.variant(step=step, down=down, Δpolang=-d.pmap.polang)
+			ndet, nsamp = len(pmap.polang), len(pmap.ctime)
+			t1  = time.time()
+			tod = self.dev.pools["tod"].full((ndet,nsamp), 1, d.tod_dtype)
+			d.iN.white(tod)
+			d.pcut.clear(tod)
+			d.pmap.backward(tod, dxlink)
+			t2  = time.time()
+			L.print("Init map %s %d %6.3f %s" % ("xlink", weight, t2-t1,id), level=2)
+		# Finish the dynamic map
+		glxlink   = self.dxlink.finalize(); del self.dxlink
+		xtiledist = tiling.TileDistribution(fshape, fwcs,
+				glxlink.pixelization, self.comm, pixbox=pixbox, dev=self.dev)
+		return glxlink, xtiledist
 	def prepare(self):
 		"""Called when we're done adding everything. Sets up the map distribution,
 		degrees of freedom and preconditioner."""
@@ -338,11 +410,15 @@ class SignalMap(Signal):
 		with mybench.mark("misc"):
 			if "hits" in self.outputs:
 				glhits = self.calc_hits(weight=False)
-				self.dev.garbage_collect()
+			if "xlink" in self.outputs:
+				glxlink, self.xtiledist = self.calc_xlink(step=self.xdown, down=self.xdown)
+			self.dev.garbage_collect()
 		with mybench.mark("red"):
 			if "hits" in self.outputs:
 				self.hits  = self.tiledist.gwmap2dmap(glhits); del glhits
 				self.hits  = self.hits[:,0]
+			if "xlink" in self.outputs:
+				self.xlink = self.xtiledist.gwmap2dmap(glxlink); del glxlink
 		# Build ivar or div. This is a bit messy
 		with mybench.mark("iprec"):
 			if self.prec_mode in ["ivar","flat"]:
@@ -410,12 +486,13 @@ class SignalMap(Signal):
 			oname = "%s%s_%s.%s" % (prefix, oname, tag, self.ext)
 			done  = done and os.path.exists(oname)
 		return done
-	def write(self, prefix, m, tag=None, suffix="", force=False, extra={}, oslice=None):
+	def write(self, prefix, m, tag=None, suffix="", force=False, extra={}, oslice=None, tiledist=None):
 		if tag is None: tag = "map"
 		if not force and tag not in self.outputs: return
+		if tiledist is None: tiledist = self.tiledist
 		oname = self.ofmt.format(name=self.name)
 		oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
-		omap  = self.tiledist.dmap2omap(m)
+		omap  = tiledist.dmap2omap(m)
 		if self.comm.rank == 0:
 			if oslice is None: oslice = np.ix_(*(self.ocomps,)*(omap.ndim-2))
 			enmap.write_map(oname, omap[oslice], extra=extra)
@@ -429,10 +506,11 @@ class SignalMap(Signal):
 			if self.prec_mode == "div": self.write(prefix, self.iprec,  tag="div")
 			else: warnings.warn("Cannot output div: Not calculated with precon '%s'" % str(self.prec_mode))
 		if "hits" in self.outputs: self.write(prefix, self.hits, tag="hits")
+		if "xlink"in self.outputs: self.write(prefix, self.xlink, tag="xlink", tiledist=self.xtiledist)
 		if "bin"  in self.outputs: self.write(prefix, self.precon(self.rhs), tag="bin")
 		if "time" in self.outputs:
 			self.write(prefix, self.tmap, tag="time", extra={"TREF":self.tref})
-	valid_outputs = ["map","ivar","hits","bin","rhs","div","time"]
+	valid_outputs = ["map","ivar","hits","bin","rhs","div","time","xlink"]
 
 # What do we need for multi-band mapmaking?
 # Just loop over SignalMaps, but override their TileDistribution
@@ -950,43 +1028,19 @@ class SignalInfo(Signal):
 
 	valid_outputs = ["info"]
 
-# Multipass mapmaking
-# 1. In mapmaker.add_obs, evaluate model into extra tod. Subtract before
-#    gapfilling and building noise model. Then add back in
-# 2. In mapmaker.solve, use previous x as x0
-# To do this, we need a way to evaluate old model in the context of
-# a new mapmaker. Easiest if I can create a new empty mapmaker based
-# on the old one.
-
 # Mapmaking function
-config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
-def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
-	mapmaker.new()
+def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, signal_guess=None):
 	if prefix is None: prefix = ""
 	# Skip if we're already done
 	if cont and (os.path.exists(prefix + ".empty") or all([signal.written(prefix) for signal in mapmaker.signals])):
 		L.print("Skipped %s: Already done" % prefix, level=2, color=colors.gray)
-		return
+		return None
 	# Groups is a list of obsinfo entries that should be mapped jointly
 	# (as a big super-tod with full noise correlations)
 	if joint is None: joint = trivial_joint(obsinfo)
 	# Inds is a list of indices into joint groups, giving which groups this mpi task
 	# should care about
-	if inds is None:
-		# Use the first entry in groups as representative
-		gfirst = np.array([g[0] for g in joint.groups])
-		# FIXME: This doesn't know about the coordinate system we're using!
-		# It assumes equatorial coordinates.
-		taskdist = config.get("taskdist")
-		if taskdist == "simple":
-			dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
-		elif taskdist == "ra":
-			dist = tiling.distribute_tods_ra(obsinfo[gfirst], comm.size)
-		elif taskdist == "semibrute":
-			dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
-		else:
-			raise ValueError("Unrecognized task distribution method '%s'" % str(taskdist))
-		inds = np.where(dist.owner == comm.rank)[0]
+	if inds is None: inds = distribute_tasks(obsinfo, joint, comm)
 	# Set up exception types we will ignore
 	if   ignore == "all":     etypes, load_catch = (Exception,), "all"
 	elif ignore == "missing": etypes, load_catch = (utils.DataMissing,), "expected"
@@ -1035,7 +1089,7 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
 		t3    = time.time()
 		try:
-			mapmaker.add_obs(name, data, deslope=False)
+			mapmaker.add_obs(name, data, deslope=False, signal_guess=signal_guess)
 		except etypes as e:
 			L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
 			continue
@@ -1059,7 +1113,8 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 
 	# Solve the equation system
 	step = None
-	for step in mapmaker.solve(maxiter=maxiter, maxerr=maxerr):
+	x0   = signal_guess.x0 if signal_guess else None
+	for step in mapmaker.solve(maxiter=maxiter, maxerr=maxerr, x0=x0):
 		# Dump if we're in dump-list, or a multiple of the last entry, but not if
 		# we're on the final iteration anyway, since that would be redundant with
 		# the final result
@@ -1072,7 +1127,53 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 	if step is not None:
 		mapmaker.write(prefix, step.x)
 
-def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
+	return mapmaker
+
+# Multipass mapmaking
+# 1. In mapmaker.add_obs, evaluate model into extra tod. Subtract before
+#    gapfilling and building noise model. Then add back in
+# 2. In mapmaker.solve, use previous x as x0
+# To do this, we need a way to evaluate old model in the context of
+# a new mapmaker. Easiest if I can create a new empty mapmaker based
+# on the old one.
+# Mapmaking function
+def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], npass=1, maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
+	"""Like make_map_core, but performs multipass mapmaking. Each pass produces its own set of files.
+	If npass > 1, then the the 1-based pass number appended to the prefix, e.g. pass1, pass2, etc.
+	This function has no overhead compared to make_map when only one pass is used. On subsequent
+	passes, there is a small memory and run-time overhead in needing store and subtract the
+	previous solution.
+	"""
+	if prefix is None: prefix = ""
+	# Skip if we're already done
+	def make_prefix(prefix, ipass):
+		if npass == 1: return prefix
+		else: return "%spass%d_" % (prefix, ipass+1)
+	if cont:
+		first_prefix = make_prefix(prefix,0)
+		final_prefix = make_prefix(prefix,npass-1)
+		cant_run     = os.path.exists(first_prefix + ".empty")
+		done         = all([signal.written(final_prefix) for signal in mapmaker.signals])
+		if cant_run or done:
+			L.print("Skipped %s: Already done" % prefix, level=2, color=colors.gray)
+			return
+	if joint is None: joint = trivial_joint(obsinfo)
+	# Set up task distribution here. Not really necessary, since make_map would do
+	# so anyway, but doing it here makes it more explicit that we rely on the distribution
+	# being the same between passes.
+	if inds is None: inds = distribute_tasks(obsinfo, joint, comm)
+	# Ok, onto the actual mapmaking passes
+	prev_mapmaker = None
+	for ipass in range(npass):
+		pass_prefix = make_prefix(prefix, ipass)
+		mapmaker    = make_map_core(mapmaker.new(), loader, obsinfo, comm, joint=joint, inds=inds, prefix=pass_prefix,
+			dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=precalloc, ignore=ignore, cont=False,
+			dets=dets, detids=detids, signal_guess=prev_mapmaker)
+		if not mapmaker: return None
+		prev_mapmaker = mapmaker
+	return mapmaker
+
+def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], npass=1, maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work."""
 	if joint is None:
@@ -1090,10 +1191,10 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds
 		name    = joint.names[ind]
 		subpre  = prefix + name.replace(":","_") + "_"
 		L.print("Mapping %s" % name)
-		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids)
+		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids)
 
 config.default("depth1_maxdur", 24, "Max duration in hours for depth-1 maps. Lower values use less memory to store maps. Longer than 24 hours would no longer be depth-1")
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], maxiter=500, maxdur=None, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
+def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], npass=1, maxiter=500, maxdur=None, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False, dets=None, detids=None):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
@@ -1136,7 +1237,7 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, pref
 		name    = "%10.0f" % periods[pid][0]
 		subpre  = prefix + name + "_"
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(my_inds)))
-		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids)
+		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids)
 
 # Mapmaking function
 def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
@@ -1305,6 +1406,24 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		del data
 		t3    = time.time()
 		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (name, t3-t1, t2-t1, t3-t2), level=2)
+
+config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
+def distribute_tasks(obsinfo, joint, comm, taskdist=None):
+	# Use the first entry in groups as representative
+	gfirst = np.array([g[0] for g in joint.groups])
+	# FIXME: This doesn't know about the coordinate system we're using!
+	# It assumes equatorial coordinates.
+	taskdist = config.get("taskdist", taskdist)
+	if taskdist == "simple":
+		dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
+	elif taskdist == "ra":
+		dist = tiling.distribute_tods_ra(obsinfo[gfirst], comm.size)
+	elif taskdist == "semibrute":
+		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size)
+	else:
+		raise ValueError("Unrecognized task distribution method '%s'" % str(taskdist))
+	inds = np.where(dist.owner == comm.rank)[0]
+	return inds
 
 def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case

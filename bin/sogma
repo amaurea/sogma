@@ -20,6 +20,7 @@ parser.add_argument("-I", "--maxiter", type=int, default=500)
 parser.add_argument(      "--maxerr",  type=float, default=1e-7)
 parser.add_argument("-m", "--mode",    type=str, default="full", help="full, depth1, individual or dump")
 parser.add_argument("-a", "--autocrop",   action="store_true")
+parser.add_argument("-n", "--npass",   type=int, default=1, help="Number of mapmaking passes. Output of previous pass is used for gapfilling and noise model estimation, and serves as the starting point for CG iteration")
 parser.add_argument("-N", "--nmat",    type=str, default="new")
 parser.add_argument(      "--ignore",  type=str, default="recover")
 parser.add_argument("-d", "--dump",    type=str, default="10,20,50,100")
@@ -148,11 +149,11 @@ else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev, outputs=ml_out)
 
 if   args.mode == "full":
-	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
+	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, joint=joint, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "individual":
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "depth1":
-	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
+	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "dump":
 	mapmaking.dump_tod(loader, obsinfo, noise_model, comm_all, dev=dev, joint=joint, prefix=prefix, ignore=args.ignore, dets=dets, detids=detids)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

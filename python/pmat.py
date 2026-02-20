@@ -1,4 +1,4 @@
-import numpy as np
+import numpy as np, copy
 import quaternion
 import so3g
 from pixell import utils, enmap, coordsys, bench
@@ -25,6 +25,7 @@ class PmatMap:
 		* polang[ndet]
 		* response[{T,P},ndet] or None
 		"""
+		# Why do I store all these?
 		self.ctime = ctime
 		self.bore  = bore
 		self.offs  = offs
@@ -71,6 +72,14 @@ class PmatMap:
 	def _make_plan(self, pointing, reset_buffer=True):
 		with self.dev.pools["plan"].as_allocator(reset=reset_buffer):
 			return self.dev.lib.PointingPlan(self.preplan, pointing)
+	def variant(self, step=1, down=1, Δpolang=0):
+		res = copy.copy(self)
+		res.pfit = res.pfit.variant(step=step, down=down, Δpolang=Δpolang)
+		# We don't need the others, but oh well
+		res.ctime = res.ctime[::step]
+		res.bore  = res.bore[:,::step]
+		res.polang= res.polang+Δpolang
+		return res
 
 # Cuts
 
@@ -256,6 +265,25 @@ def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typi
 		pos_equ= np.array([ocoord.dec, ocoord.ra, ocoord.psi]) # [{dec,ra,psi}]
 	return pos_equ
 
+# How to evaluate xlink map cheaply?
+# 1. Want to not have to redo the fit. Thankfully eval is linear and coeffs[2]
+#    encodes the polangle, so we can just do coeffs[2,:,0] -= polang to give all
+#    detectors a zero plang, like what we need in xlink.
+# 2. Can decimate tod by just doing B = B[:,::step]
+# 3. Can downgrade map by scaling y,x part of coeffs: coeffs[:2] /= down
+# It's natural to choose step = down. That way the number of hits across
+# a pixel in a single pass is the same (though the total number of hits will be higher)
+# Could maybe make a member function variant(self, step=1, down=1, Δpolang=0) that returns
+# a new PointingFit. That could then be used in a corresponding variant()-function in
+# PmatMap.
+#
+# SignalMap would then have a function calc_xlink called from prepare. It would:
+# 1. For each tod, derive a new pmat
+# 2. Accumulate weighted all-ones tod
+# 3. Finalize and build tiledist
+# 4. save both tiledist and xlink
+# write_misc would then use this tiledist to reduce and output the map
+
 class PointingFit:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang,
 			subsamp=200, sys="cel", site=None, weather="typical", dtype=np.float64,
@@ -296,9 +324,8 @@ class PointingFit:
 		# 1. Find the typical detector offset
 		off0 = np.mean(offs, 0)
 		# 2. We want to be able to calculate y,x,psi for any detector offset
-		# We calculate p0 mangually avoid annoying %360 that wcslib seems to do
+		# We calculate p0 manually avoid annoying %360 that wcslib seems to do
 		self.p0 = (wcs.wcs.crval+(1-wcs.wcs.crpix)*wcs.wcs.cdelt)[::-1]*utils.degree # [{dec,ra}]
-		#self.p0 = enmap.pix2sky(shape, wcs, [0,0]) # [{dec,ra}]
 		self.dp = wcs.wcs.cdelt[::-1]*utils.degree # [{dec,ra}]
 		# 3. Calculate the full pointing for the reference pixel
 		ref_pixs = self.dev.np.array(self.eval_exact(ctime, bore, off0[None], [0], site=self.site)[:,0])
@@ -388,6 +415,31 @@ class PointingFit:
 		pixs[:2]  = (pos_equ[:2]-self.p0[:,None,None])/self.dp[:,None,None]
 		pixs[2]   = utils.unwind(pos_equ[2])
 		return pixs # [{y,x,psi},ndet,nsamp], on cpu
+	def variant(self, step=1, down=1, Δpolang=0):
+		"""Return a new PointingFit representing the same pointing as this one,
+		but decimated by a factor `step` in time and a factor `down` in space,
+		and with the polarization angles increased by `Δpolang`. The new PointingFit's
+		members may share memory with the current one."""
+		res = copy.copy(self)
+		# Downsampling
+		if step != 1:
+			# Subsamp isn't used after the initialization, so we don't need to update it
+			if res.store_basis: res.B = res.dev.np.ascontiguousarray(res.B[:,::step])
+			else: res.ref_pixs = res.dev.np.ascontiguousarray(res.ref_pixs[:,::step])
+		# Downgrading. Support separate y and x factors. Compatible with enmap downgrade,
+		# so requries integer factors
+		res.coeffs = res.coeffs.copy()
+		down = np.zeros(2,int)+utils.nint(down)
+		if np.any(down != 1):
+			# These aren't used, but update them anyway
+			res.shape, res.wcs = enmap.downgrade_geometry(res.shape, res.wcs, down)
+			res.nphi   = utils.nint(360/np.abs(res.wcs.wcs.cdelt[0]))
+			res.dp     = res.wcs.wcs.cdelt[::-1]*utils.degree # [{dec,ra}]
+			# Ok, the main one. Scale the y,x polynomial coefficients
+			res.coeffs[:2] /= down[:,None,None]
+		# Polangle offset
+		res.coeffs[2,:,0] += Δpolang
+		return res
 
 def normalize(x):
 	x1 = np.min(x)

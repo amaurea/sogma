@@ -312,10 +312,11 @@ class FastMeta:
 					paman.wrap("hwp_angle", pl.read("hwp_angle/hwp_angle","s"), [(0,"samps")])
 				with bench.mark("fm_hwpss"):
 					# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
-					paman.wrap("hwpss_coeffs", pl.read("hwpss_stats/coeffs","d"), [(0,"dets")])
+					paman.wrap("hwpss_coeffs", pl.read("pre_hwpss_stats/coeffs","d"), [(0,"dets")])
 			with bench.mark("fm_cuts"):
 				optional = config.get("cuts_optional")
-				paman.wrap("cuts_glitch", read_cuts(pl, "glitches/glitch_flags",optional=optional), [(0,"dets"),(1,"samps")])
+				glitches = "glitches_pre_hwpss" if has_hwp else "glitches"
+				paman.wrap("cuts_glitch", read_cuts(pl, glitches+"/glitch_flags",optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps",  optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("jumps_2pi",   read_cuts(pl, "jumps_2pi/jump_flag",  optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("jumps_slow",  read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
@@ -362,7 +363,7 @@ class FastMeta:
 		# Get our absolute calibration
 		with bench.mark("fm_abscal"):
 			stream_id = "_".join(detset.split("_")[:2])
-			abscal_cmb = self.acal_cache.get(stream_id, band).abscal_cmb
+			abscal_cmb = self.acal_cache.get(stream_id=stream_id, wafer=wslot, band=band).abscal_cmb
 		with bench.mark("pointing_model"):
 			pointing_model = self.pointing_model_cache.get_by_subid(subid)
 		# Get our sensitivity limits
@@ -460,7 +461,17 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 				# LAT: corotator angle → roll
 				roll = -data.corot[i1:i2]*utils.degree + el - 60*utils.degree
 		with bench.mark("pointing correction"):
+			#i = 10000
+			#print("Model")
+			#for key in sorted(meta.pointing_model.keys()):
+			#	try: print(" %-20s %20.10e" % (key, meta.pointing_model[key]))
+			#	except TypeError: print(" %-20s %s" % (key, str(meta.pointing_model[key])))
+			#az0 = az[i]
+			#print("ctime %.4f" % ctime[i])
+			#print("Before  az %12.8f el %12.8f roll %12.8f" % (az[i]/utils.degree, el[i]/utils.degree, roll[i]/utils.degree))
 			az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
+			#print("After   az %12.8f el %12.8f roll %12.8f" % (utils.rewind(az[i],ref=az0)/utils.degree, el[i]/utils.degree, roll[i]/utils.degree))
+			#1/0
 
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
@@ -868,8 +879,9 @@ class AcalCache:
 		self.fname  = fname
 		self.raw    = bunch.read(fname).abscal
 		self.lookup = {}
+		self.key = (utils.firstin(self.raw.dtype.names, ["dets:stream_id", "dets:wafer_slot"]), "dets:wafer.bandpass")
 		for row in self.raw:
-			key = row["dets:stream_id"].decode() + ":" + row["dets:wafer.bandpass"].decode()
+			key = ":".join([row[k].decode() for k in self.key])
 			self.lookup[key] = bunch.Bunch(
 				abscal_cmb = row["abscal_cmb"],
 				abscal_rj  = row["abscal_rj"],
@@ -877,10 +889,13 @@ class AcalCache:
 				#beam_solid_angle = row["beam_solid_angle"],
 				#cal_source = row["cal_source"].decode(),
 			)
-	def get(self, stream_id, band=None):
+	def get(self, stream_id=None, wafer=None, band=None):
 		"""Either get("ufm_mv13:f150") or get("ufm_mv13", "f150") work"""
-		if band is not None: wafer_band = stream_id + ":" + band
-		return self.lookup[wafer_band]
+		if   self.key[0] == "dets:stream_id":  key = stream_id
+		elif self.key[0] == "dets:wafer_slot": key = wafer
+		else: raise ValueError("Inconsistent key0: %s" % str(self.key[0]))
+		key += ":" + band
+		return self.lookup[key]
 
 class RelcalCache:
 	def __init__(self, fname):
@@ -910,7 +925,7 @@ class RelcalCache:
 				data = hfile[group][()]
 				self.cache[key] = (
 					np.char.decode(data["dets:det_id"]),
-					data["relcal"]
+					utils.getrec(data, ["relcal", "rel_factor"])
 				)
 		return self.cache[key]
 

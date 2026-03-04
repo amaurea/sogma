@@ -102,6 +102,8 @@ utils.mkdir(args.odir)
 if comm_all.rank == 0:
 	with open(prefix + "args.txt", "w") as ofile:
 		ofile.write(" ".join(sys.argv) + "\n")
+# Useful to have in log-files too
+L.print(" ".join(sys.argv), level=0, id=0, color=colors.lgreen)
 # Set up what to output for each signal. This is limited and hacky,
 # but would have to be rewritten in any case if we move to arbitrary-signal
 # support. For now, any field mentioned refers to SignalMap, except for "cut",
@@ -110,7 +112,7 @@ if comm_all.rank == 0:
 map_out, cut_out, info_out, elmod_out, ml_out = [], [], True, [], []
 for name in args.output.split(","):
 	if name == "auto":
-		map_out += ["map","ivar"]
+		map_out += ["map","ivar","xlink"]
 		if args.mode in ["depth1","individual"]: map_out += ["time"]
 	elif name == "cut":   cut_out += ["map"]
 	elif name == "elmod": elmod_out = ["map"]
@@ -130,8 +132,10 @@ if args.cut_type == "poly":
 elif args.cut_type == "full":
 	signal_cut = mapmaking.SignalCutFull(comm_per, dev=dev, outputs=cut_out)
 else: raise ValueError("Unrecognized cut type '%s'" % str(args.cut_type))
-signal_info= mapmaking.SignalInfo(comm_per, dev=dev)
-signals    = [signal_cut, signal_map, signal_info]
+# Disabling SignalInfo for now. Must be rewritten to not overflow mpi
+#signal_info= mapmaking.SignalInfo(comm_per, dev=dev)
+#signals    = [signal_cut, signal_map, signal_info]
+signals    = [signal_cut, signal_map]
 if args.elmod > 0:
 	signals.append(mapmaking.SignalElMod(comm_per, order=args.elmod, dev=dev, outputs=elmod_out))
 # Set up the noise model

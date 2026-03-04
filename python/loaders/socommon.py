@@ -536,11 +536,11 @@ def wafer_info(tube_slot, wafer):
 	# Allow both 0 and ws0
 	if isinstance(wafer, str):
 		wafer = int(wafer[2:])
-	if re.match(r"stp\d", tube_slot):
+	if re.match(r"st\d", tube_slot):
 		pos, rad = wafer_pos_sat[wafer], 6.0
 	elif tube_slot in wafer_pos_lat:
 		pos, rad = wafer_pos_lat[tube_slot][wafer], 0.3
-	else: raise KeyError("tube %s wafer %d: no hardcoded position" % tube_slot, wafer)
+	else: raise KeyError("tube %s wafer %d: no hardcoded position" % (tube_slot, wafer))
 	# Convert to radians
 	pos = [p*utils.degree for p in pos]
 	rad = rad*utils.degree

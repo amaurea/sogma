@@ -168,6 +168,8 @@ class Sampcut:
 	def shape(self): return (len(self.bins),self.nsamp)
 	@property
 	def nrange(self): return len(self.ranges)
+	@property
+	def ndet(self): return len(self.bins)
 	def sum(self):
 		"""Count cut samples per detector"""
 		nper   = self.ranges[:,1]-self.ranges[:,0]

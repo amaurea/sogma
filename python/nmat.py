@@ -414,6 +414,15 @@ class NmatAdaptive(Nmat):
 		bins_atm     = find_atm_bins(smooth_bps, bsize=bsize_smooth, step=self.atm_res)
 		# Add a final all-the-rest bin
 		bins_atm     = np.concatenate([bins_atm,[[bins_atm[-1,1],nfreq]]],0)
+		# 3a. Find atm modes
+		weight = (mps/np.mean(mps))**0.5
+		mask   = self.dev.np.ones(ftod.shape[-1], np.int32)
+		for bi, (b1,b2) in enumerate(bins_spike):
+			mask[b1:b2] = 0
+		to_interleave = []
+		atm_power = noise_modes_hybrid(ftod, bins_atm, weight=weight, mask=mask,
+			eig_lim=self.eig_lim, single_lim=self.single_lim, nmax=self.maxmodes, wtype=wtype)
+		to_interleave.append((bins_atm, atm_power))
 		# Want to exclude the spikes from the atmospheric model.
 		# Since we model the freq-bins as independent and zero-mean,
 		# we can just zero out the spike regions after measuring
@@ -422,18 +431,12 @@ class NmatAdaptive(Nmat):
 		# 3a. Find modes in spike bins
 		# This is a bit ad-hoc, but it gives high but not completely dominating
 		# weight to the low-l atmospheric region
-		weight = (mps/np.mean(mps))**0.5
 		if len(bins_spike) > 0:
 			spike_power = noise_modes_hybrid(ftod, bins_spike, weight=weight,
 				eig_lim=self.eig_lim, single_lim=self.single_lim, nmax=self.maxmodes, wtype=wtype)
-		# 3c. Find atm modes
-		mask = self.dev.np.ones(ftod.shape[-1], np.int32)
-		for bi, (b1,b2) in enumerate(bins_spike):
-			mask[b1:b2] = 0
-		atm_power = noise_modes_hybrid(ftod, bins_atm, weight=weight, mask=mask,
-			eig_lim=self.eig_lim, single_lim=self.single_lim, nmax=self.maxmodes, wtype=wtype)
+			to_interleave.append((bins_spike, spike_power))
 		# 4. Interleave bins, unless we don't need to
-		bins, power = interleave_power([bins_atm, bins_spike], [atm_power, spike_power], dev=self.dev)
+		bins, power = interleave_power(to_interleave, dev=self.dev)
 		# 5. Precompute Kh and iD
 		nbin = len(bins)
 		iD = 1/self.dev.np.array(power.Ds).astype(wtype, copy=False) # [nbin,ndet]
@@ -983,20 +986,22 @@ def pick_data(datas, srcs, sinds):
 def pick_data_off(datas, srcs, sinds, offs):
 	return [datas[src][sind]+offs[src] for src, sind in zip(srcs, sinds)]
 
-def interleave_power(binss, powers, dev=None):
+def interleave_power(tasks, dev=None):
 	"""This assumes NmatAdaptive!"""
 	if dev is None: dev = device.get_device()
 	# Skip if one is empty
 	ifirst = 0
 	ngood  = 0
-	for bi, bins in enumerate(binss):
+	for bi, (bins,power) in enumerate(tasks):
 		if len(bins) == 0: continue
 		ifirst = bi
 		ngood += 1
 	if ngood == 1:
-		return binss[ifirst], powers[ifirst]
+		return tasks[ifirst]
 	else:
 		# Do the full interleaving
+		binss  = [task[0] for task in tasks]
+		powers = [task[1] for task in tasks]
 		bins, srcs, sinds = override_bins(binss)
 		bins  = np.array(bins)
 		bins  = np.array(bins)

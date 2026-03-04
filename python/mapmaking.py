@@ -52,9 +52,14 @@ class MLMapmaker:
 		# to think about buffers used by the signals. SignalMap uses ibuf and obuf, but
 		# these don't get overwritten before the prepare() step
 		if signal_guess:
+			# If our previous pass didn't include this id, then that means we too will end up
+			# skipping it, so might as well do so right away. This isn't really an error, but it's
+			# convenient to raise an exception.
+			if not signal_guess.has(id): raise gutils.RecoverableError("Skipped in previous pass")
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
 			signal_guess.forward(model, id)
 			gtod -= model
+			obs.cuts.gapfill(gtod)
 		if deslope:
 			# Deslope must happen here, since it's the noise that must be periodic, not the signal
 			gutils.deslope(gtod, w=5, inplace=True)
@@ -69,6 +74,14 @@ class MLMapmaker:
 			try:
 				iN = noise_model.build(gtod, srate=srate, obs=obs)
 			except Exception as e:
+				# FIXME: If this fails for 2nd pass but not for the 1st pass, then,
+				# we end up with too many degree of freedom in the x we subtract later.
+				# Can handle that by instead using a dummy noise model with zero weight,
+				# but that's pretty inelegant!
+				# Alternatively, remap x using the accepted ids, but that would require
+				# extra logic in the Signal classes, mapmaker and evaluator classes
+				# A 3rd option is to redo the noise model estimation without subtraction
+				# if we fail here, since we know that would succeed from the previous pass
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				raise gutils.RecoverableError(msg)
 		# Undo subtraction
@@ -186,6 +199,7 @@ class Evaluator:
 			if setup: signal.precalc_setup(data.id)
 			signal.forward(data.id, tod, self.work[si])
 			if free: signal.precalc_free(data.id)
+	def has(self, id): return id in self.datas
 
 class Accumulator:
 	def __init__(self, signals, datas=None):
@@ -237,7 +251,7 @@ class Signal:
 	def write_misc(self, prefix): pass
 	valid_outputs = []
 
-config.default("xdown", 10, "Temporal and spatial downgrade-factor for crosslink map")
+config.default("xdown", 8, "Temporal and spatial downgrade-factor for crosslink map")
 class SignalMap(Signal):
 	"""Signal describing a sky map."""
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
@@ -1091,9 +1105,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		# aren't free!
 		t2    = time.time()
 		socal.autocut(data, dev=dev, id=name)
-		# Remove extreme values in the cut areas. This is gentler than trying
-		# and failing to gapfill with realistic noise
-		data.cuts.gapfill(data.tod)
+		data.cuts.gapfill(data.tod, dev=dev)
 		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
 		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
 		t3    = time.time()

@@ -251,7 +251,7 @@ class FastMeta:
 			good = np.full(len(detinfo.channels), True)
 			if dets   is not None: good &= np.isin(detinfo.channels, dets,   assume_unique=True)
 			if detids is not None: good &= np.isin(detinfo.dets,     detids, assume_unique=True)
-			aman = minisotodlib.AxisManager(minisotodlib.LabelAxis("dets", detinfo.channels))
+			aman = minisotodlib.AxisManager(minisotodlib.LabelAxis("dets", detinfo.channels[good]))
 			aman.wrap("det_ids", detinfo.dets[good], [(0,"dets")])
 			aman.wrap("bands",   detname2band(detinfo.dets[good]), [(0,"dets")])
 		ndet_full = aman.dets.count

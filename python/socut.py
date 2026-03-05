@@ -109,11 +109,13 @@ class Simplecut:
 			out[inside  ,1,1] = np.minimum(out[inside  ,1,1],out[inside+1,0,1])
 		return out
 	def _index_map(self, borders):
+		"""[nrange,{det,left1,left2,right1,right2}]"""
 		index_map        = np.zeros((self.nrange,5), np.int32)
 		index_map[:,0]   = self.dets
 		index_map[:,1:]  = borders.reshape(self.nrange,4)
 		return index_map
 	def _index_map2(self, skip_r0=False):
+		"""[nrange,{det,det0,i1,i2}]"""
 		index_map2 = np.zeros((self.nrange,4), np.int32)
 		index_map2[:,0]  = self.dets
 		# A bit cumbersome to get the index of each range's first det-sibling
@@ -262,9 +264,16 @@ class Devicecut:
 			self._ncutsamps = int(self.offs[-1] + self.lens[-1])
 		return self._ncutsamps
 	def dejump(self, tod, w=10):
-		return self._deglitch(tod, self.dev.lib.dejump, w=w)
+		bvals = self._deglitch_helper(tod, w=w)
+		with bench.mark("deglitch core", tfun=self.dev.time):
+			self.dev.lib.dejump(tod, bvals, self.index_map2)
+		return tod
 	def gapfill(self, tod, w=10):
-		return self._deglitch(tod, self.dev.lib.gapfill, w=w, skip_r0=True)
+		bvals = self._deglitch_helper(tod, w=w, skip_r0=True)
+		bvals = debias_slope(bvals, self.index_map[:,1:])
+		with bench.mark("deglitch core", tfun=self.dev.time):
+			self.dev.lib.gapfill(tod, bvals, self.index_map2)
+		return tod
 	def clear(self, tod):
 		self.dev.lib.clear_ranges(tod, self.dets, self.starts, self.lens)
 		return tod
@@ -281,7 +290,7 @@ class Devicecut:
 		self.dev.lib.extract_ranges(tod, out, self.offs, self.dets, self.starts, self.lens)
 		return out
 	# Helpers
-	def _deglitch(self, tod, fun, w=10, skip_r0=False):
+	def _deglitch_helper(self, tod, w=10, skip_r0=False):
 		# Define sample ranges just before and after each
 		# cut, where we will measure a mean value for dejumping
 		if self.borders is None or w != self.prev_w:
@@ -298,10 +307,22 @@ class Devicecut:
 		with bench.mark("get_border_means", tfun=self.dev.time):
 			bvals = self.dev.np.zeros((self.nrange,2), tod.dtype)
 			self.dev.lib.get_border_means(bvals, tod, self.index_map)
-		# Use them to deglitch
-		with bench.mark("deglitch core", tfun=self.dev.time):
-			fun(tod, bvals, self.index_map2)
-		return tod
+		return bvals
+
+def debias_slope(bvals, bins):
+	"""Given bvals[nrange,{left,right}] and bins[nrange,{ileft1,ileft2,iright1,iright2}],
+	where bvals[i,0] = mean(tod[i,ileft1:ileft2]) etc. return what bvals would have been
+	if the bin widths had been zero, assuming a linear trend."""
+	leff  = (bins[:,0]+bins[:,1]-1)/2
+	reff  = (bins[:,2]+bins[:,3]-1)/2
+	reff  = np.maximum(reff, leff+1)
+	diff  = reff-leff
+	lx    = (bins[:,1]-1-leff)/(reff-leff)
+	rx    = (bins[:,2]  -leff)/(reff-leff)
+	ovals = bvals.copy()
+	ovals[:,0] = bvals[:,0]*(1-lx)+bvals[:,1]*lx
+	ovals[:,1] = bvals[:,0]*(1-rx)+bvals[:,1]*rx
+	return ovals
 
 def merge_sampcuts(cuts):
 	"""Get the union of the given list of Sampcuts"""

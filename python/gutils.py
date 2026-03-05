@@ -75,6 +75,7 @@ def leakcheck(dev, msg):
 		m2 = dev.memuse()
 		L.print("%sleak %8.4f MB %s%s" % (colors.lbrown, (m2-m1)/1024**2, msg, colors.reset), level=2)
 
+# These have norm 2/(2i+1)
 def legbasis(order, n, ap=np):
 	x   = ap.linspace(-1, 1, n, dtype=np.float32)
 	out = ap.zeros((order+1, n),dtype=np.float32)

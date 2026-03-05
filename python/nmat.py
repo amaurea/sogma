@@ -33,13 +33,14 @@ class Nmat:
 			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
 
 class NmatDebug(Nmat):
-	def __init__(self, ivar=None, alpha=-3, fknee=2.5, profile=None, bsize=256, dev=None):
+	def __init__(self, ivar=None, alpha=-3, fknee=2.5, profile=None, bsize=256, downweight=1, dev=None):
 		self.dev   = dev or device.get_device()
 		self.bsize = bsize
 		self.ivar  = ivar
 		self.alpha = alpha
 		self.fknee = fknee
 		self.profile = profile
+		self.downweight = downweight
 		self.nwin  = 0
 		self.ready = ivar is not None
 	def build(self, tod, srate, **kwargs):
@@ -47,12 +48,12 @@ class NmatDebug(Nmat):
 		nblock = nsamp//self.bsize
 		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
 		with utils.nowarn():
-			ivar = utils.without_nan(1/var)
+			ivar = utils.without_nan(1/var)*self.downweight
 		f = self.dev.np.fft.rfftfreq(nsamp, 1/srate)
 		with utils.nowarn():
 			profile = 1/(1+(f/self.fknee)**self.alpha)
 		profile /= nsamp # fft normalization
-		return NmatDebug(ivar=ivar, alpha=self.alpha, fknee=self.fknee, bsize=self.bsize, profile=profile, dev=self.dev)
+		return NmatDebug(ivar=ivar, alpha=self.alpha, fknee=self.fknee, bsize=self.bsize, profile=profile, downweight=self.downweight, dev=self.dev)
 	def apply(self, tod, inplace=True):
 		tod = self.white(tod, inplace=inplace)
 		ft  = self.dev.pools["ft"].empty((tod.shape[0],tod.shape[1]//2+1),utils.complex_dtype(tod.dtype))

@@ -74,16 +74,16 @@ class MLMapmaker:
 			try:
 				iN = noise_model.build(gtod, srate=srate, obs=obs)
 			except Exception as e:
-				# FIXME: If this fails for 2nd pass but not for the 1st pass, then,
-				# we end up with too many degree of freedom in the x we subtract later.
-				# Can handle that by instead using a dummy noise model with zero weight,
-				# but that's pretty inelegant!
-				# Alternatively, remap x using the accepted ids, but that would require
-				# extra logic in the Signal classes, mapmaker and evaluator classes
-				# A 3rd option is to redo the noise model estimation without subtraction
-				# if we fail here, since we know that would succeed from the previous pass
+				# We failed to build a noise model. If we're on the first pass, we
+				# can just skip this tod. If we're on the second pass, then we need
+				# the degrees of freedom to be compatible with the previous pass, so
+				# we instead use a dummy noise model with tiny weight
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
-				raise gutils.RecoverableError(msg)
+				if signal_guess is None:
+					raise gutils.RecoverableError(msg)
+				else:
+					iN = nmat.NmatDebug(downweight=1e3).build(gtod, srate=srate, obs=obs)
+					L.print(msg + ". Downweighting", level=2, color=colors.red)
 		# Undo subtraction
 		if signal_guess:
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
@@ -156,14 +156,14 @@ class MLMapmaker:
 		while solver.i < maxiter and solver.err > maxerr:
 			t1 = time.time()
 			solver.step()
-			x  = self.dof.unzip(solver.x)
 			t2 = time.time()
-			yield bunch.Bunch(i=solver.i, err=solver.err, x=x, t=t2-t1)
+			yield bunch.Bunch(i=solver.i, err=solver.err, x=solver.x, t=t2-t1)
 		self.x = solver.x
 	def set_outputs(self, outputs):
 		self.outputs= check_outputs(outputs, self.valid_outputs, self.__class__.__name__)
-	def write(self, prefix, x, tag=None, suffix="", force=False):
-		for signal, val in zip(self.signals, x):
+	def write(self, prefix, x=None, vals=None, tag=None, suffix="", force=False):
+		if vals is None: vals = self.dof.unzip(x)
+		for signal, val in zip(self.signals, vals):
 			signal.write(prefix, val, tag=tag, suffix=suffix, force=force)
 	def write_misc(self, prefix):
 		# Forward to our signals
@@ -178,14 +178,6 @@ class MLMapmaker:
 				with h5py.File(fname, "r+") as hfile:
 					hfile["detids"] = np.char.encode(data.detids)
 	valid_outputs = ["nmat"]
-
-# TODO: Should decide on consistent termiology for the solved degrees of freedom.
-# Right now I have:
-# * solver.x and mapmaker.x: plain 1d numpy array
-# * solution.x and Evaluator.vals: unzipped version of x
-# Tempted to just let x always be the 1d thing, and to not auto-unzip in solution
-# since that has some overhead, instead officially requiring mapmaker.unzip for that.
-# If so, should evaluator also use a flat array? If so, it will need access to dof
 
 class Evaluator:
 	def __init__(self, signals, vals, datas=None):
@@ -755,7 +747,7 @@ class SignalCutFull(Signal):
 	valid_outputs = ["map"]
 
 class SignalCutPoly(SignalCutFull):
-	def __init__(self, comm, dev=None, order=3, bsize=400, precon="none", name="cut",
+	def __init__(self, comm, dev=None, order=3, bsize=400, precon="var", name="cut",
 			ofmt="{name}_{rank:02}", dtype=np.float32, outputs=[]):
 		"""Signal for handling the ML solution for the values of the cut samples."""
 		SignalCutFull.__init__(self, comm, dev=dev, name=name, ofmt=ofmt, dtype=dtype, outputs=outputs)
@@ -763,8 +755,8 @@ class SignalCutPoly(SignalCutFull):
 		self.bsize  = bsize
 		self.basis  = gutils.legbasis(order, bsize)
 		self.prec   = precon
-		if precon != "none":
-			raise NotImplementedError("SignalCutPoly precons other than 'none' currently don't work, but got '%s'" % str(precon))
+		#if precon != "none":
+		#	raise NotImplementedError("SignalCutPoly precons other than 'none' currently don't work, but got '%s'" % str(precon))
 		if precon == "leginv":
 			self.ibases = gutils.leginverses(self.basis)
 	def new(self):
@@ -782,15 +774,22 @@ class SignalCutPoly(SignalCutFull):
 		obs_rhs = self.dev.get(obs_rhs)
 		# Build our preconditioner. We have precomputed the basis.dot(basis.T) inverse for
 		# all block lengths, so we just read out the appropriate one for each block.
-		# TODO: Understand why the none-preconditioner suddenly works fine, while
-		# the other two breaks convergence. Apparently this only happens when I include
-		# 1/ivar in them, otherwise they don't hurt but also don't beat none. Very
-		# strange.
 		if self.prec == "leginv":
 			obs_idiv = self.ibases[self.dev.get(pcut.lens)-1] / self.dev.get(iN.ivar[pcut.dets])[:,None,None]
 		elif self.prec == "var":
-			obs_idiv = 1/self.dev.get(iN.ivar[pcut.dets])
+			# diag(B'W"B). Assuming an orthogonal basis, this would be
+			# np.sum(B**2,1)*iN.ivar, which would be ncut*2/(2i+1)*iN.ivar,
+			# where i is the order. For shorter cuts, the 2/(2i+1) factor
+			# would be closer to 1, but we can still use it. In practice, I found
+			# that I get poor convergence if I use pcut.lens instead of self.bsize.
+			# I don't understand why. I hope this lack of understanding doesn't mean
+			# cut issues will keep haunting my maps
+			i       = np.arange(self.order+1)
+			norm    = 2/(2*i+1)
+			obs_div = norm * self.dev.get(self.bsize*iN.ivar[pcut.dets])[:,None]
+			obs_idiv = 1/obs_div
 		elif self.prec == "none":
+			# This "preconditioner" performs horribly. The cuts stay at their initial value
 			obs_idiv = [1]
 		else: raise ValueError("Unknown precon '%s'" % str(self.prec))
 		self.data[id] = bunch.Bunch(pcut=pcut, i1=self.off, i2=self.off+pcut.ndof)
@@ -807,7 +806,7 @@ class SignalCutPoly(SignalCutFull):
 			return bjunk.reshape(-1)
 		elif self.prec == "var":
 			bjunk = junk.reshape(-1, self.basis.shape[0]).copy()
-			bjunk *= self.idiv[:,None]
+			bjunk *= self.idiv
 			return bjunk.reshape(-1)
 		elif self.prec == "none":
 			return junk.copy()
@@ -1087,7 +1086,6 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		name   = joint.names[ind]
 		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
-		moo = []
 		try:
 			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids)
 			# I keep calculating this. It should be a standard member of data
@@ -1131,7 +1129,6 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 	mapmaker.prepare()
 	# Write rhs and ivar
 	mapmaker.write_misc(prefix)
-
 	# Solve the equation system
 	step = None
 	x0   = mapmaker.dof.zip(signal_guess.vals) if signal_guess else None
@@ -1147,7 +1144,6 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 	# Write the final result, unless we didn't do a single CG step
 	if step is not None:
 		mapmaker.write(prefix, step.x)
-
 	return mapmaker
 
 # Multipass mapmaking

@@ -77,8 +77,7 @@ try:
 			self.lib.get_plan_c2r    = gpu_mm.cufft.get_plan_c2r
 			self.lib.set_plan_scratch= gpu_mm.cufft.set_plan_scratch
 			# Plan caching, including a reusable scratch array
-			self.pools.want("fft_scratch")
-			self.plan_cache          = PlanCacheGpu(self.pools.fft_scratch, self.lib)
+			self.plan_cache          = PlanCacheGpu(self.pools["fft_scratch"], self.lib)
 			# The actual ffts, using this plan cache
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				if plan_cache is None: plan_cache = self.plan_cache
@@ -136,6 +135,9 @@ try:
 		def __init__(self, pool, lib):
 			self.plans = {}
 			self.pool  = pool
+			# Reserve this pool, so it's not used elsewhere
+			# if we use pools.auto()
+			self.pool.active = True
 			self.lib   = lib
 		def get(self, kind, shape, axis=1):
 			# Get a plan from the cache, or set it up if not present.

@@ -43,8 +43,9 @@ class MLMapmaker:
 		ctime  = obs.ctime
 		srate  = (len(ctime)-1)/(ctime[-1]-ctime[0])
 		tod    = obs.tod.astype(self.dtype, copy=False)
-		t2 = self.dev.time()
-		gtod = self.dev.pools["tod"].array(tod)
+		t2     = self.dev.time()
+		tpool  = dev.pools.auto(tod.size, dtype=tod.type)
+		gtod   = self.dev.pool.auto.array(tod)
 		del tod
 		# If we have a signal guess, then temporarily subtract that when gapfilling
 		# and building the noise model. Safe to use the ft buffer here, though we'll have
@@ -56,10 +57,10 @@ class MLMapmaker:
 			# skipping it, so might as well do so right away. This isn't really an error, but it's
 			# convenient to raise an exception.
 			if not signal_guess.has(id): raise gutils.RecoverableError("Skipped in previous pass")
-			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
-			signal_guess.forward(model, id)
-			gtod -= model
-			obs.cuts.gapfill(gtod)
+			with self.dev.auto.zeros(gtod.shape, gtod.dtype) as model:
+				signal_guess.forward(model, id)
+				gtod -= model
+				obs.cuts.gapfill(gtod)
 		if deslope:
 			# Deslope must happen here, since it's the noise that must be periodic, not the signal
 			gutils.deslope(gtod, w=5, inplace=True)
@@ -86,9 +87,9 @@ class MLMapmaker:
 					L.print(msg + ". Downweighting", level=2, color=colors.red)
 		# Undo subtraction
 		if signal_guess:
-			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
-			signal_guess.forward(model, id)
-			gtod += model
+			with self.dev.pools.auto.zeros(gtod.shape, gtod.dtype) as model:
+				signal_guess.forward(model, id)
+				gtod += model
 		t4 = self.dev.time()
 		# And apply it to the tod
 		gtod = iN.apply(gtod)
@@ -99,6 +100,8 @@ class MLMapmaker:
 		# Add the observation to each of our signals
 		for signal in self.signals:
 			signal.add_obs(id, obs, iN, gtod)
+		# Done with gtod
+		gtod.pool.active = False
 		t6 = self.dev.time()
 		L.print("Init sys trun %6.3f ds %6.3f Nb %6.3f N %6.3f add sigs %6.3f %s" % (t2-t1, t3-t2, t4-t3, t5-t4, t6-t5, id), level=2)
 		# Save only what we need about this observation
@@ -125,14 +128,14 @@ class MLMapmaker:
 		t2 = self.dev.time()
 		for di, data in enumerate(self.datas):
 			ta1  = self.dev.time()
-			gtod = self.dev.pools["tod"].empty([data.ndet, data.nsamp], self.dtype)
-			ta2  = self.dev.time()
-			evaluator.forward(gtod, data)
-			ta3 = self.dev.time()
-			data.iN.apply(gtod)
-			ta4 = self.dev.time()
-			accumulator.backward(gtod, data)
-			ta5 = self.dev.time()
+			with self.dev.pools.auto.empty([data.ndet, data.nsamp], self.dtype) as gtod:
+				ta2  = self.dev.time()
+				evaluator.forward(gtod, data)
+				ta3 = self.dev.time()
+				data.iN.apply(gtod)
+				ta4 = self.dev.time()
+				accumulator.backward(gtod, data)
+				ta5 = self.dev.time()
 			self.dev.garbage_collect()
 			ta6 = self.dev.time()
 			L.print("A z %6.3f P %6.3f N %6.3f P' %6.3f gc %6.4f %s %4d %6d" % (ta2-ta1, ta3-ta2, ta4-ta3, ta5-ta4, ta6-ta5, data.id, *gtod.shape), level=2)
@@ -346,14 +349,14 @@ class SignalMap(Signal):
 		for i, id in enumerate(self.ids):
 			d   = self.data[id]
 			t1  = time.time()
-			tod = self.dev.pools["tod"].empty(d.tod_shape, d.tod_dtype)
-			if isinstance(fill, str):
-				if fill == "time": tod[:] = self.dev.np.array(d.ctime)-self.tref
-				else: raise ValueError("Unrecognized fill '%s'" % fill)
-			else: tod[:] = fill
-			if weight: d.iN.white(tod)
-			d.pcut.clear(tod)
-			d.pmap.backward(tod, glhits)
+			with self.dev.pools.auto.empty(d.tod_shape, d.tod_dtype) as tod:
+				if isinstance(fill, str):
+					if fill == "time": tod[:] = self.dev.np.array(d.ctime)-self.tref
+					else: raise ValueError("Unrecognized fill '%s'" % fill)
+				else: tod[:] = fill
+				if weight: d.iN.white(tod)
+				d.pcut.clear(tod)
+				d.pmap.backward(tod, glhits)
 			t2  = time.time()
 			L.print("Init map %s %d %6.3f %s" % (name, weight, t2-t1,id), level=2)
 		return glhits
@@ -370,12 +373,12 @@ class SignalMap(Signal):
 			for i, id in enumerate(self.ids):
 				d   = self.data[id]
 				t1  = time.time()
-				tod = self.dev.pools["tod"].empty(d.tod_shape, d.tod_dtype)
-				d.pmap.forward(tod, imap)
-				# d.pcut.clear(tod) # not needed because iN.white is diag
-				if weight: d.iN.white(tod)
-				d.pcut.clear(tod)
-				d.pmap.backward(tod, omap)
+				with self.dev.pools.auto.empty(d.tod_shape, d.tod_dtype) as tod:
+					d.pmap.forward(tod, imap)
+					# d.pcut.clear(tod) # not needed because iN.white is diag
+					if weight: d.iN.white(tod)
+					d.pcut.clear(tod)
+					d.pmap.backward(tod, omap)
 				t2  = time.time()
 				L.print("Init map %s [%d,:] %d %6.3f %s" % (name, ci, weight, t2-t1,id), level=2)
 			gldiv.append(omap)
@@ -396,10 +399,10 @@ class SignalMap(Signal):
 			pmap = d.pmap.variant(step=step, down=down, Δpolang=-d.pmap.polang)
 			ndet, nsamp = len(pmap.polang), len(pmap.ctime)
 			t1  = time.time()
-			tod = self.dev.pools["tod"].full((ndet,nsamp), 1, d.tod_dtype)
-			d.iN.white(tod)
-			d.pcut.clear(tod)
-			pmap.backward(tod, dxlink)
+			with self.dev.pools.auto.full((ndet,nsamp), 1, d.tod_dtype) as tod:
+				d.iN.white(tod)
+				d.pcut.clear(tod)
+				pmap.backward(tod, dxlink)
 			t2  = time.time()
 			L.print("Init map %s %6.3f %s" % ("xlink", t2-t1, id), level=2)
 		# Finish the dynamic map
@@ -615,6 +618,11 @@ class SignalMapMulti(Signal):
 		for bi, band, d1, d2 in self.data[id].band_info:
 			self.mapsigs[bi].backward(id, gtod[d1:d2], glmap[bi], mmul=mmul)
 	def precalc_setup(self, id):
+		# FIXME: How can I adapt this to the auto-pool approach?
+		# Don't assume there's justa  single pointing and plan buffer.
+		# Let the pmats allocate their own, and free their own.
+		# Will be simpler in the end. The hardest part will be to make
+		# setup_buffers aware of this
 		self.dev.pools["pointing"].reset()
 		self.dev.pools["plan"].reset()
 		for bi, band, d1, d2 in self.data[id].band_info:
@@ -1455,11 +1463,18 @@ def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 	# These are the big ones
 	ctype = utils.complex_dtype(dtype)
 	ftot = ntot//2 + ndet_guess
-	dev.pools["pointing"]   .empty((3, ntot), dtype=dtype)
-	dev.pools["tod"]        .empty(ntot, dtype=dtype)
-	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
+	# Two tod-sized pools that can be used for both the tod and its fourier transform
+	dev.pools["tod1"].empty(ftot, dtype=ctype)
+	dev.pools["tod2"].empty(ftot, dtype=ctype)
+	# A 3x as big pool that can be used for pointing
+	dev.pools["pointing"].empty((3,ntot), dtype=dtype)
+	# Scratch for fourier transforms
 	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
 	dev.pools.reset()
+	# Set to active because it's permanently owned by the fft-wrapper (though only
+	# actually used in gpu mode)
+	dev.pools["fft_scratch"].active = True
+
 	# The remaining are:
 	# * plan
 	# * cut

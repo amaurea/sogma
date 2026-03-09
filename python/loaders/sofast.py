@@ -47,6 +47,11 @@ from .socommon import cmeta_lookup
 # worth it. But in the process, I discovered that I had a typo in the fourier
 # prime list, and after fixing that the amount of truncation went down a lot.
 
+# Code-wise, it would be nicer if demodulation was done after the loading,
+# since it would work the same for all the loaders (probably). But for load_multi,
+# it saves a lot of memory to do it per-subobs, so I'll do it as part of the
+# loading. We won't always want to do demodulation, so 
+
 class SoFastLoader:
 	def __init__(self, context_or_config_or_name, dev=None, mul=32):
 		self.context   = socommon.get_expanded_context(context_or_config_or_name)
@@ -76,6 +81,8 @@ class SoFastLoader:
 			# Calibrate the data
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
+			with bench.mark("load_demod"):
+				obs = socommon.demodulate(obs, dev=self.dev)
 		except catch_list as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
@@ -155,6 +162,8 @@ class SoFastLoader:
 					# This uses buffers "tod" and "ft"
 					with bench.mark("load_calib"):
 						obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
+					with bench.mark("load_demod"):
+						obs = socommon.demodulate(obs, dev=self.dev)
 					obs.subids = [subid]
 					obs.errors = []
 				except catch_list as e:

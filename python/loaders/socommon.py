@@ -1,7 +1,7 @@
 # Things used by both sofast and soslow
 import re, numpy as np, warnings, os, yaml, contextlib
 from pixell import utils, sqlite, bunch, config
-from .. import device, gutils
+from .. import device, gutils, socut
 from . import minisotodlib
 
 # Bugs:
@@ -892,3 +892,170 @@ def find_scanning(az, down=10, tol=0.01, pad=1):
 	i1   = max((moving[ 0]-1-pad)*down, 0)
 	i2   = min((moving[-1]+1+pad)*down+1, az.size)
 	return i1, i2
+
+# How to handle buffers with demodulation.
+# Standard case:
+#  Reading:
+#   rtod [nsub,nsamp] 1/6
+#   rft  [nsub,nsamp] 1/6
+#   tod  [ndet,nsamp]   1
+#  Running:
+#   tod  [ndet,nsamp]   1
+#   ft   [ndet,nsamp]   1
+#   point[3,ndet,nsamp] 3
+# Both cases are served with:
+#  tod   [ndet,nsamp]   1
+#  ft    [ndet,nsamp]   1
+#  point [3,ndet,nsamp] 3
+#  In load_multi(), point is abused as temporary storage when calling load()
+
+# Demodulation:
+#  Reading:
+#   rtod [nsub,nsamp]   1/6
+#   rft  [nsub,nsamp]   1/6
+#   dtod [nsub,ndown]   1/150
+#   tod  [ndet,ndown]   1/25
+#  Running:
+#   tod  [ndet,ndown]   1/25
+#   ft   [ndet,ndown]   1/25
+#   point[3,ndet,ndown] 3/25
+# So unlike the standard case, our biggest buffers are actually the
+# temporary ones used during reading, not our final one
+
+# Idea: Create pools with all these names, but make some of them aliases
+# of each other. That way the reading code can use the buffer that's natural
+# for it, and it's up to the setup function to make sure things work.
+# If the setup function is not called, then things will still work, but the buffers
+# will be separate, and hence some memory will be wasted
+
+# The current setup_buffers, slightly simplified
+# def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
+# 	dev.pools["pointing"]   .empty((3, ntot), dtype=dtype)
+# 	dev.pools["tod"]        .empty(ntot, dtype=dtype)
+# 	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
+# 	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
+#
+# Could instead become something like
+#
+# det setup_buffers_demod(dev, ndet, nsub, nsamp, ndown, dtype=np.float32):
+#   dev.pools["rtod"].empty((nsub,nsamp), dtype)
+#   dev.pools["rft"] .empty((nsub,nsamp), dtype)
+#   dev.pools["dtod"].empty((nsub,ndown), dtype)
+#   dev.pools["tod"] .empty((ndet,ndown), dtype)
+#   dev.pools["ft"] = dev.pools["rft"] # assumes ndet*ndown < nsub*nsamp
+#   dev.pools["pointing"].empty((3,ndet,ndown), dtype)
+#
+# det setup_buffers_plain(dev, ndet, nsub, nsamp, dtype=np.float32):
+#   dev.pools["tod"] .empty((ndet,nsamp), dtype)
+#   dev.pools["ft"]  .empty((ndet,nsamp), dtype)
+#   dev.pools["pointing"].empty((3,ndet,nsamp), dtype)
+#   dev.pools["rtod"] = dev.pools["tod"]
+#   dev.pools["rft"]  = dev.pools["ft"]
+#
+# One would still be using 
+
+config.default("demodulate", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
+
+def demodulate(data, frel=2, comps="TQU", mode=None, mul=32, dev=None):
+	# Check if we should demodulate
+	mode    = config.get("demodulate", mode)
+	has_hwp = "hwp" in data and data.hwp is not None
+	if mode == "auto": mode = "yes" if has_hwp else "no"
+	if   mode == "no": return data
+	elif mode == "yes":
+		if not has_hwp: raise ValueError("Cannot demodulate without HWP angles")
+	else: raise ValueError("Unrecognized demodulation mode '%s'" % str(mode))
+	# Ok, if we get here, then we can demodulate
+	if dev is None: dev = device.get_device()
+	import pdb; pdb.set_trace()
+	ncomp        = len(comps)
+	ndet, insamp = data.tod.shape
+	duration     = data.ctime[-1]-data.ctime[0]
+	srate        = (insamp-1)/duration
+	# Estimate hwp rotation speed. A bit inefficient, but we don't
+	# require it to be unwound. Should I guarantee that it's unwound
+	# after calibration? The disadvantage is that this reduces precision,
+	# since float32 has 7 digits of precision, and the integer part can
+	# take up 3-4 of those digits, leaving only 3-4 for the important
+	# fractional part. To avoid this, the hwp angle would need to be
+	# double precision.
+	diffs = dev.np.diff(data.hwp)
+	speed = dev.np.mean(diffs[dev.np.abs(diffs)<dev.np.pi])*srate
+	fhwp  = np.abs(speed/(2*np.pi))
+	# Find the last index where we complete a full revolution. We want
+	# a whole number of rotations to avoid fourier bleeding. The cost of truncating
+	# would be at most 0.5 s
+	intrunc = gutils.find_last_crossing(data.hwp, data.hwp[0])
+	# Find our output number of samples. This is ideally determined by
+	# ofmax, but we are also restricted by fourier and mapmaking
+	# considerations via mul
+	ofmax   = frel*fhwp
+	ifmax   = srate/2
+	onsamp  = fft.fft_len(utils.nint(intrunc*ofmax/ifmax/mul), factors=dev.lib.fft_factors)*mul
+	# Prepare our resampling. For the tod we use fft-resampling. For the others, we use
+	# linear interpolation. Averaging would be better, but these are smooth functions so
+	# it should be good enough
+	linresamp = gutils.LinResamp(intrunc, onsamp)
+	# Prepare our output detectors. Our output data will have 2 or 3 times
+	# as many detectors as we started with, since demodulation lets us recover
+	# a T, Q and U-timestream from a single detector.
+	assert comps == "TQU" or comps == "QU"
+	detnames = []
+	modfuns  = []
+	if "T"  in comps:
+			detnames.append(np.char.add(data.dets, "_one"))
+			modfuns .append(lambda x:dev.np.full_like(x, 0.5))
+	if "QU" in comps:
+			detnames.append(np.char.add(data.dets, "_cos"))
+			detnames.append(np.char.add(data.dets, "_sin"))
+			modfuns .append(dev.np.cos)
+			modfuns .append(dev.np.sin)
+	ndup  = len(modfuns)
+	odets = np.char.concatenate(detnames)
+	# Construct an output data with the given downsampling and detector duplication
+	odata = bunch.Bunch()
+	odata.dets  = odets
+	odata.ctime = linresamp(data.ctime[:intrunc])
+	odata.hwp   = None # already handled
+	odata.point_offset = utils.repeat(data.point_offset, ndup, axis=0)
+	odata.polangle  = np.zeros(   len(odets) , data.tod.dtype) # filled below
+	odata.response  = np.zeros((2,len(odets)), data.tod.dtype) # filled below
+	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
+	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1,:intrunc])) # az
+	odata.boresight[0] = linresamp(data.boresight[0,:intrunc]) # el
+	odata.boresight[2] = linresamp(data.boresight[2,:intrunc]) # roll
+	# Resample cuts, and duplicate them across the virtual detectors
+	recuts      = data.cuts[:,:intrunc].resample(onsamp).simplify()
+	odata.cuts  = socut.Simplecut.detcat([recuts]*len(modfuns))
+	odata.tod   = dev.np.zeros((len(odets),onsamp),data.tod.dtype) # filled below
+	# TODO: Think about how to handle gpu memory allocation here.
+	# There are three big arrays involved:
+	# * input tod
+	# * modulated input tod
+	# * ft of modulated input tod
+	# The outputs are much smaller.
+	# After all the loading is done, none of these big arrays will be needed
+	# any more.
+	# For now, I'll just use the heap
+	# Ok, here comes the actual demodulation part
+	for i, fun in enumerate(modfuns):
+		carrier = fun(4*data.hwp[:intrunc]).astype(data.tod.dtype)
+		# Should I gapfill tod*carrier?
+		# Should I truncate to a whole number of rotations?
+		ftod    = dev.lib.rfft(data.tod[:,:intrunc]*carrier)
+		# This step actually performs the filtering/downsampling
+		ftod    = ftod[:,:onsamp//2+1].copy()
+		ftod   *= 2/intrunc
+		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
+	# TODO: gapfill and deslope
+	# T-detectors have response [1,0,0]
+	if comps == "TQU": odata.response[0,:ndet] = 1
+	elif comps != "QU": raise ValueError("Only comps='TQU' and comps='QU' supported")
+	# cos-detectors have response [0,+detQ,-detU]
+	# Equivalent to -ang
+	odata.polangle[-2*ndet:-ndet] = -data.polangle
+	# sin-detectors have response [0,+detU,+detQ]
+	# Equivalent to (-(2*ang-pi/4)+pi/4)/2 = pi/4-ang
+	odata.polangle[-ndet:] = np.pi/4-data.polangle
+	odata.response[1,-2*ndet:] = 1
+	return odata

@@ -20,7 +20,7 @@ class PmatMap:
 
 		* shape, wcs: geometry
 		* ctime[nsamp]
-		* bore[{ra,dec},nsamp]
+		* bore[{el,az,roll},nsamp]
 		* offs[ndet,{eta,xi}]
 		* polang[ndet]
 		* response[{T,P},ndet] or None
@@ -308,7 +308,7 @@ class PointingFit:
 
 		* shape, wcs: geometry
 		* ctime[nsamp]
-		* bore[{ra,dec},nsamp]
+		* bore[{el,az,roll},nsamp]
 		* offs[ndet,{eta,xi}]
 		* polang[ndet]
 		"""

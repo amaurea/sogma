@@ -60,6 +60,7 @@ class Simplecut:
 	def merge(cuts):
 		# Currently implemented via Sampcut
 		return Sampcut.merge([cut.to_sampcut() for cut in cuts]).simplify().to_simple()
+	def simplify(self): return self.to_sampcut().simplify().to_simple()
 	@staticmethod
 	def detcat(cuts):
 		"""Concatenate list of cuts in detector direction."""

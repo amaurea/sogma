@@ -1,6 +1,5 @@
 import time
 from pixell import memory, colors
-from . import device
 
 class Logger:
 	def __init__(self, dev=None, level=0, id=0, fmt="{id:3d} {t:6.2f} {mem:6.2f} {dmem_rest:6.2f} {dmem:6.2f} {msg:s}"):

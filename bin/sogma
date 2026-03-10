@@ -58,7 +58,7 @@ dev = device.get_device(args.device)
 # Set up our logging
 verbosity  = args.verbose-args.quiet
 L = logging.Logger(dev, id=comm_all.rank, level=verbosity, fmt="{id:3d} {t:8.3f} {mem:5.2f} {dmem_pools:5.2f} {dmem_rest:5.2f} {dmem_unknown:5.2f} {msg:s}").setdefault()
-bench.set_verbose(verbosity >= 3)
+bench.set_verbose(verbosity >= 4)
 L.print("Init", level=0, id=0, color=colors.lgreen)
 # Benchmarking
 bench.set_tfun(dev.time)

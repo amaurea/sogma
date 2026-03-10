@@ -562,7 +562,10 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		# Cut all detectors if too large a fraction is cut
 		good   &= dev.np.sum(good)/meta.ndet_full > 0.25
 		nfinal  = dev.np.sum(good)
-		signal = dev.np.ascontiguousarray(signal[good]) # 600 ms!
+		# Prune signal and make it contiguous. Make sure it ends up in tod pool
+		# by renaming ft
+		signal  = dev.pools["ft"].array(signal[good])
+		dev.pools.swap("ft", "tod")
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))

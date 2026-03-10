@@ -1,6 +1,9 @@
 import numpy as np
 from pixell import device, bunch, fft
 from pixell.device import anypy
+from .logging import L
+
+Devices = bunch.Bunch()
 
 def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu"]):
 	if type == "auto":
@@ -8,15 +11,16 @@ def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu
 			if name in Devices:
 				type = name
 				break
-	cname  = Devices[type]
-	device = Devices[type](align=align, alloc_factory=alloc_factory)
+	# Small overhead on pool-growing operations from always pasing a logger, even
+	# when we don't need it, but those operations shouldn't be happening often anyway
+	device = Devices[type](align=align, alloc_factory=alloc_factory, logger=pool_logger)
 	return device
 
-Devices = bunch.Bunch()
+def pool_logger(msg): return L.print(msg, level=3)
 
 class MMDeviceMinimal(device.DeviceCpu):
-	def __init__(self, align=None, alloc_factory=None, verbose=False):
-		super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
+	def __init__(self, align=None, alloc_factory=None, logger=None):
+		super().__init__(align=align, alloc_factory=alloc_factory, logger=logger)
 		self.name = "minimal"
 		# ffts. No plan caching for now
 		def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
@@ -55,8 +59,8 @@ try:
 	from cupy.cuda import cublas
 
 	class MMDeviceGpu(device.DeviceGpu):
-		def __init__(self, align=None, alloc_factory=None, verbose=False):
-			super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
+		def __init__(self, align=None, alloc_factory=None, logger=None):
+			super().__init__(align=align, alloc_factory=alloc_factory, logger=logger)
 			self.name = "gpu"
 			# pointing
 			self.lib.PointingPrePlan = gpu_mm.PointingPrePlan
@@ -166,8 +170,8 @@ try:
 	import cpu_mm
 
 	class MMDeviceCpu(device.DeviceCpu):
-		def __init__(self, align=None, alloc_factory=None, verbose=False):
-			super().__init__(align=align, alloc_factory=alloc_factory, verbose=verbose)
+		def __init__(self, align=None, alloc_factory=None, logger=None):
+			super().__init__(align=align, alloc_factory=alloc_factory, logger=logger)
 			self.name = "cpu"
 			# pointing
 			self.lib.PointingPrePlan = cpu_mm.PointingPrePlan

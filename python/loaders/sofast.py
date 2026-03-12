@@ -198,7 +198,7 @@ class SoFastLoader:
 			otot.tod = otot.tod[:dcum]
 		finally:
 			# Finally, move tod to the tod-buffer, where it's expected to be
-			self.dev.pools.swap("pointing","tod")
+			self.dev.pools.swap("pointing", "tod")
 		# Non-fatal errors
 		if len(exceptions) > 0:
 			otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
@@ -562,10 +562,11 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		# Cut all detectors if too large a fraction is cut
 		good   &= dev.np.sum(good)/meta.ndet_full > 0.25
 		nfinal  = dev.np.sum(good)
-		# Prune signal and make it contiguous. Make sure it ends up in tod pool
-		# by renaming ft
+		# Can't use swap trick here, since the tod buffer may
+		# already be temporarily swapped out from load_multi.
+		# Manual buffers are so fragile!
 		signal  = dev.pools["ft"].array(signal[good])
-		dev.pools.swap("ft", "tod")
+		signal  = dev.pools["tod"].array(signal)
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))

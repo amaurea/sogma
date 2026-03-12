@@ -32,6 +32,18 @@ class Nmat:
 		if not self.ready:
 			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
 
+class NmatNull(Nmat):
+	def __init__(self, dev=None):
+		self.dev   = dev or device.get_device()
+		self.ready = True
+	def build(self, tod, srate, **kwargs): return self
+	def apply(self, tod, inplace=True):
+		if not inplace: tod = tod.copy()
+		tod[:] = 0
+		return tod
+	def white(self, tod, inplace=True):
+		return self.apply(tod, inplace=inplace)
+
 class NmatDebug(Nmat):
 	def __init__(self, ivar=None, alpha=-3, fknee=2.5, profile=None, bsize=256, downweight=1, dev=None):
 		self.dev   = dev or device.get_device()

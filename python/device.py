@@ -3,18 +3,24 @@ from pixell import device, bunch, fft
 from pixell.device import anypy
 from .logging import L
 
-Devices = bunch.Bunch()
+# This will hold the types of device we can construct
+device_types = bunch.Bunch()
+# This will hold the devices we have actually initialized
+devices = bunch.Bunch()
 
 def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu"]):
 	if type == "auto":
 		for name in priority:
-			if name in Devices:
+			if name in device_types:
 				type = name
 				break
-	# Small overhead on pool-growing operations from always pasing a logger, even
-	# when we don't need it, but those operations shouldn't be happening often anyway
-	device = Devices[type](align=align, alloc_factory=alloc_factory, logger=pool_logger)
-	return device
+	if type not in devices:
+		L.print("init device %s" % type, level=3)
+		# Small overhead on pool-growing operations from always pasing a logger, even
+		# when we don't need it, but those operations shouldn't be happening often anyway
+		device = device_types[type](align=align, alloc_factory=alloc_factory, logger=pool_logger)
+		devices[type] = device
+	return devices[type]
 
 def pool_logger(msg): return L.print(msg, level=3)
 
@@ -52,7 +58,7 @@ class MMDeviceMinimal(device.DeviceCpu):
 			raise NotImplementedError
 		self.lib.sdgmm = sdgmm
 
-Devices.minimal = MMDeviceMinimal
+device_types.minimal = MMDeviceMinimal
 
 try:
 	import cupy, gpu_mm
@@ -81,8 +87,7 @@ try:
 			self.lib.get_plan_c2r    = gpu_mm.cufft.get_plan_c2r
 			self.lib.set_plan_scratch= gpu_mm.cufft.set_plan_scratch
 			# Plan caching, including a reusable scratch array
-			self.pools.want("fft_scratch")
-			self.plan_cache          = PlanCacheGpu(self.pools.fft_scratch, self.lib)
+			self.plan_cache          = PlanCacheGpu(self.pools["fft_scratch"], self.lib)
 			# The actual ffts, using this plan cache
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				if plan_cache is None: plan_cache = self.plan_cache
@@ -161,7 +166,7 @@ try:
 			self.plans[tag] = plan
 			return plan
 
-	Devices.gpu = MMDeviceGpu
+	device_types.gpu = MMDeviceGpu
 
 except ImportError:
 	pass
@@ -227,7 +232,7 @@ try:
 			# Scaling
 			self.lib.block_scale = cpu_mm.block_scale
 
-	Devices.cpu = MMDeviceCpu
+	device_types.cpu = MMDeviceCpu
 
 except ImportError:
 	pass

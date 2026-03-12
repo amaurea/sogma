@@ -59,7 +59,7 @@ class MLMapmaker:
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
 			signal_guess.forward(model, id)
 			gtod -= model
-			obs.cuts.gapfill(gtod)
+			obs.cuts.gapfill(gtod, dev=self.dev)
 		if deslope:
 			# Deslope must happen here, since it's the noise that must be periodic, not the signal
 			gutils.deslope(gtod, w=5, inplace=True)
@@ -82,8 +82,8 @@ class MLMapmaker:
 				if signal_guess is None:
 					raise gutils.RecoverableError(msg)
 				else:
-					iN = nmat.NmatDebug(downweight=1e3).build(gtod, srate=srate, obs=obs)
-					L.print(msg + ". Downweighting", level=2, color=colors.red)
+					iN = nmat.NmatNull(dev=self.dev)
+					L.print(msg + ". Nulling", level=2, color=colors.red)
 		# Undo subtraction
 		if signal_guess:
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
@@ -787,7 +787,7 @@ class SignalCutPoly(SignalCutFull):
 			i       = np.arange(self.order+1)
 			norm    = 2/(2*i+1)
 			obs_div = norm * self.dev.get(self.bsize*iN.ivar[pcut.dets])[:,None]
-			obs_idiv = 1/obs_div
+			obs_idiv = utils.without_nan(1/obs_div)
 		elif self.prec == "none":
 			# This "preconditioner" performs horribly. The cuts stay at their initial value
 			obs_idiv = [1]

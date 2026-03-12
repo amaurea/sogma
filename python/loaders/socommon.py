@@ -462,7 +462,7 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 		utils.dict_lookup(flavor_noptc_per_band, info["tube_flavor"]),
 		utils.dict_lookup(flavor_ndark_per_band, info["tube_flavor"]),
 	)
-	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("r","d"),("sweep","d",(6,2))]
+	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("fhwp","d"),("r","d"),("sweep","d",(6,2))]
 	obsinfo = np.zeros(len(info), dtype).view(np.recarray)
 	obsinfo.id    = info["subobs_id"]
 	obsinfo.ndet  = ndet
@@ -475,6 +475,8 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 	obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
 	obsinfo.roll  = info["roll_center"].astype(np.float64) * utils.degree
 	obsinfo.waz   = info["az_throw" ].astype(np.float64)*2 * utils.degree
+	if "hwp_freq_mean" in info: obsinfo.fhwp = info["hwp_freq_mean"]
+
 	wafer_centers, obsinfo.r = wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
 	if sweeps:
 		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
@@ -952,26 +954,25 @@ def find_scanning(az, down=10, tol=0.01, pad=1):
 #   dev.pools["rtod"] = dev.pools["tod"]
 #   dev.pools["rft"]  = dev.pools["ft"]
 #
-# One would still be using 
+# First step would be to estimate useful values for ndet, nsub, nsamp and ndown
+# The simplest if, slightly wasteful, is to let ndet = max(ndets), nsamp = max(nsamps).
+# gutils.obs_group_size would also know the differenc between ndets and nsubs.
+# For ndown, we would need to know how much downsampling there will be.
+# That depends on the hwp speed. Is this available in obsdb?
 
-config.default("demodulate", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
-
-def demodulate(data, frel=2, comps="TQU", mode=None, mul=32, dev=None):
+def demodulate(data, frel=2, comps="TQU", mode="auto", mul=32, dev=None):
 	# Check if we should demodulate
-	mode    = config.get("demodulate", mode)
 	has_hwp = "hwp" in data and data.hwp is not None
-	if mode == "auto": mode = "yes" if has_hwp else "no"
-	if   mode == "no": return data
-	elif mode == "yes":
-		if not has_hwp: raise ValueError("Cannot demodulate without HWP angles")
-	else: raise ValueError("Unrecognized demodulation mode '%s'" % str(mode))
+	demod = gutils.check_demod(mode, has_hwp)
+	if not demod: return data
 	# Ok, if we get here, then we can demodulate
 	if dev is None: dev = device.get_device()
-	import pdb; pdb.set_trace()
 	ncomp        = len(comps)
 	ndet, insamp = data.tod.shape
 	duration     = data.ctime[-1]-data.ctime[0]
 	srate        = (insamp-1)/duration
+	dtype        = data.tod.dtype
+	ctype        = utils.complex_dtype(dtype)
 	# Estimate hwp rotation speed. A bit inefficient, but we don't
 	# require it to be unwound. Should I guarantee that it's unwound
 	# after calibration? The disadvantage is that this reduces precision,
@@ -1018,8 +1019,8 @@ def demodulate(data, frel=2, comps="TQU", mode=None, mul=32, dev=None):
 	odata.ctime = linresamp(data.ctime[:intrunc])
 	odata.hwp   = None # already handled
 	odata.point_offset = utils.repeat(data.point_offset, ndup, axis=0)
-	odata.polangle  = np.zeros(   len(odets) , data.tod.dtype) # filled below
-	odata.response  = np.zeros((2,len(odets)), data.tod.dtype) # filled below
+	odata.polangle  = np.zeros(   len(odets) , dtype) # filled below
+	odata.response  = np.zeros((2,len(odets)), dtype) # filled below
 	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
 	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1,:intrunc])) # az
 	odata.boresight[0] = linresamp(data.boresight[0,:intrunc]) # el
@@ -1027,27 +1028,28 @@ def demodulate(data, frel=2, comps="TQU", mode=None, mul=32, dev=None):
 	# Resample cuts, and duplicate them across the virtual detectors
 	recuts      = data.cuts[:,:intrunc].resample(onsamp).simplify()
 	odata.cuts  = socut.Simplecut.detcat([recuts]*len(modfuns))
-	odata.tod   = dev.np.zeros((len(odets),onsamp),data.tod.dtype) # filled below
-	# TODO: Think about how to handle gpu memory allocation here.
-	# There are three big arrays involved:
-	# * input tod
-	# * modulated input tod
-	# * ft of modulated input tod
-	# The outputs are much smaller.
-	# After all the loading is done, none of these big arrays will be needed
-	# any more.
-	# For now, I'll just use the heap
+	odata.tod   = dev.pools["dtod"].zeros((len(odets),onsamp), dtype) # filled below
+	work        = dev.pools["wtod"].zeros((ndet, intrunc), dtype)
 	# Ok, here comes the actual demodulation part
 	for i, fun in enumerate(modfuns):
-		carrier = fun(4*data.hwp[:intrunc]).astype(data.tod.dtype)
-		# Should I gapfill tod*carrier?
-		# Should I truncate to a whole number of rotations?
-		ftod    = dev.lib.rfft(data.tod[:,:intrunc]*carrier)
-		# This step actually performs the filtering/downsampling
-		ftod    = ftod[:,:onsamp//2+1].copy()
+		carrier = fun(4*data.hwp[:intrunc]).astype(dtype)
+		work[:] = data.tod[:,:intrunc]
+		# Modulate
+		work    *= carrier
+		gutils.deslope(work)
+		# Fourier-truncate. This step actually performs the filtering/downsampling
+		# Sadly the ft must be contiguous, so we need a work buffer. We use our
+		# tod work buffer for this, since its info has been transferred to fourier
+		# space by then
+		ftod    = dev.pools["ft"].empty((ndet, intrun//2+1), ctype)
+		dev.lib.rfft(work, ftod)
+		ftod    = gutils.rewrite_contig(ftod[:,:onsamp//2+1], work)
 		ftod   *= 2/intrunc
+		# can finally transform back
 		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
-	# TODO: gapfill and deslope
+	# Should gapfill now that we've unwiggled. Don't need desloping
+	# since we're periodic by definition now
+	odata.cuts.gapfill(odata.tod, dev=dev)
 	# T-detectors have response [1,0,0]
 	if comps == "TQU": odata.response[0,:ndet] = 1
 	elif comps != "QU": raise ValueError("Only comps='TQU' and comps='QU' supported")

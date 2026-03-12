@@ -446,6 +446,29 @@ def logint(arr, x):
 	larr = ap.log(arr)
 	return ap.exp(larr[...,ix]*(1-rx) + larr[...,ix+1]*rx)
 
+def obs_group_info(obsinfo, groups, inds=None, sampranges=None):
+	"""Given an obsinfo (ala socommon.finish_query), group definitions
+	groups[ngroup][obsinds], and optionally a lis of which groups to actually include,
+	returns information about number of detectors and samples per group,
+	per member etc, which would be useful for precallocating buffers."""
+	if inds is None: inds = np.arange(len(groups))
+	info = bunch.Bunch(ndet=[], nsub=[], nsamp=[], fhwp=[], fsamp=[])
+	for ind in inds:
+		group = groups[ind]
+		ginfo = obsinfo[group]
+		info.ndet .append(np.sum(ginfo.ndet))
+		info.nsub .append(np.max(ginfo.ndet))
+		info.nsamp.append(np.max(ginfo.nsamp))
+		# max and min here so that we don't overestimate
+		# the potential downsampling factor fsamp/fhwp
+		info.fhwp .append(np.max(ginfo.fhwp))
+		info.fsamp.append(np.min(ginfo.nsamp/ginfo.dur))
+	for key in info: info[key] = np.array(info[key])
+	info.dur = info.nsamp/info.fsamp
+	if sampranges is not None:
+		info.nsamp = np.minimum(info.nsamp, sampranges[1])-sampranges[0]
+	return info
+
 def obs_group_size(obsinfo, groups, inds=None, sampranges=None):
 	if inds is None: inds = np.arange(len(groups))
 	if sampranges is None:
@@ -733,3 +756,23 @@ class LinResamp:
 		axis= axis % arr.ndim
 		pre = (slice(None),)*axis
 		return arr[pre+(self.x1,)]*self.r1 + arr[pre+(self.x2,)]*self.r2
+
+def check_demod(demod="auto", has_hwp=False):
+	if demod not in ["auto", "yes", "no"]:
+		raise ValueError("demod must be 'auto', 'yes' or 'no', but got '%s'" % str(demod))
+	if demod == "auto": return has_hwp
+	elif demod == "no": return False
+	elif has_hwp: return True
+	else: raise ValueError("Asked to demodulate, but no hwp present")
+
+def rewrite_contig(arr, work):
+	"""Given a non-contiguous array arr and a scratch array work,
+	return a new version of arr that's contiguous, and uses the same
+	memory region as arr. The original contents of arr and work are
+	destroyed"""
+	ap     = device.anypy(arr)
+	tmp    = ap.ndarray(shape=arr.shape, dtype=arr.dtype, buffer=work)
+	tmp[:] = arr
+	oarr   = ap.ndarray(shape=arr.shape, dtype=arr.dtype, buffer=arr)
+	oarr[:]= arr
+	return oarr

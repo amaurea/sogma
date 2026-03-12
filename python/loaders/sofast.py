@@ -53,7 +53,7 @@ from .socommon import cmeta_lookup
 # loading. We won't always want to do demodulation, so 
 
 class SoFastLoader:
-	def __init__(self, context_or_config_or_name, dev=None, mul=32):
+	def __init__(self, context_or_config_or_name, dev=None, mul=32, demod="auto"):
 		self.context   = socommon.get_expanded_context(context_or_config_or_name)
 		self.obsdb     = sqlite.open(self.context["obsdb"])
 		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
@@ -63,6 +63,7 @@ class SoFastLoader:
 		self.fast_meta = FastMeta(self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
+		self.demod   = demod
 		self.catch_list = (Exception,)
 		#self.catch_list = ()
 	def query(self, query=None, sweeps=True, output="sogma"):
@@ -82,7 +83,7 @@ class SoFastLoader:
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
 			with bench.mark("load_demod"):
-				obs = socommon.demodulate(obs, dev=self.dev)
+				obs = socommon.demodulate(obs, dev=self.dev, mode=self.demod)
 		except catch_list as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
@@ -145,60 +146,50 @@ class SoFastLoader:
 			("polangle",0),("response",1)]
 		for field, axis in append_fields: otot[field] = []
 		dcum = 0
-		try:
-			# We want the final output tod in the "tod" buffer, but this buffer will be
-			# used in calibrate(). The big "pointing" buffer is free at this point, though,
-			# so we can trick calibrate() into using that one instead by swapping the
-			# "pointing" and "tod" pools. By swapping back in the end, the result will end
-			# up where we want it. We also need to swap back in the end to keep our total
-			# allocations low, since "pointing" is supposed to be a 3x as large buffer
-			self.dev.pools.want("pointing", "tod")
-			self.dev.pools.swap("pointing", "tod")
-			for si, (subid, meta) in enumerate(zip(mids, metas)):
-				try:
-					# read in and calibrate each
-					with bench.mark("load_data"):
-						data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
-					# This uses buffers "tod" and "ft"
-					with bench.mark("load_calib"):
-						obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
-					with bench.mark("load_demod"):
-						obs = socommon.demodulate(obs, dev=self.dev)
-					obs.subids = [subid]
-					obs.errors = []
-				except catch_list as e:
-					exceptions.append(e)
-					eids      .append(subid)
-					continue
-				# Initial otot setup
-				if otot.tod is None:
-					otot.ctime     = obs.ctime
-					otot.boresight = obs.boresight
-					otot.hwp       = obs.hwp
-					otot.site      = obs.site
-					otot.overpole  = obs.overpole
-					otot.tod       = self.dev.pools["pointing"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
-				# Handle the simple append cases
-				for field, axis in append_fields:
-					otot[field].append(obs[field])
-				otot.cuts.append(obs.cuts)
-				otot.subids += obs.subids
-				otot.errors += obs.errors
-				# Copy tod over to the right part of the output buffer
-				otot.tod[dcum:dcum+len(obs.tod)] = obs.tod
-				dcum += len(obs.tod)
-			# Were we left with anything at all?
-			if dcum == 0:
-				raise utils.DataMissing(format_multi_exception(exceptions, eids))
-			# Concatenate the work-lists into the final arrays
+		for si, (subid, meta) in enumerate(zip(mids, metas)):
+			try:
+				# read in and calibrate each
+				with bench.mark("load_data"):
+					data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
+				# This uses buffers "tod" and "ft"
+				with bench.mark("load_calib"):
+					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
+				with bench.mark("load_demod"):
+					obs = socommon.demodulate(obs, dev=self.dev, mode=self.demod)
+				obs.subids = [subid]
+				obs.errors = []
+			except catch_list as e:
+				exceptions.append(e)
+				eids      .append(subid)
+				continue
+			# Initial otot setup
+			if otot.tod is None:
+				otot.ctime     = obs.ctime
+				otot.boresight = obs.boresight
+				otot.hwp       = obs.hwp
+				otot.site      = obs.site
+				otot.overpole  = obs.overpole
+				# This is where we finally put things in the "tod" pool. Until now, we've
+				# used the input buffer "itod"
+				otot.tod       = self.dev.pools["tod"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
+			# Handle the simple append cases
 			for field, axis in append_fields:
-				otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
-			otot.cuts = socut.Simplecut.detcat(otot.cuts)
-			# Trim tod in case we lost some detectors
-			otot.tod = otot.tod[:dcum]
-		finally:
-			# Finally, move tod to the tod-buffer, where it's expected to be
-			self.dev.pools.swap("pointing","tod")
+				otot[field].append(obs[field])
+			otot.cuts.append(obs.cuts)
+			otot.subids += obs.subids
+			otot.errors += obs.errors
+			# Copy tod over to the right part of the output buffer
+			otot.tod[dcum:dcum+len(obs.tod)] = obs.tod
+			dcum += len(obs.tod)
+		# Were we left with anything at all?
+		if dcum == 0:
+			raise utils.DataMissing(format_multi_exception(exceptions, eids))
+		# Concatenate the work-lists into the final arrays
+		for field, axis in append_fields:
+			otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
+		otot.cuts = socut.Simplecut.detcat(otot.cuts)
+		# Trim tod in case we lost some detectors
+		otot.tod = otot.tod[:dcum]
 		# Non-fatal errors
 		if len(exceptions) > 0:
 			otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
@@ -486,7 +477,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	with bench.mark("signal → gpu", tfun=dev.time):
 		signal_ = dev.pools["ft"].array(signal)
 	with bench.mark("signal → float32", tfun=dev.time):
-		signal  = dev.pools["tod"].empty(signal.shape, np.float32)
+		signal  = dev.pools["itod"].empty(signal.shape, np.float32)
 		signal[:] = signal_
 
 	with bench.mark("calibrate", tfun=dev.time):
@@ -534,7 +525,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		# I can't find an efficient way to do this. BLAS can't
 		# do it since it's a triple multiplication. Hopefully the
 		# gpu won't have trouble with it
-		with dev.pools["tod"].as_allocator(): # tod buffer not in use atm
+		with dev.pools["itod"].as_allocator(): # tod buffer not in use atm
 			#ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
 			# Writing it this way saves some memroy
 			tfact = dev.np.full(ftod.shape, 2j*np.pi, ftod.dtype)
@@ -562,10 +553,10 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		# Cut all detectors if too large a fraction is cut
 		good   &= dev.np.sum(good)/meta.ndet_full > 0.25
 		nfinal  = dev.np.sum(good)
-		# Prune signal and make it contiguous. Make sure it ends up in tod pool
-		# by renaming ft
+		# Prune signal and make it contiguous
+		# Annoying to have to copy twice to get it back into the right buffer
 		signal  = dev.pools["ft"].array(signal[good])
-		dev.pools.swap("ft", "tod")
+		signal  = dev.pools["itod"].array(signal)
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))

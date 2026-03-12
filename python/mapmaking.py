@@ -1077,8 +1077,8 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 	# actually more memory-efficient, as long as our estimate is
 	# good.
 	if prealloc and len(inds) > 0:
-		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
-		setup_buffers(dev, ntot_max)
+		ginfo = np.max(gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
+		setup_buffers(dev, ginfo)
 	# Start map from scartch
 	mapmaker.reset()
 	# Add our observations
@@ -1201,8 +1201,8 @@ def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds
 	if prefix is None:
 		prefix = ""
 	if prealloc:
-		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
-		setup_buffers(mapmaker.dev, ntot_max)
+		ginfo = np.max(gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
+		setup_buffers(mapmaker.dev, ginfo)
 
 	# Map indivdual tods
 	for ind in inds:
@@ -1240,13 +1240,10 @@ def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, pref
 	pids, order, edges = utils.find_equal_groups_fast(gpids)
 	my_pinds = list(range(comm.rank, len(pids), comm.size))
 	if prealloc:
-		# Estimate the max memory a group-group needs, and preallocate
-		ntot_max  = 0
-		for pind in my_pinds:
-			my_inds = inds[order[edges[pind]:edges[pind+1]]]
-			ntot    = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=my_inds, sampranges=joint.sampranges))
-			ntot_max= max(ntot, ntot_max)
-		setup_buffers(mapmaker.dev, ntot_max)
+		# All the obs-inds that I'm responsible for
+		my_inds = np.concatenate([inds[order[edges[pind]:edges[pind+1]]] for pind in my_pinds])
+		ginfo   = gutils.obs_group_info(obsinfo, joint.groups, inds=my_inds, sampranges=joint.sampranges)
+		setup_buffers(mapmaker.dev, ginfo)
 	# Now loop over and map each of our group-groups
 	for pind in my_pinds:
 		pid     = pids[pind]
@@ -1282,8 +1279,8 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 	# actually more memory-efficient, as long as our estimate is
 	# good.
 	if prealloc and len(inds) > 0:
-		ntot_max = np.max(gutils.obs_group_size(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges))
-		setup_buffers(dev, ntot_max)
+		ginfo    = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
+		setup_buffers(dev, ginfo)
 	# Process our observations
 	for i, ind in enumerate(inds):
 		name   = joint.names[ind]
@@ -1443,31 +1440,64 @@ def distribute_tasks(obsinfo, joint, comm, taskdist=None):
 	inds = np.where(dist.owner == comm.rank)[0]
 	return inds
 
-def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
-	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case
-	ntot = ndet*nsamp.
-
-	Pre-allocation isn't really necessary,
-	but automatically growing the buffers has some overhead, and I've unexpectedly
-	run out of memory when not doing this. This should be investigated futher.
-
-	This function will need to be updated if which memory pools are used is changed."""
-	# These are the big ones
+def setup_buffers(dev, ginfo, demod=None, dtype=np.float32):
+	# Need to know if we're demodulating, since if affects buffer sizes
+	fhwp    = np.mean(np.abs(ginfo.fhwp))
+	has_hwp = fhwp > 0
+	demod   = gutils.check_demod(config.get("demodulate", demod), has_hwp)
 	ctype = utils.complex_dtype(dtype)
-	ftot = ntot//2 + ndet_guess
-	dev.pools["pointing"]   .empty((3, ntot), dtype=dtype)
-	dev.pools["tod"]        .empty(ntot, dtype=dtype)
-	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
-	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
-	dev.pools.reset()
-	# The remaining are:
-	# * plan
-	# * cut
-	# * sky_iwork
-	# * sky_owork
-	# * nmat_work
-	# We don't have good estimates for these, so we don't pre-allocate them.
-	# But they should be small
+	nsub  = np.max(ginfo.nsub)    # per-subid det count
+	nsamp = np.max(ginfo.nsamp)   # raw sample count
+	fsamp = np.mean(ginfo.fsamp)
+	# ndown is the post-demodulation sample count
+	if demod:
+		dmul  = 3
+		ndown = utils.ceil(nsamp*fhwp/fsamp)
+		ndet  = np.max(ginfo.ndet)*dmul
+	else:
+		dmul  = 1
+		ndown = nsamp
+		ndet  = np.max(ginfo.ndet)
+	nf    = nsamp//2+1
+	nfdown= ndown//2+1
+	# Pools for main analysis. These are not used for scratch during loading,
+	# except for the final load_multi
+	dev.pools["tod"].empty((ndet, ndown),  dtype=dtype)
+	dev.pools["pointing"].empty((3, ndet, ndown), dtype=dtype)
+	dev.pools["itod"].empty((nsub, nsamp), dtype=dtype)
+	if demod:
+		dev.pools["wtod"].empty((nsub,      nsamp), dtype=dtype)
+		dev.pools["dtod"].empty((nsub*dmul, ndown), dtype=dtype)
+	# Fourier transforms. ft will be used both for the full-res per-subid data
+	# and the potentiallyd emodulated full data
+	dev.pools["ft"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
+	dev.pools["fft_scratch"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
+
+#def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
+#	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case
+#	ntot = ndet*nsamp.
+#
+#	Pre-allocation isn't really necessary,
+#	but automatically growing the buffers has some overhead, and I've unexpectedly
+#	run out of memory when not doing this. This should be investigated futher.
+#
+#	This function will need to be updated if which memory pools are used is changed."""
+#	# These are the big ones
+#	ctype = utils.complex_dtype(dtype)
+#	ftot = ntot//2 + ndet_guess
+#	dev.pools["pointing"]   .empty((3, ntot), dtype=dtype)
+#	dev.pools["tod"]        .empty(ntot, dtype=dtype)
+#	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
+#	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
+#	dev.pools.reset()
+#	# The remaining are:
+#	# * plan
+#	# * cut
+#	# * sky_iwork
+#	# * sky_owork
+#	# * nmat_work
+#	# We don't have good estimates for these, so we don't pre-allocate them.
+#	# But they should be small
 
 def trivial_joint(obsids):
 	"""Make a group-info corresponding to a no grouping"""

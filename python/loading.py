@@ -21,19 +21,22 @@ from . import device
 # FIXME: SimpleLoader and SotodlibLoader are out of date.
 # Misisng new query system, load_multi and det-restriction
 
-def Loader(dbfile, type="auto", dev=None, mul=32):
+config.default("demodulate", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
+
+def Loader(dbfile, type="auto", dev=None, mul=32, demod=None):
+	demod = config.get("demodulate", demod)
 	if type == "auto":
 		if dbfile.endswith(".txt"): type = "simple"
 		else: type = "sofast"
 	if type == "simple":
 		from .loaders.simple import SimpleLoader
-		return SimpleLoader(dbfile, dev=dev, mul=mul)
+		return SimpleLoader(dbfile, dev=dev, mul=mul, demod=demod)
 	elif type == "sofast":
 		from .loaders.sofast import SoFastLoader
-		return SoFastLoader(dbfile, dev=dev, mul=mul)
+		return SoFastLoader(dbfile, dev=dev, mul=mul, demod=demod)
 	elif type == "soslow":
 		from .loaders.soslow import SotodlibLoader
-		return SotodlibLoader(dbfile, dev=dev, mul=mul)
+		return SotodlibLoader(dbfile, dev=dev, mul=mul, demod=demod)
 	else: raise ValueError("Unrecognized loader type '%s'" % str(type))
 
 def get_filelist(ifiles):

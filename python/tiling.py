@@ -216,6 +216,8 @@ class TileDistribution:
 	def dmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.dshape, dtype)
 	def wmap(self, dtype=np.float32, ncomp=3): return np.zeros(self.oshape, dtype)
 	def gwmap(self, buf=None, dtype=np.float32, reset=True):
+		from .logging import L
+		L.print("gwmap self.work.shape %s reset %d" % (str(self.work.shape), reset), level=3)
 		if buf: arr = buf.zeros(self.work.shape, dtype, reset=reset)
 		else:   arr = self.dev.np.zeros(self.work.shape, dtype)
 		return self.dev.lib.LocalMap(self.work.lp, arr)
@@ -431,10 +433,12 @@ def distribute_tods_ra(obsinfo, nsplit, verbose=False):
 	if nsplit == 1: return bunch.Bunch(owner=np.zeros(ntod,int), weight=np.ones(ntod))
 	if ntod <= nsplit: return bunch.Bunch(owner=np.arange(ntod), weight=np.ones(ntod))
 	ra     = np.mean(obsinfo.sweep[:,:,0],-1)
-	order  = np.argsort(ra)
 	weight = obsinfo.ndet*obsinfo.nsamp
-	cweight= np.cumsum(weight)
-	owner  = np.minimum(utils.floor(cweight*nsplit/cweight[-1]),nsplit-1)
+	# Hand out blocks in ra-sorted space
+	order  = np.argsort(ra)
+	cweight= np.cumsum(weight[order])
+	owner  = np.zeros(ntod,int)
+	owner[order] = np.minimum(utils.floor(cweight*nsplit/cweight[-1]),nsplit-1)
 	# If any ends up empty, just fall back to unweighted
 	nper   = np.bincount(owner, minlength=nsplit)
 	if np.any(nper==0):

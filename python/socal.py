@@ -234,6 +234,7 @@ def elmod_cal(obs, nel=2, natm=2, bsize=1000, tol=0.1, prefix=None, minamp=None,
 		fit = measure_el_response(obs, nel=nel, natm=natm, bsize=bsize, tol=tol, dev=dev)
 		if "clean" in tasks:
 			deproj_el_response(obs.tod, fit, dev=dev)
+			obs.cuts.gapfill(obs.tod, dev=dev)
 		if "cal" in tasks:
 			obs.tod *= dev.np.array(fit.gain)[:,None]
 		# Prefix required if dumping!

@@ -616,8 +616,10 @@ def make_sweep(ctime, baz0, waz, bel0, off, npoint=6, nocross=True):
 	cout = coordsys.transform("hor", "equ", coordsys.Coords(az=az.reshape(-1), el=el.reshape(-1)), ctime=ts.reshape(-1), site="so", weather="typical")
 	pos_equ = np.array([cout.ra, cout.dec]).T # [ntot,{ra,dec}]
 	sweep   = pos_equ.reshape(len(ctime),npoint,2)
-	# Make sure we don't have any sudden jumps in ra
-	sweep[:,:,0] = utils.unwind(sweep[:,:,0])
+	# Move all the sweeps to a compatible winding of the sky,
+	# and avoid angle cuts inside each sweep
+	sweep[:,0,0]  = utils.rewind_compact(sweep[:,0,0])
+	sweep[:,1:,0] = utils.rewind(sweep[:,1:,0]-sweep[:,0,None,0])+sweep[:,0,None,0]
 	return sweep
 
 def truncate_az_crossing(az1, az2):

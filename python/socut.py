@@ -74,8 +74,8 @@ class Simplecut:
 		dets, starts, lens = map(np.concatenate, [dets,starts,lens])
 		return Simplecut(dets, starts, lens, ndet=dcum, nsamp=cut.nsamp)
 	def resample(self, n):
-		starts = utils.floor(self.starts*n/self.nsamp)
-		ends   = utils.ceil ((self.starts+self.lens-1)*n/self.nsamp+1)
+		starts = utils.floor(self.starts.astype(np.int64)*n/self.nsamp).astype(np.int32)
+		ends   = utils.ceil (((self.starts.astype(np.int64)+self.lens-1)*n/self.nsamp+1).astype(np.int32))
 		ends   = np.minimum(ends, n)
 		lens   = ends-starts
 		return Simplecut(dets=self.dets, starts=starts, lens=lens, ndet=self.ndet, nsamp=n)
@@ -139,8 +139,8 @@ class Sampcut:
 	gapfilling, dejumping etc. are provided, but are implemented by
 	converting to Simplecut and then to Devicecut, so working direclty with
 	Devicecut is more efficient."""
-	def __init__(self, bins=None, ranges=None, nsamp=0):
-		if bins   is None: bins   = np.zeros((0,2),np.int32)
+	def __init__(self, bins=None, ranges=None, nsamp=0, ndet=0):
+		if bins   is None: bins   = np.zeros((ndet,2),np.int32)
 		if ranges is None: ranges = np.zeros((0,2),np.int32)
 		self.bins   = np.asarray(bins,   dtype=np.int32) # (ndet,  {from,to})
 		self.ranges = np.asarray(ranges, dtype=np.int32) # (nrange,{from,to})
@@ -342,7 +342,7 @@ def merge_sampcuts(cuts):
 	# where this is nonzero. We flatten franges because we will
 	# make a running tally of how many cut starts/ends we have encountred.
 	franges = np.concatenate(franges).reshape(-1)
-	if franges.size == 0: return Sampcut(nsamp=nsamp)
+	if franges.size == 0: return Sampcut(ndet=ndet, nsamp=nsamp)
 	# FIXME: Handle everything cut-case
 	vals    = np.zeros(franges.shape,np.int32)
 	vals[0::2] =  1
@@ -395,6 +395,6 @@ def _simplify_cuts(bins, ranges):
 				oranges.append(ranges[ri])
 		obins.append((o1,o2))
 		o1 = o2
-	obins = np.array(obins, np.int32).reshape((-1,2))
+	obins = np.array(obins, np.int32).reshape((len(bins),2))
 	oranges = np.array(oranges, np.int32).reshape((-1,2))
 	return obins, oranges

@@ -53,7 +53,7 @@ from .socommon import cmeta_lookup
 # loading. We won't always want to do demodulation, so 
 
 class SoFastLoader:
-	def __init__(self, context_or_config_or_name, dev=None, mul=32, demod="auto"):
+	def __init__(self, context_or_config_or_name, dev=None, mul=32):
 		self.context   = socommon.get_expanded_context(context_or_config_or_name)
 		self.obsdb     = sqlite.open(self.context["obsdb"])
 		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
@@ -63,13 +63,12 @@ class SoFastLoader:
 		self.fast_meta = FastMeta(self.context)
 		self.mul     = mul
 		self.dev     = dev or device.get_device()
-		self.demod   = demod
 		self.catch_list = (Exception,)
 		#self.catch_list = ()
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
-	def load(self, subid, catch="expected", dets=None, detids=None):
+	def load(self, subid, catch="expected", dets=None, detids=None, demod=None):
 		catch_list = catch2list(catch)
 		try:
 			with bench.mark("load_meta"):
@@ -82,8 +81,9 @@ class SoFastLoader:
 			# Calibrate the data
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
-			with bench.mark("load_demod"):
-				obs = socommon.demodulate(obs, dev=self.dev, mode=self.demod)
+			if demod is not None and demod.demod:
+				with bench.mark("load_demod"):
+					obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
 		except catch_list as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
@@ -94,7 +94,7 @@ class SoFastLoader:
 		# Record any non-fatal errors
 		obs.errors = []
 		return obs
-	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None):
+	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, demod=None):
 		"""Load multiple concurrent subids into a single obs"""
 		# FIXME: This is inefficient:
 		# * bands and dark detectors for the same wafer are stored in the same files,
@@ -133,8 +133,9 @@ class SoFastLoader:
 		if len(metas) == 0:
 			raise utils.DataMissing(format_multi_exception(exceptions, eids))
 		# Restrict them to a common sample range
-		sinfo = get_obs_sampinfo(self.obsdb.conn, mids)
-		ndet, nsamp = make_metas_compatible(metas, sinfo)
+		sinfo    = get_obs_sampinfo(self.obsdb.conn, mids)
+		ndet_raw = make_metas_compatible(metas, sinfo)[0]
+		ndet     = socommon.get_full_ndet(ndet_raw, demod=demod)
 		# Restrict to target sample range
 		if samprange is not None:
 			for meta in metas:
@@ -154,8 +155,9 @@ class SoFastLoader:
 				# This uses buffers "tod" and "ft"
 				with bench.mark("load_calib"):
 					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
-				with bench.mark("load_demod"):
-					obs = socommon.demodulate(obs, dev=self.dev, mode=self.demod)
+				if demod is not None and demod.demod:
+					with bench.mark("load_demod"):
+						obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
 				obs.subids = [subid]
 				obs.errors = []
 			except catch_list as e:
@@ -461,17 +463,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 				# LAT: corotator angle → roll
 				roll = -data.corot[i1:i2]*utils.degree + el - 60*utils.degree
 		with bench.mark("pointing correction"):
-			#i = 10000
-			#print("Model")
-			#for key in sorted(meta.pointing_model.keys()):
-			#	try: print(" %-20s %20.10e" % (key, meta.pointing_model[key]))
-			#	except TypeError: print(" %-20s %s" % (key, str(meta.pointing_model[key])))
-			#az0 = az[i]
-			#print("ctime %.4f" % ctime[i])
-			#print("Before  az %12.8f el %12.8f roll %12.8f" % (az[i]/utils.degree, el[i]/utils.degree, roll[i]/utils.degree))
 			az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
-			#print("After   az %12.8f el %12.8f roll %12.8f" % (utils.rewind(az[i],ref=az0)/utils.degree, el[i]/utils.degree, roll[i]/utils.degree))
-			#1/0
 
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
@@ -479,6 +471,14 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	with bench.mark("signal → float32", tfun=dev.time):
 		signal  = dev.pools["itod"].empty(signal.shape, np.float32)
 		signal[:] = signal_
+
+	#i = utils.find(meta.aman.det_ids, "Mv19_f150_Ar10c02A")
+	#print(i)
+	#moo = bunch.Bunch(tod=dev.get(signal[i]), dets=meta.aman.det_ids[i],
+	#	ctime=ctime, az=az, el=el, hwp=hwp_angle, abscal=meta.abscal_cmb,
+	#	phase_to_pW=meta.aman.phase_to_pW[i], relcal=meta.aman.relcal[i],
+	#	dac_to_phase=meta.dac_to_phase)
+	#bunch.write("test_raw.hdf", moo)
 
 	with bench.mark("calibrate", tfun=dev.time):
 		# Calibrate to CMB µK
@@ -534,13 +534,17 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 			tfact += 1
 			ftod  *= tfact
 			del tfact
+	# Measure our noise while we're in fourier space
+	with bench.mark("measure noise", tfun=dev.time):
+		rms = socommon.measure_rms_ft(ftod, dt=dt)
 	# Back to real space
+	print("FIXME sofast rms estimate")
 	with bench.mark("ifft", tfun=dev.time):
 		dev.lib.irfft(ftod, signal)
 
-	# Sanity checks
-	with bench.mark("measure noise", tfun=dev.time):
-		rms = socommon.measure_rms(signal, dt=dt)
+	## Sanity checks
+	#with bench.mark("measure noise", tfun=dev.time):
+	#	rms = socommon.measure_rms(signal, dt=dt)
 	with bench.mark("final detector prune", tfun=dev.time):
 		good    = socommon.sensitivity_cut(rms, meta.sens_lim)
 		nrms    = dev.np.sum(good)
@@ -1068,14 +1072,14 @@ def get_wafer_file(waferdb, wafer_name):
 def get_acalfile(indexdb):
 	return os.path.join(os.path.dirname(indexdb.fname),list(indexdb.execute("SELECT name FROM files INNER JOIN map ON files.id = map.file_id WHERE map.dataset = 'abscal'"))[0][0])
 
-def read_wiring_status(fname, parse=True):
+def read_wiring_status(fname, required=[]):
 	import fast_g3
 	for frame in fast_g3.get_header_frames(fname)["frames"]:
 		if frame["type"] == "wiring":
-			wiring = frame
-	status = wiring["fields"]["status"]
-	if parse:
-		status = yaml.safe_load(status)
+			status = frame["fields"]["status"]
+			status = yaml.safe_load(status)
+			if all([name in status for name in required]):
+				return status
 	return status
 
 class WiringCache:
@@ -1084,7 +1088,7 @@ class WiringCache:
 		self.fields = fields
 	def get(self, fname):
 		if fname not in self.cache:
-			status = read_wiring_status(fname)
+			status = read_wiring_status(fname, required=self.fields)
 			if self.fields is not None:
 				status = {field:status[field] for field in self.fields}
 			self.cache[fname] = status

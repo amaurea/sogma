@@ -1,6 +1,6 @@
 # Things used by both sofast and soslow
 import re, numpy as np, warnings, os, yaml, contextlib
-from pixell import utils, sqlite, bunch, config
+from pixell import utils, sqlite, bunch, config, fft
 from .. import device, gutils, socut
 from . import minisotodlib
 
@@ -162,6 +162,9 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 			elif tok in ["f030","f040"]: tok = tag_op(bandsel(tok, 'lf'),  op, noneg=not issub)
 			elif tok in ["f090","f150"]: tok = tag_op(bandsel(tok, 'mf'),  op, noneg=not issub)
 			elif tok in ["f220","f280"]: tok = tag_op(bandsel(tok, 'uhf'), op, noneg=not issub)
+			# Telescope
+			elif tok in ["lat", "satp1", "satp2", "satp3", "satp4", "satp5", "satp6"]:
+				tok = tag_op("(telescope = '%s')" % tok, op)
 			# Optics tube
 			elif tok in ["c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6"]:
 				tok = tag_op("(tube_slot = '%s')" % tok, op)
@@ -475,7 +478,7 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 	obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
 	obsinfo.roll  = info["roll_center"].astype(np.float64) * utils.degree
 	obsinfo.waz   = info["az_throw" ].astype(np.float64)*2 * utils.degree
-	if "hwp_freq_mean" in info: obsinfo.fhwp = info["hwp_freq_mean"]
+	if "hwp_freq_mean" in info.keys: obsinfo.fhwp = info["hwp_freq_mean"]
 
 	wafer_centers, obsinfo.r = wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
 	if sweeps:
@@ -570,7 +573,7 @@ def wafer_info_multi(tubes, wafers, missing="warn"):
 		rads[inds] = rad
 	return poss, rads
 
-def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=100):
+def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=10000):
 	ap  = device.anypy(rms_uKrts)
 	# First reject detectors with unreasonably low noise
 	good     = rms_uKrts >= sens_lim
@@ -583,6 +586,21 @@ def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=100):
 	good    &= rms_uKrts < ref/med_tol
 	return good
 
+# This one is not robust to bright signals like planets.
+# Trying to map a planet would see the detectors that see it
+# disqualified for being too noisy. The good thing about
+# this version is that it's robust to the hwp
+def measure_rms_ft(ftod, dt=1, fmin=30, fmax=100):
+	fnyq = 0.5/dt
+	imin = utils.ceil (ftod.shape[-1] * fmin/fnyq)
+	imax = utils.floor(ftod.shape[-1] * fmax/fnyq)
+	fsub = ftod[:,imin:imax]
+	rms  = np.std(fsub,-1)*(dt/fsub.shape[-1])**0.5 * ftod.shape[-1]
+	return rms
+
+# This one is robust to planets, but fails in the
+# presence of a hwp, since all the blocks would be
+# impacted.
 def measure_rms(tod, dt=1, bsize=32, nblock=10):
 	ap  = device.anypy(tod)
 	tod = tod[:,:tod.shape[1]//bsize*bsize]
@@ -962,11 +980,11 @@ def find_scanning(az, down=10, tol=0.01, pad=1):
 # For ndown, we would need to know how much downsampling there will be.
 # That depends on the hwp speed. Is this available in obsdb?
 
-def demodulate(data, frel=2, comps="TQU", mode="auto", mul=32, dev=None):
-	# Check if we should demodulate
-	has_hwp = "hwp" in data and data.hwp is not None
-	demod = gutils.check_demod(mode, has_hwp)
-	if not demod: return data
+def get_full_ndet(ndet, demod):
+	if demod.demod: return ndet*len(demod.comps)
+	else: return ndet
+
+def demodulate(data, frel=1, comps="TQU", mul=32, dev=None):
 	# Ok, if we get here, then we can demodulate
 	if dev is None: dev = device.get_device()
 	ncomp        = len(comps)
@@ -992,7 +1010,7 @@ def demodulate(data, frel=2, comps="TQU", mode="auto", mul=32, dev=None):
 	# Find our output number of samples. This is ideally determined by
 	# ofmax, but we are also restricted by fourier and mapmaking
 	# considerations via mul
-	ofmax   = frel*fhwp
+	ofmax   = float(frel*fhwp)
 	ifmax   = srate/2
 	onsamp  = fft.fft_len(utils.nint(intrunc*ofmax/ifmax/mul), factors=dev.lib.fft_factors)*mul
 	# Prepare our resampling. For the tod we use fft-resampling. For the others, we use
@@ -1004,23 +1022,30 @@ def demodulate(data, frel=2, comps="TQU", mode="auto", mul=32, dev=None):
 	# a T, Q and U-timestream from a single detector.
 	assert comps == "TQU" or comps == "QU"
 	detnames = []
+	detids   = []
 	modfuns  = []
 	if "T"  in comps:
-			detnames.append(np.char.add(data.dets, "_one"))
+			detnames.append(np.char.add(data.dets,   "_one"))
+			detids  .append(np.char.add(data.detids, "_one"))
 			modfuns .append(lambda x:dev.np.full_like(x, 0.5))
 	if "QU" in comps:
-			detnames.append(np.char.add(data.dets, "_cos"))
-			detnames.append(np.char.add(data.dets, "_sin"))
+			detnames.append(np.char.add(data.dets,   "_cos"))
+			detnames.append(np.char.add(data.dets,   "_sin"))
+			detids  .append(np.char.add(data.detids, "_cos"))
+			detids  .append(np.char.add(data.detids, "_sin"))
 			modfuns .append(dev.np.cos)
 			modfuns .append(dev.np.sin)
-	ndup  = len(modfuns)
-	odets = np.char.concatenate(detnames)
+	ndup    = len(modfuns)
+	odets   = np.concatenate(detnames)
+	odetids = np.concatenate(detids)
 	# Construct an output data with the given downsampling and detector duplication
 	odata = bunch.Bunch()
-	odata.dets  = odets
-	odata.ctime = linresamp(data.ctime[:intrunc])
-	odata.hwp   = None # already handled
+	odata.dets   = odets
+	odata.detids = odetids
+	odata.ctime  = linresamp(data.ctime[:intrunc])
+	odata.hwp    = None # already handled
 	odata.point_offset = utils.repeat(data.point_offset, ndup, axis=0)
+	odata.bands     = utils.repeat(data.bands, ndup)
 	odata.polangle  = np.zeros(   len(odets) , dtype) # filled below
 	odata.response  = np.zeros((2,len(odets)), dtype) # filled below
 	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
@@ -1028,30 +1053,29 @@ def demodulate(data, frel=2, comps="TQU", mode="auto", mul=32, dev=None):
 	odata.boresight[0] = linresamp(data.boresight[0,:intrunc]) # el
 	odata.boresight[2] = linresamp(data.boresight[2,:intrunc]) # roll
 	# Resample cuts, and duplicate them across the virtual detectors
-	recuts      = data.cuts[:,:intrunc].resample(onsamp).simplify()
+	recuts      = data.cuts.to_sampcut()[:,:intrunc].to_simple().resample(onsamp).simplify()
 	odata.cuts  = socut.Simplecut.detcat([recuts]*len(modfuns))
 	odata.tod   = dev.pools["dtod"].zeros((len(odets),onsamp), dtype) # filled below
-	work        = dev.pools["wtod"].zeros((ndet, intrunc), dtype)
 	# Ok, here comes the actual demodulation part
+	hwp = dev.np.array(data.hwp[:intrunc].astype(dtype))
 	for i, fun in enumerate(modfuns):
-		carrier = fun(4*data.hwp[:intrunc]).astype(dtype)
-		work[:] = data.tod[:,:intrunc]
+		carrier = fun(4*hwp)
+		work    = dev.pools["wtod"].array(data.tod[:,:intrunc])
 		# Modulate
 		work    *= carrier
-		gutils.deslope(work)
+		gutils.deslope(work, dev=dev, inplace=True)
 		# Fourier-truncate. This step actually performs the filtering/downsampling
 		# Sadly the ft must be contiguous, so we need a work buffer. We use our
 		# tod work buffer for this, since its info has been transferred to fourier
 		# space by then
-		ftod    = dev.pools["ft"].empty((ndet, intrun//2+1), ctype)
+		ftod    = dev.pools["ft"].empty((ndet, intrunc//2+1), ctype)
 		dev.lib.rfft(work, ftod)
-		ftod    = gutils.rewrite_contig(ftod[:,:onsamp//2+1], work)
+		ftod    = dev.pools["ft"].array(dev.pools["wtod"].array(ftod[:,:onsamp//2+1]))
 		ftod   *= 2/intrunc
 		# can finally transform back
 		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
-	# Should gapfill now that we've unwiggled. Don't need desloping
-	# since we're periodic by definition now
 	odata.cuts.gapfill(odata.tod, dev=dev)
+	gutils.deslope(odata.tod, dev=dev, inplace=True, w=100)
 	# T-detectors have response [1,0,0]
 	if comps == "TQU": odata.response[0,:ndet] = 1
 	elif comps != "QU": raise ValueError("Only comps='TQU' and comps='QU' supported")
@@ -1062,4 +1086,16 @@ def demodulate(data, frel=2, comps="TQU", mode="auto", mul=32, dev=None):
 	# Equivalent to (-(2*ang-pi/4)+pi/4)/2 = pi/4-ang
 	odata.polangle[-ndet:] = np.pi/4-data.polangle
 	odata.response[1,-2*ndet:] = 1
+	# Everything else will be simply copied over
+	for key in data:
+		if key not in odata:
+			odata[key] = data[key]
+
+	#i = utils.find(data.detids, "Mv19_f150_Ar10c02A")
+	#moo = bunch.Bunch(tod=dev.get(odata.tod[i::ndet]), dets=odetids[i::ndet], polangle=odata.polangle[i::ndet],
+	#	response=odata.response[:,i::ndet], offs=data.point_offset[:1], el=odata.boresight[0], az=odata.boresight[1],
+	#	ctime=odata.ctime)
+	#bunch.write("test_demod.hdf", moo)
+	#1/0
+
 	return odata

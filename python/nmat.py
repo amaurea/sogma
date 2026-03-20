@@ -929,7 +929,8 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 		#if budget_E < bsize: print(bi, bsize, budget_E)
 		# Measure as many amplitudes as we can afford
 		# C = VEV' => E = (V'V)"V'CV(V'V)"'. V ortho, so this is just E = V'CV
-		E     = ap.einsum("dm,de,em->m", V, cov, V)
+		# this version is much slower on the cpu
+		#E    = ap.einsum("dm,de,em->m", V, cov, V)
 		E     = np.diag(V.T.dot(cov).dot(V))
 		inds  = ap.argsort(E)[-budget_E:]
 		E, v  = E[inds], V[:,inds]

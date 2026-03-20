@@ -1,4 +1,4 @@
-import time, contextlib
+import time, contextlib, os, re
 import numpy as np
 from pixell import utils, colors, bunch, fft
 from . import device
@@ -183,14 +183,16 @@ def safe_invert_div(div, tol=1e-3):
 
 def safe_invert_prec(prec):
 	if   prec.ndim == 3: return safe_invert_ivar(prec)
+	if   prec.ndim == 4: return safe_invert_ivar(prec)
 	elif prec.ndim == 5: return safe_invert_div (prec)
-	else: raise ValueError("prec must be [ntile,ty,tx] (ivar form) or [ntile,3,3,ty,tx] (div form)")
+	else: raise ValueError("prec must be [ntile,ty,tx] (ivar form), [ntile,3,ty,tx] (diag form) or [ntile,3,3,ty,tx] (div form)")
 
 def apply_prec(prec, gmap):
 	ap = device.anypy(prec)
 	if   prec.ndim == 3: return prec[:,None]*gmap
+	elif prec.ndim == 4: return prec*gmap
 	elif prec.ndim == 5: return ap.einsum("tabyx,tbyx->tayx", prec, gmap)
-	else: raise ValueError("prec must be [ntile,ty,tx] (ivar form) or [ntile,3,3,ty,tx] (div form)")
+	else: raise ValueError("prec must be [ntile,ty,tx] (ivar form) or [ntile,3,ty,tx] (diag form) [ntile,3,3,ty,tx] (div form)")
 
 # Want something like DataSet or AxisManager that's low-overhead
 # while being able to wrap multiple types of data, ideally without
@@ -466,7 +468,8 @@ def obs_group_info(obsinfo, groups, inds=None, sampranges=None):
 	for key in info: info[key] = np.array(info[key])
 	info.dur = info.nsamp/info.fsamp
 	if sampranges is not None:
-		info.nsamp = np.minimum(info.nsamp, sampranges[1])-sampranges[0]
+		# Sampranges is [ngroup,{from,to}]
+		info.nsamp = np.minimum(info.nsamp, sampranges[inds,1])-sampranges[inds,0]
 	return info
 
 def obs_group_size(obsinfo, groups, inds=None, sampranges=None):
@@ -488,19 +491,24 @@ def obs_group_dur(obsinfo, groups, inds=None, sampranges=None):
 		durs  *= tfracs
 	return durs
 
-def time_split(obsinfo, joint, maxsize=None, maxdur=None):
+def time_split(joint, ginfo, demod=None, maxsize=None, maxdur=None):
 	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
 	into subranges so that the total ndet*nsamp size of each is no larger than
 	maxsize. This can be needed due to memory constraints."""
+	if demod is not None and demod.demod:
+		nsamps = utils.ceil(ginfo.nsamp*ginfo.fhwp/ginfo.fsamp)
+		ndets  = ginfo.ndet*len(demod.comps)
+	else:
+		nsamps = ginfo.nsamp
+		ndets  = ginfo.ndet
 	nsplits = np.ones(len(joint.groups), int)
 	if maxsize is not None:
 		# calculate the total size of each group
-		sizes  = obs_group_size(obsinfo, joint.groups, sampranges=joint.sampranges)
+		sizes = nsamps*ndets
 		# number of time splits for each
-		nsplits= np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
+		nsplits = np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
 	if maxdur is not None:
-		durs   = obs_group_dur(obsinfo, joint.groups, sampranges=joint.sampranges)
-		nsplits= np.maximum(nsplits, utils.floor(durs/maxdur)+1)
+		nsplits = np.maximum(nsplits, utils.floor(ginfo.dur/maxdur)+1)
 	# Do the split
 	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
 		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
@@ -508,7 +516,7 @@ def time_split(obsinfo, joint, maxsize=None, maxdur=None):
 		# Need the number of samples the group covers. Will assume good time alignment
 		if joint.sampranges is None:
 			i0    = 0
-			nsamp = np.max(obsinfo.nsamp[group])
+			nsamp = ginfo.nsamp[gi]
 		else:
 			i0    = joint.sampranges[gi,0]
 			nsamp = joint.sampranges[gi,1]-joint.sampranges[gi,0]
@@ -521,6 +529,44 @@ def time_split(obsinfo, joint, maxsize=None, maxdur=None):
 			ojoint.sampranges.append((i1,i2))
 	ojoint.sampranges = np.array(ojoint.sampranges)
 	return ojoint
+
+#def time_split(obsinfo, joint, maxsize=None, maxdur=None):
+#	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
+#	into subranges so that the total ndet*nsamp size of each is no larger than
+#	maxsize. This can be needed due to memory constraints."""
+#	nsplits = np.ones(len(joint.groups), int)
+#	ginfo   = obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
+#
+#
+#
+#	if maxsize is not None:
+#		# calculate the total size of each group
+#		sizes  = obs_group_size(obsinfo, joint.groups, sampranges=joint.sampranges)
+#		# number of time splits for each
+#		nsplits= np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
+#	if maxdur is not None:
+#		durs   = obs_group_dur(obsinfo, joint.groups, sampranges=joint.sampranges)
+#		nsplits= np.maximum(nsplits, utils.floor(durs/maxdur)+1)
+#	# Do the split
+#	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
+#		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
+#	for gi, (group, name, nsplit) in enumerate(zip(joint.groups, joint.names, nsplits)):
+#		# Need the number of samples the group covers. Will assume good time alignment
+#		if joint.sampranges is None:
+#			i0    = 0
+#			nsamp = np.max(obsinfo.nsamp[group])
+#		else:
+#			i0    = joint.sampranges[gi,0]
+#			nsamp = joint.sampranges[gi,1]-joint.sampranges[gi,0]
+#		for si in range(nsplit):
+#			i1 = i0 + si*nsamp//nsplit
+#			i2 = i0 + (si+1)*nsamp//nsplit
+#			oname = "%s:split%d" % (name,si)
+#			ojoint.groups.append(group)
+#			ojoint.names.append(oname)
+#			ojoint.sampranges.append((i1,i2))
+#	ojoint.sampranges = np.array(ojoint.sampranges)
+#	return ojoint
 
 def select_groups(joint, inds):
 	return bunch.Bunch(
@@ -765,14 +811,116 @@ def check_demod(demod="auto", has_hwp=False):
 	elif has_hwp: return True
 	else: raise ValueError("Asked to demodulate, but no hwp present")
 
-def rewrite_contig(arr, work):
-	"""Given a non-contiguous array arr and a scratch array work,
-	return a new version of arr that's contiguous, and uses the same
-	memory region as arr. The original contents of arr and work are
-	destroyed"""
-	ap     = device.anypy(arr)
-	tmp    = ap.ndarray(shape=arr.shape, dtype=arr.dtype, buffer=work)
-	tmp[:] = arr
-	oarr   = ap.ndarray(shape=arr.shape, dtype=arr.dtype, buffer=arr)
-	oarr[:]= arr
-	return oarr
+def estimate_leakage(fx, fy, leak0=0.01, verbose=False):
+	"""Given complex arrays fx and fy, estimate how much of fx has leaked
+	into fy using the last axis. This could be used to find the leakage of
+	a demodulated I-timestream into a Q-timestream, after fourier-
+	transforming them. To use only a given frequency range, just slice them.
+	Reterns an array leak with shape fx.shape[:-1].
+
+	Data must be on the cpu"""
+	import odrpack
+	dtype = np.float64
+	ctype = utils.complex_dtype(dtype)
+	fx    = np.ascontiguousarray(fx, dtype=ctype)
+	fy    = np.ascontiguousarray(fy, dtype=ctype)
+	def model(x, beta): return beta[0]*x
+	leak  = np.zeros(fx.shape[:-1], dtype)
+	for I in utils.nditer(fx.shape[:-1]):
+		if verbose: print("odf_fit", I)
+		leak[I] = odrpack.odr_fit(model, fx[I].view(dtype), fy[I].view(dtype), beta0=[leak0]).beta
+	return leak
+
+def merge_metadbs(ifnames, ofname, verbose=False):
+	from pixell import sqlite
+	# Prepare to write a new file db from scratch
+	utils.mkdir(os.path.dirname(ofname))
+	utils.rm(ofname)
+	npfile = 0
+	with sqlite.open(ofname) as ofile:
+		for fi, ifname in enumerate(ifnames):
+			if verbose: print(ifname)
+			idir = os.path.dirname(ifname)
+			with sqlite.open(ifname) as ifile:
+				with ofile.attach(ifile):
+					# Copy over table definitions from first
+					if fi == 0:
+						for name, sql in ofile.execute("select name, sql from other.sqlite_master where type = 'table' and name != 'sqlite_sequence'"):
+							if name == "map":
+								# Hack: remove unique requirement, as it is overly restrictive
+								sql = re.subn(r",UNIQUE\(.*?\)", "", sql)[0]
+							_ex(ofile, sql, verbose)
+						# Copy over the input scheme one, which should not append
+						_app(ofile, "input_scheme", verbose)
+					# Done with special treatment of first input.
+					# Now append data from all the other tables
+					# First the map. Here we just need to add to the file_id.
+					# I thought I could avoid mentioning the columns by name here,
+					# but that's not compatible with singling out an individual column
+					cols = ['[%s]' % col for col in ifile.columns("map") if col != "id"]
+					_ex(ofile, "insert into main.map (%s) select %s from other.map" % (
+						", ".join(cols),
+						", ".join([("%s+%d"%(col,npfile) if col == "[file_id]" else col) for col in cols])), verbose)
+					# Then the 'files' table, which needs to be translated to
+					# absolute paths
+					for i, (id, pfile) in enumerate(ofile.execute("select id, name from other.files")):
+						_ex(ofile, "insert into main.files (name) values ('%s')" % os.path.join(idir, pfile), verbose and i == 0)
+						if verbose and i == 1: print("...")
+						npfile += 1
+					_ex(ofile, "commit", verbose)
+
+def merge_obsdbs(ifnames, ofname, verbose=False):
+	from pixell import sqlite
+	# Prepare to write a new file db from scratch
+	utils.mkdir(os.path.dirname(ofname))
+	utils.rm(ofname)
+	with sqlite.open(ofname) as ofile:
+		for fi, ifname in enumerate(ifnames):
+			if verbose: print(ifname)
+			idir = os.path.dirname(ifname)
+			with sqlite.open(ifname) as ifile:
+				with ofile.attach(ifile):
+					# Copy over table definitions from first
+					if fi == 0:
+						for name, sql in ofile.execute("select name, sql from other.sqlite_master where type = 'table' and name != 'sqlite_sequence'"):
+							_ex(ofile, sql, verbose)
+					_app(ofile, "obs", verbose)
+					_app(ofile, "tags", verbose)
+					_ex(ofile, "commit", verbose)
+
+def merge_obsfiledbs(ifnames, ofname, verbose=False):
+	from pixell import sqlite
+	# Prepare to write a new file db from scratch
+	utils.mkdir(os.path.dirname(ofname))
+	utils.rm(ofname)
+	with sqlite.open(ofname) as ofile:
+		for fi, ifname in enumerate(ifnames):
+			if verbose: print(ifname)
+			idir = os.path.dirname(ifname)
+			with sqlite.open(ifname) as ifile:
+				with ofile.attach(ifile):
+					# Copy over table definitions from first
+					if fi == 0:
+						for name, sql in ofile.execute("select name, sql from other.sqlite_master where type = 'table' and name != 'sqlite_sequence'"):
+							_ex(ofile, sql, verbose)
+						# Copy over meta, which should not append
+						_app(ofile, "meta", verbose)
+					# Done with special treatment of first input.
+					# Now append data from all the other tables
+					_app(ofile, "detsets", verbose)
+					# Then the 'files' table, which needs to be translated to
+					# absolute paths
+					for i, (name, detset, obs_id, sample_start, sample_stop) in enumerate(ofile.execute("select name, detset, obs_id, sample_start, sample_stop from other.files")):
+						_ex(ofile, "insert into main.files (name, detset, obs_id, sample_start, sample_stop) values ('%s', '%s', '%s', %s, %s)" % (
+							os.path.join(idir, name), detset, obs_id, sample_start, sample_stop), verbose and i == 0)
+						if verbose and i == 1: print("...")
+					_ex(ofile, "commit", verbose)
+
+def _ex(s, cmd, verbose):
+	if verbose: print(cmd)
+	s.execute(cmd)
+
+def _app(s, table, verbose):
+	cols = ",".join(s.columns(table))
+	sql  = "insert into main.%s (%s) select %s from other.%s" % (table, cols, cols, table)
+	_ex(s, sql, verbose)

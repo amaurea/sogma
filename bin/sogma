@@ -82,7 +82,10 @@ detids = gutils.read_detnames(args.detids) if args.detids is not None else None
 # .bands[nband]      List of bands involved
 # .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
 joint   = loader.group_obs(obsinfo, mode=args.joint)
-joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
+ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
+demod   = mapmaking.demod_settings(ginfo)
+joint   = gutils.time_split(joint, ginfo, demod=demod, maxsize=args.split*1e9, maxdur=args.tsplit)
+#joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
 # group selection. Sadly this can't be done with the query-level selection, as that
 # happens before grouping.
 jinds   = eval("list(range(%d))[%s]" % (len(joint.groups),args.sel))

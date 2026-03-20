@@ -665,17 +665,17 @@ def point_hit(point, sweep, dur, r, pad=1.0*utils.degree):
 	was_hit[good] = ra_hit & dec_hit
 	return was_hit
 
-def gal_hit(sweep, dur, r, minlat=None, pad=1*utils.degree):
+def gal_hit(sweep, dur, r, latlim=None, pad=1*utils.degree):
 	# sweep[:,npoint,{ra,dec}]
-	if minlat is None: minlat = 5*utils.degree
+	if latlim is None: latlim = 5*utils.degree
 	from pixell import coordinates
 	speed= 15*utils.degree/utils.hour
 	ras, decs = sweep.T # [npoint,ntod]
 	icoord = np.array([[ras,ras+dur*speed],[decs,decs]]) # [{ra,dec},2,npoint,ntod]
 	lats   = coordinates.transform("equ", "gal", icoord)[1]
-	# We hit the galaxy if lats either crosses zero, or if min(abs(lat))+r+pad < minlat
+	# We hit the galaxy if lats either crosses zero, or if min(abs(lat))+r+pad < latlim
 	lat1,lat2 = utils.minmax(lats,(0,1))
-	hits = (lat1*lat2 < 0)|(np.min(np.abs(lats),(0,1))+r+pad < minlat)
+	hits = (lat1*lat2 < 0)|(np.min(np.abs(lats),(0,1))+r+pad < latlim)
 	return hits
 
 def poly_interpol(x, xp, yp):
@@ -704,7 +704,7 @@ def eval_pycode(pycode, obsinfo):
 		if isinstance(ra, str):
 			# Special case: 'gal'. The optional second argument gives the min
 			# galactic latitude
-			if ra == "gal": return gal_hit(obsinfo.sweep, obsinfo.dur, obsinfo.r, minlat=dec, pad=r*utils.degree)
+			if ra == "gal": return gal_hit(obsinfo.sweep, obsinfo.dur, obsinfo.r, latlim=dec, pad=r*utils.degree)
 			# For a planet name, we look up the planet position and continue on to the
 			# standard point hit
 			else: pos = planet_pos(ra, obsinfo)

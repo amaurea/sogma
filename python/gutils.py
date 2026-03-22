@@ -811,25 +811,35 @@ def check_demod(demod="auto", has_hwp=False):
 	elif has_hwp: return True
 	else: raise ValueError("Asked to demodulate, but no hwp present")
 
-def estimate_leakage(fx, fy, leak0=0.01, verbose=False):
-	"""Given complex arrays fx and fy, estimate how much of fx has leaked
-	into fy using the last axis. This could be used to find the leakage of
-	a demodulated I-timestream into a Q-timestream, after fourier-
-	transforming them. To use only a given frequency range, just slice them.
-	Reterns an array leak with shape fx.shape[:-1].
+def estimate_leakage(x, y, down=10, nblock=10):
+	"""Assuming x = signal+noise1, y = signal*a + noise2, estimate
+	a. The estimate is done along the last axis, so that a.shape = x.shape[:-1].
+	x and y must be on the cpu.
 
-	Data must be on the cpu"""
+	The estimate is done by downsampling the data by a factor down (effectively
+	acting as a low-pass filter), splitting it into nblock blocks, fitting
+	y = a*x+b for each block, and then taking the median of the blocks. The
+	median is less optimal than the mean, but is robust to bright signals and
+	glitches. Including the offset b in the model acts as a very mild high-pass
+	filter.
+
+	Returns fit[{a,b},...], where ... is x.shape[:-1].
+
+	ODR is relatively slow. For a typical demodulated timestream of 4k detectors
+	and 15k samples, this function should take around 8 s.
+	"""
 	import odrpack
-	dtype = np.float64
-	ctype = utils.complex_dtype(dtype)
-	fx    = np.ascontiguousarray(fx, dtype=ctype)
-	fy    = np.ascontiguousarray(fy, dtype=ctype)
-	def model(x, beta): return beta[0]*x
-	leak  = np.zeros(fx.shape[:-1], dtype)
-	for I in utils.nditer(fx.shape[:-1]):
-		if verbose: print("odf_fit", I)
-		leak[I] = odrpack.odr_fit(model, fx[I].view(dtype), fy[I].view(dtype), beta0=[leak0]).beta
-	return leak
+	xdown = utils.downgrade(x, down)
+	ydown = utils.downgrade(y, down)
+	bsize = xdown.shape[-1]//nblock
+	bx    = xdown[...,:bsize*nblock].reshape(xdown.shape[:-1]+(nblock,bsize))
+	by    = ydown[...,:bsize*nblock].reshape(ydown.shape[:-1]+(nblock,bsize))
+	def model(x, beta): return beta[0]*x+beta[1]
+	betas = np.zeros(bx.shape[:-1]+(2,), x.dtype)
+	for I in utils.nditer(bx.shape[:-1]):
+		betas[I,:] = odrpack.odr_fit(model, bx[I], by[I], beta0=[0.01,0]).beta
+	betas = np.moveaxis(np.median(betas,-2),-1,0) # now have [{a,b},...]
+	return betas
 
 def merge_metadbs(ifnames, ofname, verbose=False):
 	from pixell import sqlite

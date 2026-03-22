@@ -169,10 +169,11 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 			elif tok in ["c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6"]:
 				tok = tag_op("(tube_slot = '%s')" % tok, op)
 			# Pseudo-tags
-			elif tok == "obs": tok = tag_op("(type='obs')", op)
-			elif tok == "cmb": tok = tag_op("(type='obs' and subtype='cmb')", op)
+			elif tok == "obs":   tok = tag_op("(type='obs')", op)
+			elif tok == "cmb":   tok = tag_op("(type='obs' and subtype='cmb')", op)
 			elif tok == "night": tok = tag_op("(mod(timestamp/3600,24) not between 11 and 23)", op)
-			elif tok == "day": tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
+			elif tok == "day":   tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
+			elif tok == "spin":  tok = tag_op("(hwp_freq_mean!=0)", op)
 			elif tok.upper() in ["DARK","OPTC"]:
 				if "det_type" in cols: tok = tag_op("(det_type = '%s')" % tok.upper(), op)
 				else:                  tok = "1"

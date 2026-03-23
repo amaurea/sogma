@@ -534,17 +534,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 			tfact += 1
 			ftod  *= tfact
 			del tfact
-	# Measure our noise while we're in fourier space
-	with bench.mark("measure noise", tfun=dev.time):
-		rms = socommon.measure_rms_ft(ftod, dt=dt)
 	# Back to real space
-	print("FIXME sofast rms estimate")
 	with bench.mark("ifft", tfun=dev.time):
 		dev.lib.irfft(ftod, signal)
 
-	## Sanity checks
-	#with bench.mark("measure noise", tfun=dev.time):
-	#	rms = socommon.measure_rms(signal, dt=dt)
+	# Sanity checks
+	with bench.mark("measure noise", tfun=dev.time):
+		rms = socommon.measure_rms_der(signal, dt=dt)
 	with bench.mark("final detector prune", tfun=dev.time):
 		good    = socommon.sensitivity_cut(rms, meta.sens_lim)
 		nrms    = dev.np.sum(good)

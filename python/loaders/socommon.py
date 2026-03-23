@@ -587,6 +587,27 @@ def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=10000):
 	good    &= rms_uKrts < ref/med_tol
 	return good
 
+# This one is robust to planets, but fails in the
+# presence of a hwp, since all the blocks would be
+# impacted.
+_rms_der_norm = [1,2,6,20,70,252]
+def measure_rms_der(tod, dt=1, nder=3, bsize=32, nblock=10):
+	ap  = device.anypy(tod)
+	tod = tod[:,:tod.shape[1]//bsize*bsize]
+	tod = tod.reshape(tod.shape[0],-1,bsize)
+	bstep = max(1,tod.shape[1]//nblock)
+	tod = tod[:,::bstep,:][:,:nblock,:]
+	# Take the nder'th derivative, to effectively highpass filter.
+	# This will put our focus on only the highest freqs, which may not
+	# be representative of the practical white noise floor, but it will
+	# make us robust to any hwp
+	tod  = ap.diff(tod, n=nder, axis=-1)
+	rms  = ap.median(ap.std(tod,-1),-1)
+	rms /= _rms_der_norm[nder]**0.5
+	# to µK√s units
+	rms *= dt**0.5
+	return rms
+
 # This one is not robust to bright signals like planets.
 # Trying to map a planet would see the detectors that see it
 # disqualified for being too noisy. The good thing about
@@ -1026,14 +1047,14 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None):
 	detids   = []
 	modfuns  = []
 	if "T"  in comps:
-			detnames.append(np.char.add(data.dets,   "_one"))
-			detids  .append(np.char.add(data.detids, "_one"))
+			detnames.append(np.char.add(data.dets,   "_0"))
+			detids  .append(np.char.add(data.detids, "_0"))
 			modfuns .append(lambda x:dev.np.full_like(x, 0.5))
 	if "QU" in comps:
-			detnames.append(np.char.add(data.dets,   "_cos"))
-			detnames.append(np.char.add(data.dets,   "_sin"))
-			detids  .append(np.char.add(data.detids, "_cos"))
-			detids  .append(np.char.add(data.detids, "_sin"))
+			detnames.append(np.char.add(data.dets,   "_1"))
+			detnames.append(np.char.add(data.dets,   "_2"))
+			detids  .append(np.char.add(data.detids, "_1"))
+			detids  .append(np.char.add(data.detids, "_2"))
 			modfuns .append(dev.np.cos)
 			modfuns .append(dev.np.sin)
 	ndup    = len(modfuns)

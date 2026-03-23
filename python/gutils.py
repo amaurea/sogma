@@ -811,7 +811,7 @@ def check_demod(demod="auto", has_hwp=False):
 	elif has_hwp: return True
 	else: raise ValueError("Asked to demodulate, but no hwp present")
 
-def estimate_leakage(x, y, down=10, nblock=10):
+def estimate_leakage(x, y, down=10, nblock=10, verbose=False):
 	"""Assuming x = signal+noise1, y = signal*a + noise2, estimate
 	a. The estimate is done along the last axis, so that a.shape = x.shape[:-1].
 	x and y must be on the cpu.
@@ -837,11 +837,17 @@ def estimate_leakage(x, y, down=10, nblock=10):
 	def model(x, beta): return beta[0]*x+beta[1]
 	betas = np.zeros(bx.shape[:-1]+(2,), x.dtype)
 	for I in utils.nditer(bx.shape[:-1]):
-		betas[I,:] = odrpack.odr_fit(model, bx[I], by[I], beta0=[0.01,0]).beta
+		if verbose: print(I)
+		betas[I] = odrpack.odr_fit(model, bx[I], by[I], beta0=[0.01,0]).beta
 	betas = np.moveaxis(np.median(betas,-2),-1,0) # now have [{a,b},...]
 	return betas
 
 def merge_metadbs(ifnames, ofname, verbose=False):
+	"""Warning: This function doesn't work correctly with databases that
+	use detector-independent selectors in .map, such as relcal which only
+	uses time-ranges. In that case, the lookup code won't know which of
+	the resulting overlapping time-ranges to use. Fixing this would require
+	changing the map logic and the sofast read-in code"""
 	from pixell import sqlite
 	# Prepare to write a new file db from scratch
 	utils.mkdir(os.path.dirname(ofname))

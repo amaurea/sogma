@@ -1441,7 +1441,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (name, t3-t1, t2-t1, t3-t2), level=2)
 
 class SimpleLoader:
-	def __init__(self):
+	def __init__(self, fname_fun=None, empty_fun=None):
 		#!/usr/bin/env -S python -u
 		# Must import before ArgumentParser is initialized to import args from config
 		import numpy as np, os, time, sys
@@ -1467,8 +1467,11 @@ class SimpleLoader:
 		parser.add_argument(      "--sel",     type=str, default=":")
 		parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
 		parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
+		parser.add_argument("-c", "--cont",    action="store_true")
 		self.parser = parser
 		self.comm   = mpi.COMM_WORLD
+		self.fname_fun = fname_fun
+		self.empty_fun = empty_fun
 	def add_argument(self, *args, **kwargs):
 		self.parser.add_argument(*args, **kwargs)
 	def init(self):
@@ -1535,8 +1538,11 @@ class SimpleLoader:
 		subids = self.obsinfo.id[self.joint.groups[ind]]
 		subpre = self.prefix + name.replace(":","_") + "_"
 		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, demod=self.demod)
-	def obs_iter(self, inds=None):
+	def obs_iter(self, inds=None, fname_fun=None, empty_fun=None):
 		from . import tiling
+		if fname_fun is None: fname_fun = self.fname_fun
+		if empty_fun is None: empty_fun = self.empty_fun
+		if empty_fun is None: empty_fun = lambda self,name: fname_fun(self,name).replace(".txt", ".empty")
 		if inds is None:
 			# Use the first entry in groups as representative
 			gfirst = np.array([g[0] for g in self.joint.groups])
@@ -1544,10 +1550,14 @@ class SimpleLoader:
 			inds = np.where(dist.owner == self.comm.rank)[0]
 		for ind in inds:
 			name = self.joint.names[ind]
+			if self.args.cont and fname_fun and (os.path.isfile(fname_fun(self, name)) or os.path.isfile(empty_fun(self, name))):
+				L.print("Skipped %s: done" % (name), level=2, color=colors.gray)
+				continue
 			try:
 				obs = self.get_obs(ind)
 				yield bunch.Bunch(obs=obs, ind=ind, name=name)
 			except self.etypes as e:
+				if empty_fun: utils.touch(empty_fun(self, name))
 				L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 
 def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,

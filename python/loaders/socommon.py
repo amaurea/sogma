@@ -889,6 +889,10 @@ def group_obs(obsinfo, mode="wafer"):
 		# but keep the tubes separate
 		key = np.char.partition(obsinfo.id, ":")[:,0]
 		groups, names = _group_obs_simple(key)
+	elif mode == "oband":
+		# Group by obs-band
+		key = astr_tok_inds(obsinfo.id, ":", [0, 2])
+		groups, names = _group_obs_simple(key)
 	elif mode == "wafer":
 		key = astr_tok_range(obsinfo.id, ":", 0, 2)
 		groups, names = _group_obs_simple(key)
@@ -909,6 +913,14 @@ def group_obs(obsinfo, mode="wafer"):
 		bands=full_bands[~is_null], nullbands=full_bands[is_null],
 		joint=mode!="none", sampranges=None)
 	return joint
+
+def astr_tok_inds(astr, sep, inds):
+	# np.char lacks substr, so just loop
+	res = []
+	for word in astr:
+		toks = word.split(sep)
+		res.append(sep.join([toks[i] for i in inds]))
+	return np.array(res)
 
 def astr_tok_range(astr, sep, start, end):
 	# np.char lacks substr, so just loop

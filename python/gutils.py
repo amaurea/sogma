@@ -507,6 +507,7 @@ def time_split(joint, ginfo, demod=None, maxsize=None, maxdur=None):
 		sizes = nsamps*ndets
 		# number of time splits for each
 		nsplits = np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
+		print(nsplits)
 	if maxdur is not None:
 		nsplits = np.maximum(nsplits, utils.floor(ginfo.dur/maxdur)+1)
 	# Do the split

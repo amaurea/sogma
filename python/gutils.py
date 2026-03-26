@@ -9,6 +9,10 @@ class RecoverableError(Exception): pass
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 
+def blockify(tod, bsize=10):
+	nblock = tod.shape[-1]//bsize
+	return tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))
+
 def apply_window(tod, nsamp, exp=1):
 	"""Apply a cosine taper to each end of the TOD."""
 	if nsamp <= 0: return
@@ -812,7 +816,7 @@ def check_demod(demod="auto", has_hwp=False):
 	elif has_hwp: return True
 	else: raise ValueError("Asked to demodulate, but no hwp present")
 
-def estimate_leakage(x, y, down=10, nblock=10, verbose=False):
+def estimate_leakage_odr(x, y, down=10, bsize=700):
 	"""Assuming x = signal+noise1, y = signal*a + noise2, estimate
 	a. The estimate is done along the last axis, so that a.shape = x.shape[:-1].
 	x and y must be on the cpu.
@@ -830,18 +834,124 @@ def estimate_leakage(x, y, down=10, nblock=10, verbose=False):
 	and 15k samples, this function should take around 8 s.
 	"""
 	import odrpack
-	xdown = utils.downgrade(x, down)
-	ydown = utils.downgrade(y, down)
-	bsize = xdown.shape[-1]//nblock
+	bsize = bsize // down
+	xdown = downgrade(x, down)
+	ydown = downgrade(y, down)
+	nblock= xdown.shape[-1]//bsize
 	bx    = xdown[...,:bsize*nblock].reshape(xdown.shape[:-1]+(nblock,bsize))
 	by    = ydown[...,:bsize*nblock].reshape(ydown.shape[:-1]+(nblock,bsize))
 	def model(x, beta): return beta[0]*x+beta[1]
-	betas = np.zeros(bx.shape[:-1]+(2,), x.dtype)
+	fit  = np.zeros(bx.shape[:-1]+(2,), x.dtype)
+	dfit = fit*0
 	for I in utils.nditer(bx.shape[:-1]):
-		if verbose: print(I)
-		betas[I] = odrpack.odr_fit(model, bx[I], by[I], beta0=[0.01,0]).beta
-	betas = np.moveaxis(np.median(betas,-2),-1,0) # now have [{a,b},...]
+		sol       = odrpack.odr_fit(model, bx[I], by[I], beta0=[0.01,0])
+		fit [I,:] = sol.beta
+		dfit[I,:] = sol.sd_beta
+	fit   = np.moveaxis(np.median(fit, -2),-1,0) # now have [{a,b},...]
+	dfit  = np.moveaxis(np.median(dfit,-2),-1,0) # now have [{a,b},...]
+	dfit /= nblock**0.5
 	return betas
+
+def estimate_leakage_gibbs(x, y, nsamp=30, nburn=5, bsize=700, down=10, nmode=1):
+	"""Assuming x = signal+xnoise, y = signal*a + ynoise, estimate
+	a. The estimate is done along the last axis, so that a.shape = x.shape[:-1].
+	x and y must be on the cpu.
+
+	The estimate is done by downsampling the data by a factor down (effectively
+	acting as a low-pass filter), splitting it into blocks of size bsize, fitting
+	y = a*x+b+c*slope+... for each block, and then taking the median of the blocks. The
+	median is less optimal than the mean, but is robust to bright signals and
+	glitches. The parameter nmode controls how many extra degrees of freedom are
+	included. With nmode = 1, you get the per-block offset b. Higher values add
+	a slope and then higher polynomials. These effectively act as a high-pass filter
+	that becomes stricter the more modes are included.
+
+	Returns fit, dfit, where each has shape [{leak,off,...},...] where ... is
+	x.shape[:-1]. fit is the posterior mean, while dfit is its uncertainty.
+
+	fit[0], dfit[0] correspond to the actual leakage estimate. The other
+	values, fit[1:], dfit[1:] are the nmode polynomial nuisance parameters.
+	"""
+	bsize   = bsize // down
+	bx      = downgrade(x, down)
+	by      = downgrade(y, down)
+	sampler = LeakSampler(bx, by, nmode=nmode)
+	leak    = np.zeros((nsamp,sampler.na)+sampler.x.shape[:-1], sampler.x.dtype)
+	# First get rid of the burning
+	for i in range(nburn):
+		sampler.draw()
+	# Then draw our samples
+	for i in range(nsamp):
+		sampler.draw()
+		leak[i] = np.moveaxis(sampler.a,-1,0)
+	leak  = np.median(leak, -1)
+	dleak = np.std (leak,0)
+	mleak = np.mean(leak,0)
+	return mleak, dleak
+
+class LeakSampler:
+	def __init__(self, x, y, nmode=1, ivx0=None, ivy0=None, a0=None):
+		self.x     = np.asarray(x)
+		self.y     = np.asarray(y)
+		self.pre   = self.x.shape[:-1]
+		self.nsamp = self.x.shape[-1]
+		self.na    = 1+nmode
+		# y [pre,nsamp]
+		# a [pre,na]
+		# Q [pre,nsamp,na]
+		self.B = utils.build_legendre(np.linspace(-1,1,self.nsamp,dtype=x.dtype), nmode).T
+		self.Q = np.zeros(self.pre+(self.nsamp,self.na))
+		self.Q[...,1:] = self.B
+		if a0   is None: a0   = np.zeros(self.y.shape[:-1]+self.Q.shape[-1:])
+		if ivx0 is None: ivx0 = 1/np.var(self.x,-1)
+		if ivy0 is None: ivy0 = 1/np.var(self.y,-1)
+		self.a   = a0
+		self.ivx = ivx0 # [pre]
+		self.ivy = ivy0 # [pre]
+		self.set_s(x*0.1)
+	def set_s(self, s):
+		self.s = s
+		self.Q[...,0] = s
+	def model_y(self, s=None, a=None):
+		if s is None: s = self.s
+		if a is None: a = self.a
+		return np.einsum("...sa,...a->...s", self.Q, a)
+	def draw_v(self):
+		nx = self.x - self.s
+		ny = self.y - self.model_y()
+		self.ivx = 1/sample_var(nx)
+		self.ivy = 1/sample_var(ny)
+	def draw_a(self):
+		# (Q'N"Q)"Q'N"y. But since N" = ivy = const per pre, it factorizes out
+		rhs = np.einsum("...sa,...s->...a",self.Q,self.y)
+		div = np.einsum("...sa,...sb->...ab", self.Q, self.Q)
+		A   = np.linalg.inv(div)
+		hA  = np.linalg.cholesky(A)
+		a0  = np.einsum("...ab,...b->...a", A, rhs)
+		a   = a0 + np.einsum("...ab,...b->...a", hA, np.random.randn(*a0.shape).astype(a0.dtype, copy=False))
+		self.a = a
+	def draw_s(self):
+		vs  = (self.ivx + self.ivy*self.a[...,0]**2)**-1 # [pre]
+		# ry = y - non-s-dependent parts of the model. So basically deoffset y
+		ry  = self.y - np.einsum("...sa,...a->...s", self.Q[...,1:], self.a[...,1:]) # [pre,nsamp]
+		s0  = (self.x*self.ivx[...,None] + self.a[...,0,None]*ry*self.ivy[...,None])*vs[...,None]
+		self.set_s(s0 + vs[...,None]**0.5*np.random.randn(*s0.shape).astype(s0.dtype, copy=False))
+	def calc_chisq(self):
+		chisq  = np.sum((self.x-self.s)**2*self.ivx[...,None])
+		ry     = self.y - np.einsum("...sa,...a->...s", self.Q[...,1:], self.a[...,1:]) # [pre,nsamp]
+		chisq += np.sum(ry**2*self.ivy[...,None])
+		chisq /= self.y.size + self.x.size
+		return chisq
+	def draw(self):
+		self.draw_v()
+		self.draw_a()
+		self.draw_s()
+
+def sample_var(samps):
+	from scipy import stats
+	vemp = np.var(samps,-1)
+	nsamp= samps.shape[-1]
+	return stats.invgamma(a=nsamp/2, scale=nsamp*vemp/2).rvs()
 
 def merge_metadbs(ifnames, ofname, verbose=False):
 	"""Warning: This function doesn't work correctly with databases that

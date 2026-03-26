@@ -1061,6 +1061,7 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None):
 	if "T"  in comps:
 			detnames.append(np.char.add(data.dets,   "_0"))
 			detids  .append(np.char.add(data.detids, "_0"))
+			# 0.5 compensates for the multiplication by 2 later
 			modfuns .append(lambda x:dev.np.full_like(x, 0.5))
 	if "QU" in comps:
 			detnames.append(np.char.add(data.dets,   "_1"))

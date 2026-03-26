@@ -13,6 +13,7 @@ def apply_window(tod, nsamp, exp=1):
 	"""Apply a cosine taper to each end of the TOD."""
 	if nsamp <= 0: return
 	ap = device.anypy(tod)
+	nsamp   = min(nsamp, tod.shape[-1]//2)
 	taper   = 0.5*(1-ap.cos(ap.arange(1,nsamp+1)*ap.pi/nsamp))
 	taper **= exp
 	tod[...,:nsamp]  *= taper
@@ -507,7 +508,6 @@ def time_split(joint, ginfo, demod=None, maxsize=None, maxdur=None):
 		sizes = nsamps*ndets
 		# number of time splits for each
 		nsplits = np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
-		print(nsplits)
 	if maxdur is not None:
 		nsplits = np.maximum(nsplits, utils.floor(ginfo.dur/maxdur)+1)
 	# Do the split

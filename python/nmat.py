@@ -21,7 +21,7 @@ class Nmat:
 		"""Multiply the time-ordered data tod[ndet,nsamp] by the inverse noise covariance matrix.
 		This is done in-pace, but the result is also returned."""
 		return tod.copy()
-	def white(self, tod):
+	def white(self, tod, nwin=None):
 		"""Like apply, but without detector or time correlations"""
 		return tod.copy()
 	def write(self, fname):
@@ -41,7 +41,7 @@ class NmatNull(Nmat):
 		if not inplace: tod = tod.copy()
 		tod[:] = 0
 		return tod
-	def white(self, tod, inplace=True):
+	def white(self, tod, inplace=True, nwin=None):
 		return self.apply(tod, inplace=inplace)
 
 class NmatDebug(Nmat):
@@ -73,7 +73,7 @@ class NmatDebug(Nmat):
 		ft *= self.profile
 		self.dev.lib.irfft(ft, tod)
 		return tod
-	def white(self, tod, inplace=True):
+	def white(self, tod, inplace=True, nwin=None):
 		if not inplace: tod = tod.copy()
 		tod *= self.ivar[:,None]
 		return tod
@@ -130,12 +130,13 @@ class NmatUncorr(Nmat):
 			ftod[:,b[0]:b[1]] *= (self.ips_binned[:,None,bi])**exp/nsamp
 		# I divided by the normalization above instead of passing normalize=True
 		# here to reduce the number of operations needed
-	def white(self, tod, inplace=True):
+	def white(self, tod, inplace=True, nwin=None):
 		self.check_ready()
 		if not inplace: tod = tod.copy()
-		gutils.apply_window(tod, self.nwin)
+		if nwin is None: nwin = self.nwin
+		gutils.apply_window(tod, nwin)
 		tod *= self.ivar[:,None]
-		gutils.apply_window(tod, self.nwin)
+		gutils.apply_window(tod, nwin)
 		return tod
 	def write(self, fname):
 		self.check_ready()
@@ -163,14 +164,15 @@ class NmatWhite(Nmat):
 		with utils.nowarn():
 			ivar = utils.without_nan(1/var)
 		return NmatWhite(ivar=ivar, bsize=self.bsize, nwin=self.nwin, dev=self.dev)
-	def apply(self, gtod, inplace=True):
+	def apply(self, gtod, inplace=True, nwin=None):
 		self.check_ready()
 		if not inplace: gtod.copy()
-		gutils.apply_window(gtod, self.nwin)
+		if nwin is None: nwin = self.nwin
+		gutils.apply_window(gtod, nwin)
 		gtod *= self.ivar[:,None]
-		gutils.apply_window(gtod, self.nwin)
+		gutils.apply_window(gtod, nwin)
 		return gtod
-	def white(self, tod, inplace=True): return self.apply(tod, inplace=inplace)
+	def white(self, tod, inplace=True, nwin=None): return self.apply(tod, inplace=inplace, nwin=nwin)
 	def write(self, fname):
 		bunch.write(fname, bunch.Bunch(type="NmatWhite", bsize=self.bsize, nwin=self.nwin, ivar=self.dev.get(self.ivar)))
 	@staticmethod
@@ -291,12 +293,13 @@ class NmatDetvecs(Nmat):
 		t6 =self.dev.time()
 		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
 		return gtod
-	def white(self, gtod, inplace=True):
+	def white(self, gtod, inplace=True, nwin=None):
 		self.check_ready()
 		if not inplace: gtod.copy()
-		gutils.apply_window(gtod, self.nwin)
+		if nwin is None: nwin = self.nwin
+		gutils.apply_window(gtod, nwin)
 		gtod *= self.ivar[:,None]
-		gutils.apply_window(gtod, self.nwin)
+		gutils.apply_window(gtod, nwin)
 		return gtod
 	def write(self, fname):
 		data = bunch.Bunch(type="NmatDetvecs")
@@ -522,12 +525,13 @@ class NmatAdaptive(Nmat):
 		t8 =self.dev.time()
 		L.print("iN sub win %6.4f fft %6.4f s1 %6.4f mats %6.4f s2 %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5,t7-t6,t8-t7, tod.shape[0], tod.shape[1], maxnmode, len(self.bins)), level=3)
 		return tod
-	def white(self, gtod, inplace=True):
+	def white(self, gtod, inplace=True, nwin=None):
 		self.check_ready()
 		if not inplace: gtod.copy()
-		gutils.apply_window(gtod, self.nwin)
+		if nwin is None: nwin = self.nwin
+		gutils.apply_window(gtod, nwin)
 		gtod *= self.ivar[:,None]
-		gutils.apply_window(gtod, self.nwin)
+		gutils.apply_window(gtod, nwin)
 		return gtod
 	# Debug functions below. These are not part of the
 	# Nmat interface.
@@ -665,7 +669,7 @@ class PseudoNmatGapfill(Nmat):
 		# subtract prediction from tod to clean the atmosphere
 		tod -= model
 		return tod
-	def white(self, tod, inplace=True):
+	def white(self, tod, inplace=True, nwin=None):
 		# This is the only part of this "Nmat" that actually acts as a noise matrix
 		self.check_ready()
 		if not inplace: gtod.copy()

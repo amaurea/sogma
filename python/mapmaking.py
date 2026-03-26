@@ -397,7 +397,8 @@ class SignalMap(Signal):
 			ndet, nsamp = len(pmap.polang), len(pmap.ctime)
 			t1  = time.time()
 			tod = self.dev.pools["tod"].full((ndet,nsamp), 1, d.tod_dtype)
-			d.iN.white(tod)
+			# override windowing, since we're downsampled
+			d.iN.white(tod, nwin=0)
 			d.pcut.clear(tod)
 			pmap.backward(tod, dxlink)
 			t2  = time.time()

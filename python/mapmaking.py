@@ -265,7 +265,7 @@ class SignalMap(Signal):
 		self.comm  = comm
 		self.autocrop = autocrop
 		if precon not in ["ivar", "diag", "div", "flat"]:
-			raise ValueError("precon must be 'ivar', 'diag', 'div' or 'flat'")
+			raise ValueError("precon must be 'ivar', 'diag', 'div' or 'flat', but got '%s'" % str(precon))
 		self.prec_mode = precon
 		self.dev   = dev or device.get_device()
 		# Set up our internal tiling
@@ -295,9 +295,9 @@ class SignalMap(Signal):
 				delattr(self, name)
 	def new(self): return SignalMap(self.shape, self.wcs, self.comm,
 			dev=self.dev, name=self.name, ofmt=self.ofmt, outputs=self.outputs,
-			precon=self.precon, ext=self.ext, dtype=self.dtype, ibuf=self.ibuf,
+			precon=self.prec_mode, ext=self.ext, dtype=self.dtype, ibuf=self.ibuf,
 			obuf=self.obuf, sys=self.sys, interpol=self.interpol, autocrop=self.autocrop,
-			ocomps=ocomps)
+			ocomps=self.ocomps)
 	def add_obs(self, id, obs, iN, iNd, pmap=None, pcut=None):
 		"""Add and process an observation, building the pointing matrix
 		and our part of the RHS. "obs" should be an Observation axis manager,
@@ -926,6 +926,8 @@ class SignalElMod(Signal):
 # Requries no changes to Mapmaker, make_map, etc.
 # Slightly hacky since it would have no degrees of freedom though.
 class SignalInfo(Signal):
+	info_dtype = [("id","S40"),("band","S4"),("ctime","d"),("dur","d"),("az","d"),
+		("waz","d"),("el","d"),("wel","d"),("roll","d"),("wroll","d"),("sens","d")]
 	def __init__(self, comm, dev=None):
 		Signal.__init__(self, name="info", ofmt="{name}", outputs=["info"], ext="hdf")
 		self.comm  = comm
@@ -956,99 +958,43 @@ class SignalInfo(Signal):
 			el   = np.pi-el
 			az   = utils.rewind(az+np.pi)
 			roll = utils.rewind(roll+np.pi)
-		# Detector info
-		dsens = (iN.ivar*srate)**-0.5
-		# Center and radius per band
-		self.info.append(bunch.Bunch(
-			id=id, ctime=ctime, dur=dur, az=az, waz=waz, el=el, wel=wel, roll=roll, wroll=wroll,
-			dsens=dsens, dets=obs.dets, detids=obs.detids, bands=obs.bands,
-			offs=obs.point_offset))
+		# Only track per-band sensitivity for now, until I design a system
+		# that doesn't overflow the 4 giga-element mpi communication buffer
+		# when reducing
+		ubands, binds = np.unique(obs.bands, return_inverse=True)
+		bivar = np.bincount(binds, self.dev.get(iN.ivar*srate))
+		for bi, band in enumerate(ubands):
+			row = np.zeros(1, self.info_dtype).view(np.recarray)
+			row.id,    row.band = id,    band
+			row.ctime, row.dur  = ctime, dur
+			row.az,    row.el,  row.roll  = az,  el,  roll
+			row.waz,   row.wel, row.wroll = waz, wel, wroll
+			row.sens = bivar[bi]**-0.5
+		self.info.append(row)
 	def owork(self): return np.zeros(self.rhs.shape, self.rhs.dtype)
 	def prepare(self):
-		# high-level gather. Hopefully not too high overhead
-		info = self.comm.gather(self.info)
-		if self.comm.rank == 0: self.info = sum(info,[])
+		self.info = np.array(self.info, dtype=self.info_dtype).reshape(-1)
+		self.info = utils.allgatherv(self.info, self.comm).view(np.recarray)
 		self.ready = True
 	def written(self, prefix):
-		return os.path.isfile(prefix + "info.hdf")
+		return os.path.isfile(prefix + "info.txt")
 	def write_misc(self, prefix):
 		# We only have a misc product, nothing we're actually solving for
 		if "info" not in self.outputs: return
 		if self.comm.rank != 0: return
-		nobs   = len(self.info)
-		# Loop through and find the full set of ids and dets
-		ids, detids = [], []
-		bands = {}
-		for row in self.info:
-			ids.append(row.id)
-			detids.append(row.detids)
-			for detid, band in zip(row.detids, row.bands):
-				bands[detid] = band
-		ids    = np.char.encode(np.array(ids))
-		detids = np.unique(np.concatenate(detids))
-		bands  = np.array([bands[detid] for detid in detids])
-		ndet   = len(detids)
-		# Sort dets by detid and obs by id
-		order_obs = np.argsort(ids)
-		order_det = np.argsort(detids)
-		detids    = detids[order_det]
-		bands     = bands [order_det]
-		# Get the sensitivity per band
-		ubands, order, edges = utils.find_equal_groups_fast(bands)
-		nband     = len(ubands)
-		nperband  = edges[1:]-edges[:-1]
-		# Some of our info fits nicely into a simple per-obs table
-		obstab = np.zeros(nobs, [("id",ids.dtype),("ctime","f"),("dur","f"),
-			("az","f"),("waz","f"),("el","f"),("wel","f"),
-			("roll","f"),("wroll","f"),("ndet","i"),("sens","%df"%nband)]).view(np.recarray)
-		simple_fields = ["ctime","dur","az","waz","el","wel","roll","wroll"]
-		deg_fields = ["az","waz","el","wel","roll","wroll"]
-		for i, ri in enumerate(order_obs):
-			row = self.info[ri]
-			obstab[i].id   = row.id
-			obstab[i].ndet = len(row.detids)
-			for field in simple_fields:
-				obstab[i][field] = row[field]
-			# Get the band sensitvity
-			inds  = utils.find(detids, row.detids)
-			dsens = self.dev.get(row.dsens)
-			for bi, band in enumerate(ubands):
-				good = bands[inds]==band
-				band_dsens = dsens[good]
-				if band_dsens.size == 0: continue
-				band_sens  = np.sum(band_dsens**-2)**-0.5
-				obstab[i].sens[bi] = band_sens
-		# to degrees
-		for field in deg_fields:
-			obstab[field] /= utils.degree
-		# Build obs,dsens matrix. A problem with this matrix is that it is
-		# quite sparse for multi-tube obsjoint or multi-wafer waferjoint, and can get
-		# pretty big. It would be more useful to separate out the dense blocks, but
-		# not easy to do this automatically. Basically a boolean svd.
-		# Will leave it as is for now
-		dsens = np.zeros((nobs,ndet), np.float32)
-		for i, ri in enumerate(order_obs):
-			row  = self.info[ri]
-			inds = utils.find(detids, row.detids)
-			dsens[i,inds] = self.dev.get(row.dsens)
-		res = bunch.Bunch(obstab=obstab, detids=detids, bands=bands, ubands=ubands, dsens=dsens)
-		bunch.write(prefix + "info.hdf", res)
-		# Also write obstab to simple text file, since the info files are a bit tedious to
-		# deal with for quick inspection
-		idlen = max([len(row.id) for row in obstab])
+		idlen = int(np.max(np.char.str_len(self.info.id)))
 		with open(prefix + "info.txt", "w") as ofile:
-			msg = "#%*s %10s  %6s %8s %7s %7s %5s %8s %5s " % (idlen-1, "id", "ctime",
-				"dur", "az", "waz", "el", "wel", "roll", "wroll")
-			for bname in ubands:
-				msg += " n%4s %7s" % (bname, "sens")
+			msg = "#%*s %4s %10s  %6s %8s %7s %7s %5s %8s %5s %7s" % (idlen-1, "id", "band", "ctime",
+				"dur", "az", "waz", "el", "wel", "roll", "wroll", "sens")
 			ofile.write(msg + "\n")
-			for row in obstab:
-				msg = "%*s %10.0f  %6.1f %8.3f %7.3f %7.3f %5.3f %8.3f %5.3f " % (
-						idlen, row.id.decode(), row.ctime, row.dur, row.az, row.waz, row.el, row.wel,
-						row.roll, row.wroll,
+			for row in self.info:
+				msg = "%*s %4s %10.0f %6.1f  %8.3f %7.3f %7.3f %5.3f %8.3f %5.3f  %7.3f" % (
+						idlen, row.id.decode(), row.band.decode(), row.ctime, row.dur,
+						row.az/utils.degree, row.waz/utils.degree,
+						row.el/utils.degree, row.wel/utils.degree,
+						row.roll/utils.degree, row.wroll/utils.degree,
+						row.sens,
 				)
-				for bname, nper, bsens in zip(ubands, nperband, row.sens):
-					msg += " %5d %7.3f" % (nper, bsens)
 				ofile.write(msg + "\n")
 
 	valid_outputs = ["info"]
@@ -1441,7 +1387,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (name, t3-t1, t2-t1, t3-t2), level=2)
 
 class SimpleLoader:
-	def __init__(self):
+	def __init__(self, fname_fun=None, empty_fun=None):
 		#!/usr/bin/env -S python -u
 		# Must import before ArgumentParser is initialized to import args from config
 		import numpy as np, os, time, sys
@@ -1467,8 +1413,11 @@ class SimpleLoader:
 		parser.add_argument(      "--sel",     type=str, default=":")
 		parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
 		parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
+		parser.add_argument("-c", "--cont",    action="store_true")
 		self.parser = parser
 		self.comm   = mpi.COMM_WORLD
+		self.fname_fun = fname_fun
+		self.empty_fun = empty_fun
 	def add_argument(self, *args, **kwargs):
 		self.parser.add_argument(*args, **kwargs)
 	def init(self):
@@ -1535,8 +1484,11 @@ class SimpleLoader:
 		subids = self.obsinfo.id[self.joint.groups[ind]]
 		subpre = self.prefix + name.replace(":","_") + "_"
 		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, demod=self.demod)
-	def obs_iter(self, inds=None):
+	def obs_iter(self, inds=None, fname_fun=None, empty_fun=None):
 		from . import tiling
+		if fname_fun is None: fname_fun = self.fname_fun
+		if empty_fun is None: empty_fun = self.empty_fun
+		if empty_fun is None: empty_fun = lambda self,name: fname_fun(self,name).replace(".txt", ".empty")
 		if inds is None:
 			# Use the first entry in groups as representative
 			gfirst = np.array([g[0] for g in self.joint.groups])
@@ -1544,10 +1496,14 @@ class SimpleLoader:
 			inds = np.where(dist.owner == self.comm.rank)[0]
 		for ind in inds:
 			name = self.joint.names[ind]
+			if self.args.cont and fname_fun and (os.path.isfile(fname_fun(self, name)) or os.path.isfile(empty_fun(self, name))):
+				L.print("Skipped %s: done" % (name), level=2, color=colors.gray)
+				continue
 			try:
 				obs = self.get_obs(ind)
 				yield bunch.Bunch(obs=obs, ind=ind, name=name)
 			except self.etypes as e:
+				if empty_fun: utils.touch(empty_fun(self, name))
 				L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 
 def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
@@ -1628,35 +1584,80 @@ def distribute_tasks(obsinfo, joint, comm, taskdist=None):
 
 def setup_buffers(dev, ginfo, demod=None, dtype=np.float32):
 	# Need to know if we're demodulating, since if affects buffer sizes
-	fhwp  = np.mean(np.abs(ginfo.fhwp))
 	demod = demod_settings(ginfo, demod)
 	ctype = utils.complex_dtype(dtype)
-	nsub  = np.max(ginfo.nsub)    # per-subid det count
-	nsamp = np.max(ginfo.nsamp)   # raw sample count
-	fsamp = np.mean(ginfo.fsamp)
 	# ndown is the post-demodulation sample count
 	if demod.demod:
-		dmul  =len(demod.comps)
-		ndown = utils.ceil(nsamp*fhwp/fsamp)
-		ndet  = np.max(ginfo.ndet)*dmul
+		dmul   = len(demod.comps)
+		ndown  = utils.ceil(ginfo.nsamp*np.abs(ginfo.fhwp)/ginfo.fsamp)
 	else:
 		dmul  = 1
-		ndown = nsamp
-		ndet  = np.max(ginfo.ndet)
-	nf    = nsamp//2+1
-	nfdown= ndown//2+1
+		ndown = ginfo.nsamp
+	ndet   = ginfo.ndet*dmul
+	nf     = ginfo.nsamp//2+1
+	nfdown = ndown//2+1
+	ndet_ndown = np.max(ndet*ndown)
+	nsub_nsamp = np.max(ginfo.nsub*ginfo.nsamp)
+	nsub_ndown = np.max(ginfo.nsub*ndown)
+	ndet_nfdown= np.max(ndet*nfdown)
+	nsub_nf    = np.max(ginfo.nsub*nf)
 	# Pools for main analysis. These are not used for scratch during loading,
 	# except for the final load_multi
-	dev.pools["tod"].empty((ndet, ndown),  dtype=dtype)
-	dev.pools["pointing"].empty((3, ndet, ndown), dtype=dtype)
-	dev.pools["itod"].empty((nsub, nsamp), dtype=dtype)
+	dev.pools["tod"].empty(ndet_ndown,  dtype=dtype)
+	dev.pools["pointing"].empty((3, ndet_ndown), dtype=dtype)
+	# Pools used when reading in data
+	dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
 	if demod.demod:
-		dev.pools["wtod"].empty((nsub,      nsamp), dtype=dtype)
-		dev.pools["dtod"].empty((nsub*dmul, ndown), dtype=dtype)
-	# Fourier transforms. ft will be used both for the full-res per-subid data
+		#dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
+		dev.pools["wtod"].empty(nsub_nsamp,      dtype=dtype)
+		dev.pools["dtod"].empty(nsub_ndown*dmul, dtype=dtype)
+	else:
+		# HACK: overlay the itod on pointing. This will work fine as long
+		# as they aren't used at the same time, which is currently the case,
+		# and as long as swap isn't used with them
+		#dev.pools.pools["itod"] = dev.pools.pools["pointing"].proxy("itod")
+		pass
+	# Pools for fourier transforms. ft will be used both for the full-res per-subid data
 	# and the potentiallyd emodulated full data
-	dev.pools["ft"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
-	dev.pools["fft_scratch"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
+	dev.pools["ft"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
+	dev.pools["fft_scratch"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
+	print(dev.pools)
+
+#def setup_buffers(dev, ginfo, demod=None, dtype=np.float32):
+#	# Need to know if we're demodulating, since if affects buffer sizes
+#	fhwp  = np.mean(np.abs(ginfo.fhwp))
+#	demod = demod_settings(ginfo, demod)
+#	ctype = utils.complex_dtype(dtype)
+#	# FIXME: Using max on the individual factors instead of
+#	# the products is a bit wasteful. Should really
+#	# calculate the max of the products
+#	nsub  = np.max(ginfo.nsub)    # per-subid det count
+#	nsamp = np.max(ginfo.nsamp)   # raw sample count
+#	fsamp = np.mean(ginfo.fsamp)
+#	# ndown is the post-demodulation sample count
+#	if demod.demod:
+#		dmul  =len(demod.comps)
+#		ndown = utils.ceil(nsamp*fhwp/fsamp)
+#		ndet  = np.max(ginfo.ndet)*dmul
+#	else:
+#		dmul  = 1
+#		ndown = nsamp
+#		ndet  = np.max(ginfo.ndet)
+#	nf    = nsamp//2+1
+#	nfdown= ndown//2+1
+#	# Pools for main analysis. These are not used for scratch during loading,
+#	# except for the final load_multi
+#	dev.pools["tod"].empty((ndet, ndown),  dtype=dtype)
+#	dev.pools["pointing"].empty((3, ndet, ndown), dtype=dtype)
+#	dev.pools["itod"].empty((nsub, nsamp), dtype=dtype)
+#	if demod.demod:
+#		dev.pools["wtod"].empty((nsub,      nsamp), dtype=dtype)
+#		dev.pools["dtod"].empty((nsub*dmul, ndown), dtype=dtype)
+#	# Fourier transforms. ft will be used both for the full-res per-subid data
+#	# and the potentiallyd emodulated full data
+#	dev.pools["ft"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
+#	dev.pools["fft_scratch"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
+#	print(dev.pools)
 
 #def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
 #	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case

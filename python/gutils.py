@@ -511,6 +511,7 @@ def time_split(joint, ginfo, demod=None, maxsize=None, maxdur=None):
 		sizes = nsamps*ndets
 		# number of time splits for each
 		nsplits = np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
+		print(nsplits)
 	if maxdur is not None:
 		nsplits = np.maximum(nsplits, utils.floor(ginfo.dur/maxdur)+1)
 	# Do the split
@@ -953,6 +954,11 @@ def sample_var(samps):
 	return stats.invgamma(a=nsamp/2, scale=nsamp*vemp/2).rvs()
 
 def merge_metadbs(ifnames, ofname, verbose=False):
+	"""Warning: This function doesn't work correctly with databases that
+	use detector-independent selectors in .map, such as relcal which only
+	uses time-ranges. In that case, the lookup code won't know which of
+	the resulting overlapping time-ranges to use. Fixing this would require
+	changing the map logic and the sofast read-in code"""
 	from pixell import sqlite
 	# Prepare to write a new file db from scratch
 	utils.mkdir(os.path.dirname(ofname))

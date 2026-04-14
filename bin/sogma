@@ -121,6 +121,26 @@ for name in args.output.split(","):
 	elif name == "elmod": elmod_out = ["map"]
 	elif name == "nmat":  ml_out  += ["nmat"]
 	else:                 map_out += [name]
+
+# Set up our signals
+signals = []
+# SignalCut must be first, because it zeros out cut samples so other signals
+# don't have to worry about them
+if args.cut_type == "poly":
+	signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out)
+	#signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out, order=8)
+elif args.cut_type == "full":
+	signal_cut = mapmaking.SignalCutFull(comm_per, dev=dev, outputs=cut_out)
+else: raise ValueError("Unrecognized cut type '%s'" % str(args.cut_type))
+signals.append(signal_cut)
+
+# Other signals
+signals.append(mapmaking.SignalInfo(comm_per, dev=dev))
+if args.elmod > 0:
+	signals.append(mapmaking.SignalElMod(comm_per, order=args.elmod, dev=dev, outputs=elmod_out))
+
+# SignalMap must be last, because it currently does d = Pm instead of d += Pm,
+# so it would clobber any other signals. (Signals are evaluated in reverse order)
 # Don't use multi-band mapmaking for just one band. This slightly lowers overhead, but
 # most importantly does not add the band to the output files, freeing us to manually
 # add it to the prefix instead. This is useful to avoid having non-map outputs overwrite
@@ -129,16 +149,9 @@ if len(joint.bands) > 1:
 	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=dtype_map, sys=args.sys, autocrop=args.autocrop, outputs=map_out, precon=args.precon, ocomps=ocomps)
 else:
 	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype_map, sys=args.sys, autocrop=args.autocrop, outputs=map_out, precon=args.precon, ocomps=ocomps)
-if args.cut_type == "poly":
-	signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out)
-	#signal_cut = mapmaking.SignalCutPoly(comm_per, dev=dev, outputs=cut_out, order=8)
-elif args.cut_type == "full":
-	signal_cut = mapmaking.SignalCutFull(comm_per, dev=dev, outputs=cut_out)
-else: raise ValueError("Unrecognized cut type '%s'" % str(args.cut_type))
-signal_info = mapmaking.SignalInfo(comm_per, dev=dev)
-signals     = [signal_cut, signal_map, signal_info]
-if args.elmod > 0:
-	signals.append(mapmaking.SignalElMod(comm_per, order=args.elmod, dev=dev, outputs=elmod_out))
+signals.append(signal_map)
+# Don't add any more signals after this!
+
 # Set up the noise model
 if   args.nmat == "jon":    noise_model = nmat.NmatDetvecs(dev=dev)
 elif args.nmat == "jond":   noise_model = nmat.NmatDetvecs(dev=dev, downweight=[1e-4, 0.25, 0.50])

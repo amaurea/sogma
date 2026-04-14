@@ -208,10 +208,12 @@ class PmatElMod:
 			# B[0] = Δel
 			el = np.ascontiguousarray(el, dtype=dtype)
 			self.dev.copy(el, B[0])
-			B[0] -= 0.5*(dev.np.max(B[0])+dev.np.min(B[0]))
+			_normalize_bfun(B[0])
 			# Fill in any higher orders
 			for i in range(1, order):
-				B[i] = B[0]**(i+1)
+				B[i]  = B[i-1]
+				B[i] *= B[0]
+				_normalize_bfun(B[i])
 			self.B = B
 		else:
 			assert order is None and bsize is None, "Specify either basis or order, not both"
@@ -234,6 +236,14 @@ class PmatElMod:
 		assert tod.dtype == self.dtype
 		assert amps.dtype == self.dtype
 		self.dev.lib.sgemm("T", "N", self.order, ndet, nsamp, 1, self.B, nsamp, tod, nsamp, 1, amps, self.order)
+
+def _normalize_bfun(a):
+	ap = device.anypy(a)
+	v1 = ap.min(a)
+	v2 = ap.max(a)
+	a -= 0.5*(v1+v2) # zero mean
+	a /= 0.5*(v2-v1) # range [-1,1]
+	return a
 
 # Misc
 

@@ -182,6 +182,7 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 			elif tok == "&":   tok = " and "
 			elif tok == "|":   tok = " or "
 			elif tok == "t":   tok = "timestamp"
+			elif tok == "yr":  tok = "((timestamp-1735689600.0)/31556926.08+2025)"
 			elif tok == "baz": tok = "az_center"
 			elif tok == "bel": tok = "el_center"
 			elif tok == "roll": tok = "roll_center"
@@ -711,7 +712,8 @@ def point_hit(point, sweep, dur, r, pad=1.0*utils.degree):
 
 def gal_hit(sweep, dur, r, minlat=None, pad=1*utils.degree):
 	# sweep[:,npoint,{ra,dec}]
-	if minlat is None: minlat = 5*utils.degree
+	if minlat is None: minlat = 5
+	minlat = minlat*utils.degree
 	from pixell import coordinates
 	speed= 15*utils.degree/utils.hour
 	ras, decs = sweep.T # [npoint,ntod]
@@ -1015,7 +1017,7 @@ def find_scanning(az, down=10, tol=0.01, pad=1):
 # That depends on the hwp speed. Is this available in obsdb?
 
 def get_full_ndet(ndet, demod):
-	if demod.demod: return ndet*len(demod.comps)
+	if demod and demod.demod: return ndet*len(demod.comps)
 	else: return ndet
 
 def demodulate(data, frel=1, comps="TQU", mul=32, dev=None):

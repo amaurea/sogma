@@ -5,6 +5,7 @@ from . import device
 from .logging import L
 
 class RecoverableError(Exception): pass
+class SignalOrderError(Exception): pass
 
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
@@ -403,6 +404,34 @@ def adjoint_deslope(otod, v1, v2, w=10, inplace=False, n=None, dev=None, externa
 	signal = signal.reshape(pre+(nsamp,))
 	v1     = v1.reshape(pre)
 	v2     = v2.reshape(pre)
+	if return_edges: return signal, v1, v2
+	else: return signal
+
+def deoffset(signal, inplace=False, bsize=1000, n=None, dev=None):
+	"""Subtract a robust mean per detector"""
+	if dev  is None: dev   = device.get_device()
+	if n    is None: n     = signal.shape[-1]
+	if not inplace: signal = signal.copy()
+	btod = blockify(signal[...,:n], bsize=bsize)
+	offs = dev.np.median(dev.np.mean(btod,-1),-1)
+	signal -= offs[...,None]
+	return signal
+
+def common_deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, dev=None, external_v=False, return_edges=False):
+	"""Deslope the common mode, rather than individually per detector like
+	deslope() does. This avoids introducing slopes in the detector-relative
+	signal. Note that this means that each individual detector won't
+	necessarily be periodic, so this should be followed by apodization."""
+	if dev  is None: dev   = device.get_device()
+	if n    is None: n     = signal.shape[-1]
+	if not inplace: signal = signal.copy()
+	# Measure edge values
+	if not external_v:
+		v1 = dev.np.median(dev.np.mean(signal[:, :w],1))
+		v2 = dev.np.median(dev.np.mean(signal[:,n-w:n],1))
+	# Build a basis that ignores the padded area
+	trend   = linspace(v1, v2, n, pad=signal.shape[-1]-n, dtype=signal.dtype, dev=dev)
+	signal -= trend
 	if return_edges: return signal, v1, v2
 	else: return signal
 
@@ -850,7 +879,7 @@ def estimate_leakage_odr(x, y, down=10, bsize=700):
 	fit   = np.moveaxis(np.median(fit, -2),-1,0) # now have [{a,b},...]
 	dfit  = np.moveaxis(np.median(dfit,-2),-1,0) # now have [{a,b},...]
 	dfit /= nblock**0.5
-	return betas
+	return fit, dfit
 
 def estimate_leakage_gibbs(x, y, nsamp=30, nburn=5, bsize=700, down=10, nmode=1):
 	"""Assuming x = signal+xnoise, y = signal*a + ynoise, estimate
@@ -873,8 +902,8 @@ def estimate_leakage_gibbs(x, y, nsamp=30, nburn=5, bsize=700, down=10, nmode=1)
 	values, fit[1:], dfit[1:] are the nmode polynomial nuisance parameters.
 	"""
 	bsize   = bsize // down
-	bx      = downgrade(x, down)
-	by      = downgrade(y, down)
+	bx      = blockify(downgrade(x, down), bsize)
+	by      = blockify(downgrade(y, down), bsize)
 	sampler = LeakSampler(bx, by, nmode=nmode)
 	leak    = np.zeros((nsamp,sampler.na)+sampler.x.shape[:-1], sampler.x.dtype)
 	# First get rid of the burning

@@ -419,6 +419,8 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 			i += chunk.shape[-1]
 	return aman
 
+debug_det = None # "Mv21_f090_Ar00c02A"
+
 # This config moved to loading.py because sofast is only imported conditionally
 def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	from pixell import fft
@@ -472,19 +474,22 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		signal  = dev.pools["itod"].empty(signal.shape, np.float32)
 		signal[:] = signal_
 
-	#i = utils.find(meta.aman.det_ids, "Mv19_f150_Ar10c02A")
-	#print(i)
-	#moo = bunch.Bunch(tod=dev.get(signal[i]), dets=meta.aman.det_ids[i],
-	#	ctime=ctime, az=az, el=el, hwp=hwp_angle, abscal=meta.abscal_cmb,
-	#	phase_to_pW=meta.aman.phase_to_pW[i], relcal=meta.aman.relcal[i],
-	#	dac_to_phase=meta.dac_to_phase)
-	#bunch.write("test_raw.hdf", moo)
+	if debug_det:
+		i = utils.find(meta.aman.det_ids, debug_det)
+		print(i)
+		moo = bunch.Bunch(tod=dev.get(signal[i]), dets=meta.aman.det_ids[i],
+			ctime=ctime, az=az, el=el, hwp=hwp_angle, abscal=meta.abscal_cmb,
+			phase_to_pW=meta.aman.phase_to_pW[i], relcal=meta.aman.relcal[i],
+			dac_to_phase=meta.dac_to_phase)
+		bunch.write("test_raw.hdf", moo)
 
 	with bench.mark("calibrate", tfun=dev.time):
 		# Calibrate to CMB µK
 		phase_to_cmb = 1e6 * meta.abscal_cmb * meta.aman.phase_to_pW[:,None]
 		if "relcal" in meta.aman: phase_to_cmb *= meta.aman.relcal[:,None]
 		signal *= dev.np.array(meta.dac_to_phase * phase_to_cmb)
+
+	if debug_det: bunch.write("test_cal.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
 	# Subtract the HWP scan-synchronous signal. We do this before deglitching because
 	# it's large and doesn't follow the simple slopes and offsets we assume there
@@ -502,9 +507,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		jumps.dejump(signal, w=w, dev=dev)
 		raw_cuts.gapfill(signal, w=w, dev=dev)
 
+	if debug_det: bunch.write("test_deglitch.hdf", bunch.Bunch(tod=dev.get(signal[i])))
+
 	with bench.mark("deslope", tfun=dev.time):
 		with dev.pools["ft"].as_allocator():
 			gutils.deslope(signal, w=w, dev=dev, inplace=True)
+
+	if debug_det: bunch.write("test_deslope1.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
 	with bench.mark("fft", tfun=dev.time):
 		ftod = dev.pools["ft"].zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
@@ -537,6 +546,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Back to real space
 	with bench.mark("ifft", tfun=dev.time):
 		dev.lib.irfft(ftod, signal)
+
+	if debug_det: bunch.write("test_iir_tconst.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
 	# Sanity checks
 	with bench.mark("measure noise", tfun=dev.time):

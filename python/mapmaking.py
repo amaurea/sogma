@@ -16,6 +16,11 @@ class MLMapmaker:
 		  noise model for each observation. Can be overriden in add_obs.
 		* dtype: The data type to use for the time-ordered data. Only tested with float32
 		* verbose: Whether to print progress messages. Not implemented"""
+		# Check that the signal order is correct. Any clobbering signal *must* be last.
+		# Technically SignalCut clobbers, but not in the sense we care about here
+		for signal in signals[:-1]:
+			if signal.clobbers:
+				raise gutils.SignalOrderError("Clobbering %s %s not last in list!" % (type(signal).__name__, signal.name))
 		self.signals  = signals
 		self.dev      = dev or device.get_device()
 		self.dtype    = dtype
@@ -206,6 +211,7 @@ class Accumulator:
 
 class Signal:
 	"""This class represents a thing we want to solve for, e.g. the sky, ground, cut samples, etc."""
+	clobbers = False
 	def __init__(self, name, ofmt, outputs, ext):
 		"""Initialize a Signal. It probably doesn't make sense to construct a generic signal
 		directly, though. Use one of the subclasses.
@@ -246,6 +252,9 @@ class Signal:
 config.default("xdown", 8, "Temporal and spatial downgrade-factor for crosslink map")
 class SignalMap(Signal):
 	"""Signal describing a sky map."""
+	# We do d = Pm instead of d += Pm, so any previous value of d is lost.
+	# Signals are evaluated in reverse order, so SignalMap 
+	clobbers = True
 	def __init__(self, shape, wcs, comm, dev=None, name="sky", ofmt="{name}",
 			outputs=["map","ivar"], precon="ivar", ext="fits", dtype=np.float32, ibuf=None, obuf=None,
 			sys=None, interpol=None, autocrop=False, ocomps=None, xdown=None):
@@ -839,7 +848,7 @@ class SignalElMod(Signal):
 	def add_obs(self, id, obs, iN, iNd):
 		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
 		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
-		pel     = pmat.PmatElMod(obs.boresight[1], order=self.order, dev=self.dev, dtype=self.dtype)
+		pel     = pmat.PmatElMod(obs.boresight[0], order=self.order, dev=self.dev, dtype=self.dtype)
 		# Build our RHS
 		ndet    = obs.tod.shape[0]
 		ndof    = ndet*self.order
@@ -847,13 +856,14 @@ class SignalElMod(Signal):
 		pcut.clear(iNd)
 		pel.backward(iNd, obs_rhs)
 		obs_rhs = self.dev.get(obs_rhs)
-		# Build our preconditioner. Fully diagonal for now
+		# Build our preconditioner. Fully diagonal for now.
 		obs_div = self.dev.np.ones((ndet,pel.order), self.dtype)
 		iNd[:]   = 0
 		pel.forward(iNd, obs_div)
 		#pcut.clear(iNd) # unnecessary since white is diagonal
 		iN.white(iNd)
 		pcut.clear(iNd)
+		obs_div[:] = 0
 		pel.backward(iNd, obs_div)
 		obs_idiv = 1/self.dev.get(obs_div) # back to the cpu
 		self.data[id] = bunch.Bunch(pel=pel, ndet=ndet, i1=self.off, i2=self.off+ndof)
@@ -1000,6 +1010,51 @@ class SignalInfo(Signal):
 
 	valid_outputs = ["info"]
 
+config.default("tdump", "none", "Dump a detector tod and model, for debugging")
+class TDumper:
+	def __init__(self, mapmaker, prefix=""):
+		self.tdump    = config.get("tdump")
+		self.active   = self.tdump != "none"
+		if self.active:
+			self.ind, self.di = [int(w) for w in self.tdump.split(":")]
+		self.mapmaker = mapmaker
+		self.dev      = mapmaker.dev
+		self.prefix   = prefix
+		self.ctime    = None
+		self.i        = -1
+	def register(self, i, ind, ctime):
+		if not self.active or ind != self.ind: return
+		self.ctime = ctime
+		self.i     = i
+	def write_data(self, ind, tod, name):
+		if not self.active or ind != self.ind: return
+		self.write(self.prefix + name, self.ctime, self.dev.get(tod[self.di])[None])
+	def write_model(self, x, name):
+		# Skip on all but the task where the target index is present
+		if self.i < 0: return
+		data = self.mapmaker.datas[self.i]
+		otod = []
+		vals = self.mapmaker.dof.unzip(x)
+		tod  = self.mapmaker.dev.pools["tod"].zeros((data.ndet, data.nsamp), self.mapmaker.dtype)
+		for si, (signal, val) in enumerate(zip(self.mapmaker.signals,vals)):
+			work = signal.to_work(val)
+			signal.precalc_setup(data.id)
+			tod[:] = 0
+			signal.forward(data.id, tod, work)
+			signal.precalc_free(data.id)
+			otod.append(self.dev.get(tod[self.di]))
+		tod[:] = 0
+		for si, (signal, val) in reversed(list(enumerate(zip(self.mapmaker.signals,vals)))):
+			work = signal.to_work(val)
+			signal.precalc_setup(data.id)
+			signal.forward(data.id, tod, work)
+			signal.precalc_free(data.id)
+		otod.insert(0, self.dev.get(tod[self.di]))
+		otod = np.array(otod)
+		self.write(self.prefix + name, self.ctime, otod)
+	def write(self, prefix, ctime, dettod):
+		np.savetxt(prefix + ".txt", np.concatenate([ctime[None], dettod],0).T, fmt="%20.12e")
+
 # Mapmaking function
 def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, signal_guess=None):
 	if prefix is None: prefix = ""
@@ -1031,6 +1086,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 	# actually more memory-efficient, as long as our estimate is
 	# good.
 	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo)
+	tdumper = TDumper(mapmaker, prefix=prefix)
 	# Start map from scartch
 	mapmaker.reset()
 	# Add our observations
@@ -1054,10 +1110,18 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		# Autocut and gapfill cost about the same as add_obs, so they definitely
 		# aren't free!
 		t2    = time.time()
+		tdumper.register(i, ind, data.ctime)
+		tdumper.write_data(ind, data.tod, "load")
 		socal.autocut(data, dev=dev, id=name)
 		data.cuts.gapfill(data.tod, dev=dev)
+		tdumper.write_data(ind, data.tod, "socut")
 		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
 		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
+		tdumper.write_data(ind, data.tod, "socal")
+
+		#bunch.write(prefix + "tod_down40.hdf", bunch.Bunch(dets=data.detids, bore=gutils.downgrade(data.boresight,40), ctime=gutils.downgrade(data.ctime,40), tod=dev.get(gutils.downgrade(data.tod, 40))))
+		#1/0
+
 		t3    = time.time()
 		try:
 			mapmaker.add_obs(name, data, deslope=False, signal_guess=signal_guess)
@@ -1090,6 +1154,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		# the final result
 		will_dump = len(dump) > 0 and (step.i in dump or (dump[-1] != 0 and step.i % dump[-1] == 0))
 		if will_dump: mapmaker.write(prefix, step.x, suffix="%04d" % step.i)
+		if will_dump: tdumper.write_model(step.x, "sol%04d" % step.i)
 		# Safest to print this *after* writing, so the user can safely abort
 		# when they see the message
 		L.print("CG %4d %15.7e  %6.3f s%s" % (step.i, step.err, step.t, " (write)" if will_dump else ""), id=0, level=1, color=colors.lgreen)
@@ -1265,73 +1330,72 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		twcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[dt*tdown,1])
 		enmap.write_map(subpre + "tod.fits", enmap.enmap(otod, twcs))
 
-		print(dt)
-		return
+		bunch.write(subpre + "data_tdown.hdf", bunch.Bunch(tod=otod, bore=gutils.downgrade(data.boresight, tdown), ctime=gutils.downgrade(data.ctime, tdown), dets=data.detids))
 
-		# Output ps
-		ft   = dev.lib.rfft(data.tod)
-		nsamp= data.tod.shape[1]
-		normexp = -1
-		ft  *= nsamp**normexp
+		## Output ps
+		#ft   = dev.lib.rfft(data.tod)
+		#nsamp= data.tod.shape[1]
+		#normexp = -1
+		#ft  *= nsamp**normexp
 
-		ps   = dev.np.abs(ft)**2
-		ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
-		df   = 1/(dt*data.tod.shape[1])
-		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
-		enmap.write_map(subpre + "ps.fits", enmap.enmap(ops, fwcs))
+		#ps   = dev.np.abs(ft)**2
+		#ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
+		#df   = 1/(dt*data.tod.shape[1])
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
+		#enmap.write_map(subpre + "ps.fits", enmap.enmap(ops, fwcs))
 
-		# Output high-res ps for low freq
-		ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
-		nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		ops  = ops[:,:nbin]
-		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		enmap.write_map(subpre + "ps_lowf.fits", enmap.enmap(ops, fwcs))
-		del ps
+		## Output high-res ps for low freq
+		#ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
+		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		#ops  = ops[:,:nbin]
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		#enmap.write_map(subpre + "ps_lowf.fits", enmap.enmap(ops, fwcs))
+		#del ps
 
-		# Output freq corrmat. Uses same resolution as coarse ps
-		ndet, nfreq = ft.shape
-		nbin = utils.floor(fmax_lowf/(df*fdown))
-		bft  = ft[:,:nbin*fdown].reshape(ndet,nbin,fdown)
-		cbft = dev.np.conj(bft)
-		fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
-		v    = dev.np.einsum("ddb->db", fcov)**-0.5
-		fcorr= fcov*v[:,None,:]*v[None,:,:]
-		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
-		enmap.write_map(subpre + "corr_lowf.fits", enmap.enmap(dev.get(fcorr), fwcs))
-		del bft, cbft
+		## Output freq corrmat. Uses same resolution as coarse ps
+		#ndet, nfreq = ft.shape
+		#nbin = utils.floor(fmax_lowf/(df*fdown))
+		#bft  = ft[:,:nbin*fdown].reshape(ndet,nbin,fdown)
+		#cbft = dev.np.conj(bft)
+		#fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
+		#v    = dev.np.einsum("ddb->db", fcov)**-0.5
+		#fcorr= fcov*v[:,None,:]*v[None,:,:]
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
+		#enmap.write_map(subpre + "corr_lowf.fits", enmap.enmap(dev.get(fcorr), fwcs))
+		#del bft, cbft
 
-		# Same, but high resolution, for a subset of detectors
-		ndet, nfreq = ft.shape
-		thin = 100
-		nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		bft  = ft[:,:nbin*fdown_lowf].reshape(ndet,nbin,fdown_lowf)
-		cbft = dev.np.conj(bft[::thin])
-		fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
-		v    = dev.np.sum(dev.np.abs(bft)**2,-1)**-0.5
-		fcorr= fcov*v[::thin,None,:]*v[None,:,:]
-		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		enmap.write_map(subpre + "corr_lowf2.fits", enmap.enmap(dev.get(fcorr), fwcs))
-		del bft, cbft
+		## Same, but high resolution, for a subset of detectors
+		#ndet, nfreq = ft.shape
+		#thin = 100
+		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		#bft  = ft[:,:nbin*fdown_lowf].reshape(ndet,nbin,fdown_lowf)
+		#cbft = dev.np.conj(bft[::thin])
+		#fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
+		#v    = dev.np.sum(dev.np.abs(bft)**2,-1)**-0.5
+		#fcorr= fcov*v[::thin,None,:]*v[None,:,:]
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		#enmap.write_map(subpre + "corr_lowf2.fits", enmap.enmap(dev.get(fcorr), fwcs))
+		#del bft, cbft
 
-		# Build the noise model
-		ft2  = ft.copy()
-		iN   = noise_model.build_fourier(ft2, srate=1/dt, nsamp=data.tod.shape[1])
-		# Apply it. Unhealthy modes should stand out here
-		iN.apply(ft2, nofft=True)
+		## Build the noise model
+		#ft2  = ft.copy()
+		#iN   = noise_model.build_fourier(ft2, srate=1/dt, nsamp=data.tod.shape[1])
+		## Apply it. Unhealthy modes should stand out here
+		#iN.apply(ft2, nofft=True)
 
-		ps   = dev.np.abs(ft2)**2
-		ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
-		df   = 1/(dt*data.tod.shape[1])
-		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
-		enmap.write_map(subpre + "iNps.fits", enmap.enmap(ops, fwcs))
+		#ps   = dev.np.abs(ft2)**2
+		#ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
+		#df   = 1/(dt*data.tod.shape[1])
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
+		#enmap.write_map(subpre + "iNps.fits", enmap.enmap(ops, fwcs))
 
-		# Output high-res ps for low freq
-		ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
-		nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		ops  = ops[:,:nbin]
-		fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		enmap.write_map(subpre + "iNps_lowf.fits", enmap.enmap(ops, fwcs))
-		del ps
+		## Output high-res ps for low freq
+		#ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
+		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
+		#ops  = ops[:,:nbin]
+		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
+		#enmap.write_map(subpre + "iNps_lowf.fits", enmap.enmap(ops, fwcs))
+		#del ps
 
 		#d2   = dev.np.arange(ndet)
 		#d1   = d2[::thin]
@@ -1503,67 +1567,10 @@ class SimpleLoader:
 			try:
 				obs = self.get_obs(ind)
 				yield bunch.Bunch(obs=obs, ind=ind, name=name)
+				del obs
 			except self.etypes as e:
 				if empty_fun: utils.touch(empty_fun(self, name))
 				L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
-
-def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
-		tdown=None, fdown=None, fdown_lowf=None, fmax_lowf=4, prealloc=True, dev=None, ignore="recover", dets=None, detids=None):
-	if prefix is None: prefix = ""
-	tdown = config.get("dump_tdown", tdown)
-	fdown = config.get("dump_fdown", fdown)
-	fdown_lowf = config.get("dump_fdown_lowf", fdown_lowf)
-
-	# Groups is a list of obsinfo entries that should be mapped jointly
-	# (as a big super-tod with full noise correlations)
-	if joint is None: joint = trivial_joint(obsinfo)
-	# Inds is a list of indices into joint groups, giving which groups this mpi task
-	# should care about
-	if inds is None:
-		# Use the first entry in groups as representative
-		gfirst = np.array([g[0] for g in joint.groups])
-		dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
-		inds = np.where(dist.owner == comm.rank)[0]
-	# Set up exception types we will ignore
-	if   ignore == "all":     etypes = (Exception,)
-	elif ignore == "missing": etypes = (utils.DataMissing,)
-	elif ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
-	elif ignore == "none":    etypes = ()
-	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
-	if dev is None: dev = device.get_device()
-	# Set up memory pools. Setting these up before-hand is
-	# actually more memory-efficient, as long as our estimate is
-	# good.
-	if len(inds) > 0:
-		ginfo  = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		demod  = demod_settings(ginfo)
-	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo)
-	# Process our observations
-	for i, ind in enumerate(inds):
-		name   = joint.names[ind]
-		subids = obsinfo.id[joint.groups[ind]]
-		subpre = prefix + name.replace(":","_") + "_"
-		t1     = time.time()
-		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, demod=demod)
-		except etypes as e:
-			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
-			continue
-		if len(data.errors) > 0:
-			# Partial skip
-			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
-		t2    = time.time()
-
-		# Output tod
-		otod = dev.get(gutils.downgrade(data.tod, tdown))
-		dt   = (data.ctime[-1]-data.ctime[0])/(len(data.ctime)-1)
-		twcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[dt*tdown,1])
-		enmap.write_map(subpre + "tod.fits", enmap.enmap(otod, twcs))
-
-		print(dt)
-		return
-
-
 
 config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
 def distribute_tasks(obsinfo, joint, comm, taskdist=None):
@@ -1622,69 +1629,6 @@ def setup_buffers(dev, ginfo, demod=None, dtype=np.float32):
 	# and the potentiallyd emodulated full data
 	dev.pools["ft"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
 	dev.pools["fft_scratch"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
-	print(dev.pools)
-
-#def setup_buffers(dev, ginfo, demod=None, dtype=np.float32):
-#	# Need to know if we're demodulating, since if affects buffer sizes
-#	fhwp  = np.mean(np.abs(ginfo.fhwp))
-#	demod = demod_settings(ginfo, demod)
-#	ctype = utils.complex_dtype(dtype)
-#	# FIXME: Using max on the individual factors instead of
-#	# the products is a bit wasteful. Should really
-#	# calculate the max of the products
-#	nsub  = np.max(ginfo.nsub)    # per-subid det count
-#	nsamp = np.max(ginfo.nsamp)   # raw sample count
-#	fsamp = np.mean(ginfo.fsamp)
-#	# ndown is the post-demodulation sample count
-#	if demod.demod:
-#		dmul  =len(demod.comps)
-#		ndown = utils.ceil(nsamp*fhwp/fsamp)
-#		ndet  = np.max(ginfo.ndet)*dmul
-#	else:
-#		dmul  = 1
-#		ndown = nsamp
-#		ndet  = np.max(ginfo.ndet)
-#	nf    = nsamp//2+1
-#	nfdown= ndown//2+1
-#	# Pools for main analysis. These are not used for scratch during loading,
-#	# except for the final load_multi
-#	dev.pools["tod"].empty((ndet, ndown),  dtype=dtype)
-#	dev.pools["pointing"].empty((3, ndet, ndown), dtype=dtype)
-#	dev.pools["itod"].empty((nsub, nsamp), dtype=dtype)
-#	if demod.demod:
-#		dev.pools["wtod"].empty((nsub,      nsamp), dtype=dtype)
-#		dev.pools["dtod"].empty((nsub*dmul, ndown), dtype=dtype)
-#	# Fourier transforms. ft will be used both for the full-res per-subid data
-#	# and the potentiallyd emodulated full data
-#	dev.pools["ft"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
-#	dev.pools["fft_scratch"].empty(max(ndet*nfdown,nsub*nf), dtype=ctype)
-#	print(dev.pools)
-
-#def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
-#	"""Pre-allocate memory buffers for mapmaking. Pass in the worst-case
-#	ntot = ndet*nsamp.
-#
-#	Pre-allocation isn't really necessary,
-#	but automatically growing the buffers has some overhead, and I've unexpectedly
-#	run out of memory when not doing this. This should be investigated futher.
-#
-#	This function will need to be updated if which memory pools are used is changed."""
-#	# These are the big ones
-#	ctype = utils.complex_dtype(dtype)
-#	ftot = ntot//2 + ndet_guess
-#	dev.pools["pointing"]   .empty((3, ntot), dtype=dtype)
-#	dev.pools["tod"]        .empty(ntot, dtype=dtype)
-#	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
-#	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
-#	dev.pools.reset()
-#	# The remaining are:
-#	# * plan
-#	# * cut
-#	# * sky_iwork
-#	# * sky_owork
-#	# * nmat_work
-#	# We don't have good estimates for these, so we don't pre-allocate them.
-#	# But they should be small
 
 def trivial_joint(obsids):
 	"""Make a group-info corresponding to a no grouping"""

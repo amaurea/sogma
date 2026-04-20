@@ -29,7 +29,7 @@ parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs
 parser.add_argument(      "--tsplit",  type=float, default=None, help="Split obs-groups in time to keep them shorter than this many seconds. See also --split")
 parser.add_argument("-c", "--cont",    action="store_true")
 parser.add_argument(      "--sys",     type=str, default="cel")
-parser.add_argument("-o", "--output",  type=str, default="auto")
+parser.add_argument("-o", "--output",  type=str, default="auto", help="map, ivar, hits, rhs, xlink, time, cut, elmod, nmat or auto. auto is equivalent to map,ivar,xlink. In depth1 and individual mode, auto also includes time")
 parser.add_argument(      "--sel",     type=str, default=":")
 parser.add_argument(      "--elmod",   type=int, default=0)
 parser.add_argument(      "--precon",  type=str, default="ivar")

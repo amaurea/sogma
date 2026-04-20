@@ -77,6 +77,12 @@ class NmatDebug(Nmat):
 		if not inplace: tod = tod.copy()
 		tod *= self.ivar[:,None]
 		return tod
+	def write(self, fname):
+		self.check_ready()
+		data = bunch.Bunch(type="NmatDebug")
+		for field in ["ivar", "alpha", "fknee", "profile", "bsize", "downweight"]:
+			data[field] = self.dev.get(getattr(self, field))
+		bunch.write(fname, data)
 
 class NmatUncorr(Nmat):
 	def __init__(self, spacing="exp", nbin=100, nmin=10, window=2, bins=None, ips_binned=None, ivar=None, nwin=None, dev=None):
@@ -247,7 +253,7 @@ class NmatDetvecs(Nmat):
 			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
 		del Nd, ft
 		# Optionally downweight the lowest frequency bins
-		if self.downweight != None and len(self.downweight) > 0:
+		if self.downweight is not None and len(self.downweight) > 0:
 			D[:len(self.downweight)] /= self.dev.np.array(self.downweight)[:,None]
 		# Also compute a representative white noise level
 		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
@@ -304,8 +310,8 @@ class NmatDetvecs(Nmat):
 	def write(self, fname):
 		data = bunch.Bunch(type="NmatDetvecs")
 		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "downweight",
-				"bins", "D", "V", "E", "ivar"]:
-			data[field] = getattr(self, field)
+				"bins", "iD", "V", "iE", "Kh", "ivar"]:
+			data[field] = self.dev.get(getattr(self, field))
 		bunch.write(fname, data)
 	@staticmethod
 	def from_bunch(data, dev=None):

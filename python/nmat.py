@@ -757,17 +757,24 @@ def apply_vecs2(ftod, iD, V, Vinds,  Kh, bins, tmp, vtmp, divtmp, dev=None, out=
 			# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
 			dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, maxnmode, 1, out[:,i1:i2], nfreq)
 
-def measure_cov(d, nmax=10000):
+# TODO: This one allocates temporary tod and cov arrays.
+# Use dev.lib.sgemm to avoid cov copies?
+def measure_cov(d, nmax=10000, normalize=True, return_norm=False):
 	ap    = device.anypy(d)
 	d     = d[:,::max(1,d.shape[1]//nmax)]
 	n,m   = d.shape
-	res   = ap.zeros((n,n),utils.real_dtype(d.dtype))
+	cov   = ap.zeros((n,n),utils.real_dtype(d.dtype))
 	# Blocked calculation to save memory
 	step  = 10000
+	norm  = 0
 	for i in range(0,m,step):
-		sub  = ap.ascontiguousarray(d[:,i:i+step])
-		res += sub.dot(ap.conj(sub.T)).real
-	return res/m
+		sub   = ap.ascontiguousarray(d[:,i:i+step])
+		cov  += sub.dot(ap.conj(sub.T)).real
+		norm += sub.shape[1]
+	if np.iscomplexobj(d): norm *= 2
+	if normalize: cov /= norm
+	if return_norm: return cov, norm
+	else: return cov
 
 def project_out_from_matrix(A, V):
 	"""This is the equivalent of deprojecting V in a timestream,
@@ -826,7 +833,7 @@ def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, force_common=False, nma
 	# Measure new orthogonal modes in each bin
 	for bi, b in enumerate(bins):
 		cov  = measure_cov(ft[:,b[0]:b[1]])
-		ndof = ndof=2*(b[1]-b[0])
+		ndof = 2*(b[1]-b[0])
 		v, e = find_modes_single(cov, ndof, deproj=vecs, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, verb_prefix="bin %d %5d %5d " % (bi, b[0], b[1]), dtype=dtype, return_eigs=True)
 		# How many do modes can we afford?
 		nleft = nmax - vecs.shape[1]
@@ -839,30 +846,24 @@ def find_modes_jon(ft, bins, eig_lim=None, single_lim=0, force_common=False, nma
 	if return_eigs: return vecs, eigs
 	else: return vecs
 
-def find_modes_merged(ft, bins, eig_lim=None, single_lim=0, nmax_frac=0.1, verbose=False, dtype=np.float32, return_eigs=False):
+def find_modes_merged(ft, bins, eig_lim=None, single_lim=0, nmax_frac=0.1, cov_big=1000, cov_nmax=10000, verbose=False, dtype=np.float32, return_eigs=False):
 	cov  = 0
-	ndof = 0
+	ndof = np.sum(bins[:,1]-bins[:,0])*2
+	nbig = np.sum(bins[:,1]-bins[:,0]>=cov_big)
+	nper = cov_nmax//nbig
 	for bi, b in enumerate(bins):
-		cov  += measure_cov(ft[:,b[0]:b[1]])
+		bsize = b[1]-b[0]
+		# Speed up cov calculation by restricting to nmax per bin.
+		# We avoid thinning small bins, so only big ones enter into the
+		# calculation
+		nmax  = nper if bsize >= cov_big else bsize
+		cov  += measure_cov(ft[:,b[0]:b[1]], normalize=False, nmax=nmax)
+		# This isn't the number of dofs we measured in measure_cov,
+		# but the total number contained in the bins. These aren't
+		# the same because measure_cov thins the data, but what
+		# find_modes_single needs is the total number available.
 		ndof += 2*(b[1]-b[0])
 	return find_modes_single(cov, ndof, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, dtype=dtype, return_eigs=return_eigs)
-
-def find_modes_individual(ft, bins, eig_lim=None, single_lim=0, nmax_frac=0.1, verbose=False, dtype=np.float32):
-	vecs = []
-	for bi, b in enumerate(bins):
-		cov  = measure_cov(ft[:,b[0]:b[1]])
-		ndof = 2*(b[1]-b[0])
-		bin_vecs = find_modes_single(cov, ndof, eig_lim=eig_lim, single_lim=single_lim, nmax_frac=nmax_frac, verbose=verbose, dtype=dtype)
-		vecs.append(bin_vecs)
-	return vecs
-
-def first_nonempty(vecs):
-	for vec in vecs:
-		if vec.size > 0:
-			return vec
-
-def fallback_modes(vecs, vec_fallback):
-	return [(vec if vec.size > 0 else vec_fallback) for vec in vecs]
 
 def find_modes_single(cov, ndof, eig_lim=None, single_lim=0, nmax_frac=0.1, deproj=None, verbose=False, verb_prefix="", dtype=np.float32, return_eigs=False):
 	"""Find strong eigenmodes given a covmat measured from data with ndof samples per detector.

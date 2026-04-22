@@ -432,16 +432,32 @@ class NmatAdaptive(Nmat):
 		# If we detect a spike at the very beginning, in the extrapolated region, then it's
 		# unreliable
 		if len(bins_spike) > 0 and bins_spike[0,0] == 0: bins_spike = bins_spike[1:]
+
+		print("Spike bins")
+		for bi, (b1,b2) in enumerate(bins_spike):
+			print("%4d  %6d %6d  size %6d" % (bi, b1, b2, b2-b1))
+
 		# 2c. Find atmospheric regions using smooth_bps
 		bins_atm     = find_atm_bins(smooth_bps, bsize=bsize_smooth, step=self.atm_res)
 		# Add a final all-the-rest bin
 		bins_atm     = np.concatenate([bins_atm,[[bins_atm[-1,1],nfreq]]],0)
+
+		print("Atm bins")
+		for bi, (b1,b2) in enumerate(bins_atm):
+			print("%4d  %6d %6d  size %6d" % (bi, b1, b2, b2-b1))
+
 		# 3a. Find atm modes
+		# TODO: Investigate weight tuning. Seems to have a big effect
 		weight = (mps/np.mean(mps))**0.5
 		mask   = self.dev.np.ones(ftod.shape[-1], np.int32)
 		for bi, (b1,b2) in enumerate(bins_spike):
 			mask[b1:b2] = 0
 		to_interleave = []
+
+		#bunch.write("test.hdf", bunch.Bunch(ftod=self.dev.get(ftod), mps=self.dev.get(mps),
+		#	bins_atm=bins_atm, bins_spike=bins_spike, eig_lim=self.eig_lim, single_lim=self.single_lim))
+
+
 		atm_power = noise_modes_hybrid(ftod, bins_atm, weight=weight, mask=mask,
 			eig_lim=self.eig_lim, single_lim=self.single_lim, nmax=self.maxmodes, wtype=wtype)
 		to_interleave.append((bins_atm, atm_power))
@@ -459,6 +475,11 @@ class NmatAdaptive(Nmat):
 			to_interleave.append((bins_spike, spike_power))
 		# 4. Interleave bins, unless we don't need to
 		bins, power = interleave_power(to_interleave, dev=self.dev)
+
+		print("Merged bins")
+		for bi, (b1,b2) in enumerate(bins):
+			print("%4d  %6d %6d  size %6d" % (bi, b1, b2, b2-b1))
+
 		# 5. Precompute Kh and iD
 		nbin = len(bins)
 		iD = 1/self.dev.np.array(power.Ds).astype(wtype, copy=False) # [nbin,ndet]
@@ -916,6 +937,7 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 	#    narrow bins.
 	if weight is not None: ft *= weight # avoids copy, at cost of weight=0 breaking
 	V     = find_modes_merged(ft, bins, eig_lim=eig_lim, single_lim=single_lim).astype(wtype, copy=False)
+	print("V.shape", V.shape)
 	if weight is not None: ft /= weight
 	nglob = V.shape[1]
 	nmax  = min(nmax, ndet//2)
@@ -936,6 +958,7 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 		# We use the smallest of nmax, bsize and a calculated degree-of-freedom budget,
 		# with a minimum of 1
 		budget_E = min(bsize, nmax, max(1,(ndof-nper*ndet)//nper))
+		print(bi, bsize, budget_E)
 		#if budget_E < bsize: print(bi, bsize, budget_E)
 		# Measure as many amplitudes as we can afford
 		# C = VEV' => E = (V'V)"V'CV(V'V)"'. V ortho, so this is just E = V'CV
@@ -1027,7 +1050,6 @@ def interleave_power(tasks, dev=None):
 		binss  = [task[0] for task in tasks]
 		powers = [task[1] for task in tasks]
 		bins, srcs, sinds = override_bins(binss)
-		bins  = np.array(bins)
 		bins  = np.array(bins)
 		power = bunch.Bunch()
 		for key in ["Es", "Ds"]:

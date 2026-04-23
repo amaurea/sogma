@@ -39,6 +39,26 @@ def cumsum0(vals, endpoint=False):
 	else:        res[1:] = ap.cumsum(vals[:-1])
 	return res
 
+def detsum_ps(ftod):
+	"""Given complex ftod[:,:], return the equivalent of
+	np.sum(np.abs(ftod)**2,0), but without creating large
+	temporaries"""
+	ap    = device.anypy(ftod)
+	dtype = utils.real_dtype(ftod.dtype)
+	assert ftod.strides[-1] == ftod.dtype.itemsize, "Must be contiguous in last dimension"
+	rtod  = ftod.view(dtype)
+	# I tried doing this in one step with einsum("aic,aic->i"), where c
+	# was a len-2 axis for the real and complex parts, but that was 20x
+	# slower!
+	ps    = ap.einsum("ai,ai->i", rtod, rtod)
+	ps    = ap.sum(ps.reshape(-1,2),-1)
+	return ps
+
+def detmean_ps(ftod):
+	ps  = detsum_ps(ftod)
+	ps /= 2*ftod.shape[0]
+	return ps
+
 def split_ranges(dets, starts, lens, maxlen):
 	# Vectorized splitting of detector ranges into subranges.
 	# Probably premature optimization, since it's a bit hard to read.

@@ -319,6 +319,162 @@ class NmatDetvecs(Nmat):
 				window=data.window, nwin=data.nwin, downweight=data.downweight,
 				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar, dev=dev)
 
+class NmatDetvecsScaled(Nmat):
+	"""Based on Jon's noise model (e.g. NmatDetvecs), but factorizes out a high-resolution
+	det-averaged powers pectrum"""
+	def __init__(self, bin_edges=None, eig_lim=16, single_lim=0.55, mode_bins=[0.25,4.0,20],
+			sampvar=1e-2, window=2, nwin=None, verbose=False, bins=None, iD=None, V=None,
+			Kh=None, iE=None, himps=None, bsize_mean=None, ivar=None, dev=None):
+		# Variables used for building the noise model
+		if bin_edges is None: bin_edges = np.array([
+			0.16, 0.25, 0.35, 0.45, 0.55, 0.70, 0.85, 1.00,
+			1.20, 1.40, 1.70, 2.00, 2.40, 2.80, 3.40, 3.80,
+			4.60, 5.00, 5.50, 6.00, 6.50, 7.00, 8.00, 9.00, 10.0, 11.0,
+			12.0, 13.0, 14.0, 16.0, 18.0, 20.0, 22.0,
+			24.0, 26.0, 28.0, 30.0, 32.0, 36.5, 41.0,
+			45.0, 50.0, 55.0, 65.0, 70.0, 80.0, 90.0,
+			100., 110., 120., 130., 140., 150., 160., 170.,
+			180., 190.
+		])
+		self.dev       = dev or device.get_device()
+		self.bin_edges = np.array(bin_edges)
+		self.mode_bins = np.array(mode_bins)
+		self.eig_lim   = eig_lim
+		self.sampvar   = sampvar # target sample variance per bin in the det-averaged spec
+		self.single_lim= single_lim
+		self.verbose   = verbose
+		# Variables used for applying the noise model
+		self.bins      = bins
+		self.window    = window
+		self.nwin      = nwin
+		self.bsize_mean= bsize_mean
+		self.iD, self.V, self.Kh, self.ivar = iD, V, Kh, ivar
+		# sqrt(1/det_mean_power_spectrum). Used for scaling
+		self.himps     = himps
+		self.iE        = iE # not necessary
+		self.ready      = all([a is not None for a in [iD, V, Kh, ivar, himps]])
+		if self.ready:
+			self.iD, self.V, self.Kh, self.ivar = [dev.np.asarray(a) for a in [iD, V, Kh, ivar]]
+			self.maxbin = np.max(self.bins[:,1]-self.bins[:,0])
+	def build(self, tod, srate, extra=False, **kwargs):
+		# Apply window before measuring noise model
+		dtype = tod.dtype
+		nwin  = utils.nint(self.window*srate)
+		ndet, nsamp = tod.shape
+		nfreq = nsamp//2+1
+		tod   = self.dev.np.asarray(tod)
+		gutils.apply_window(tod, nwin)
+		#bunch.write("test_sogma_full.hdf", bunch.Bunch(tod=tod, srate=srate))
+		ft    = self.dev.lib.rfft(tod)
+		# Unapply window again
+		gutils.apply_window(tod, nwin, -1)
+
+		# Step 1: Find our eigenmodes V. We do this from the original, unscaled ftod
+		# to stay as similar to NmatDetvecs as we can
+		mode_bins = makebins(self.mode_bins, srate, nfreq, 1000, rfun=np.round)[1:-1]
+		if np.any(np.diff(mode_bins) < 0):
+			raise RuntimeError(f"At least one of the frequency bins has a negative range: \n{mode_bins}")
+		# Then use these to get our set of basis vectors
+		V = find_modes_jon(ft, mode_bins, eig_lim=self.eig_lim, single_lim=self.single_lim, force_common=True, verbose=self.verbose, dtype=dtype)
+		nmode= V.shape[1]
+		if V.size == 0: raise errors.ModelError("Could not find any noise modes")
+
+		# Step 2: Measure a high-res det-mean power spectrum, which we will factorize out.
+		# The bin-size is set automatically to reach the given sample variance
+		bsize_mean = max(1,utils.ceil(2/self.sampvar/ndet))
+		himps = gutils.downgrade(gutils.detmean_ps(ft), bsize_mean)**-0.5
+		self.dev.lib.block_scale(ft, himps, bsize=bsize_mean, inplace=True)
+
+		# Step 3: Measure the correlated and rest noise in a set of hardcoded
+		# bins based on the whitened spectrum.
+		# Cut bins that extend beyond our max frequency
+		bin_edges = self.bin_edges[self.bin_edges < srate/2 * 0.99]
+		bins      = makebins(bin_edges, srate, nfreq, nmin=2*nmode, rfun=np.round)
+		nbin      = len(bins)
+		# Now measure the power of each basis vector in each bin. The residual
+		# noise will be modeled as uncorrelated
+		E  = self.dev.np.zeros([nbin,nmode],dtype)
+		D  = self.dev.np.zeros([nbin,ndet],dtype)
+		Nd = self.dev.np.zeros([nbin,ndet],dtype)
+		for bi, b in enumerate(bins):
+			# Skip the DC mode, since it's it's unmeasurable and filtered away
+			b = np.maximum(1,b)
+			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
+		del Nd, ft
+		# Also compute a representative white noise level. This needs to take
+		# into account the scaling we've already done. Sadly the bins don't map
+		# cleanly onto each other, but at least the scaling bin-size is constant,
+		# so we can translate the corr-bins from fourier modes to scaling bins
+		binned_scale = self.dev.np.array([self.dev.np.mean(himps[b1:b2]**2) for b1,b2 in bins//bsize_mean])
+		bsize = self.dev.np.array(bins[:,1]-bins[:,0])
+		ivar  = self.dev.np.sum(1/D*binned_scale[:,None]*bsize[:,None],0)/self.dev.np.sum(bsize)
+		ivar *= nsamp
+		# We need D", not D
+		iD, iE = 1/D, 1/E
+		# Precompute Kh = (E" + V'D"V)**-0.5
+		Kh = self.dev.np.zeros([nbin,nmode,nmode],dtype)
+		for bi in range(nbin):
+			iK = self.dev.np.diag(iE[bi]) + V.T.dot(iD[bi,:,None] * V)
+			Kh[bi] = np.linalg.cholesky(self.dev.np.linalg.inv(iK))
+		# Construct a fully initialized noise matrix
+		nmat = NmatDetvecsScaled(bin_edges=self.bin_edges, eig_lim=self.eig_lim, single_lim=self.single_lim,
+				window=self.window, sampvar=self.sampvar, nwin=nwin, verbose=self.verbose,
+				bins=bins, himps=himps, bsize_mean=bsize_mean, iD=iD, V=V, Kh=Kh, iE=iE, ivar=ivar, dev=self.dev)
+		return nmat
+	def apply(self, gtod, inplace=True):
+		self.check_ready()
+		t1 =self.dev.time()
+		if not inplace: gtod = gtod.copy()
+		gutils.apply_window(gtod, self.nwin)
+		t2 =self.dev.time()
+		ft = self.dev.pools["ft"].empty((gtod.shape[0],gtod.shape[1]//2+1),utils.complex_dtype(gtod.dtype))
+		self.dev.lib.rfft(gtod, ft)
+		# Whiten spectrum
+		self.dev.lib.block_scale(ft, self.himps, bsize=self.bsize_mean, inplace=True)
+		# If we don't cast to real here, we get the same result but much slower
+		rft = ft.view(gtod.dtype)
+		t3 =self.dev.time()
+		# Work arrays. Safe to overwrite tod array here, since we'll overwrite it with the ifft afterwards anyway
+		ndet, nmode = self.V.shape
+		nbin        = len(self.bins)
+		with self.dev.pools["tod"].as_allocator():
+			# Tmp must be big enough to hold a full bin's worth of data
+			tmp    = self.dev.np.empty([nmode,2*self.maxbin],dtype=rft.dtype)
+			vtmp   = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
+			divtmp = self.dev.np.empty([ndet,nmode],         dtype=rft.dtype)
+			apply_vecs(rft, self.iD, self.V, self.Kh, self.bins, tmp, vtmp, divtmp, dev=self.dev, out=rft)
+		# Transpose whiten spectrum
+		self.dev.lib.block_scale(ft, self.himps, bsize=self.bsize_mean, inplace=True)
+		self.dev.synchronize()
+		t4 =self.dev.time()
+		self.dev.lib.irfft(ft, gtod)
+		t5 =self.dev.time()
+		gutils.apply_window(gtod, self.nwin)
+		t6 =self.dev.time()
+		L.print("iN sub win %6.4f fft %6.4f mats %6.4f ifft %6.4f win %6.4f ndet %3d nsamp %5d nmode %2d nbin %2d" % (t2-t1,t3-t2,t4-t3,t5-t4,t6-t5, gtod.shape[0], gtod.shape[1], self.V.shape[1], len(self.bins)), level=3)
+		return gtod
+	def white(self, gtod, inplace=True, nwin=None):
+		self.check_ready()
+		if not inplace: gtod.copy()
+		if nwin is None: nwin = self.nwin
+		gutils.apply_window(gtod, nwin)
+		gtod *= self.ivar[:,None]
+		gutils.apply_window(gtod, nwin)
+		return gtod
+	def write(self, fname):
+		data = bunch.Bunch(type="NmatDetvecsScaled")
+		for field in ["bin_edges", "eig_lim", "single_lim", "window", "nwin", "sampvar", "bsize_mean", "himps",
+				"bins", "iD", "V", "iE", "Kh", "ivar"]:
+			data[field] = self.dev.get(getattr(self, field))
+		bunch.write(fname, data)
+	@staticmethod
+	def from_bunch(data, dev=None):
+		return NmatDetvecsScaled(bin_edges=data.bin_edges, eig_lim=data.eig_lim, single_lim=data.single_lim,
+				window=data.window, nwin=data.nwin, sampvar=data.sampvar, bsize_mean=data.bsize_mean, himps=data.himps,
+				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar, dev=dev)
+
+
+
 # Originally considered a model of this form,
 #  ps = ps_detcov * Δperdet * Δmean * Δtweak
 # * ps_detcov is a detvecs noise model. Low frequency resolution
@@ -429,6 +585,7 @@ class NmatAdaptive(Nmat):
 		# 2b. Find our spikes
 		rel_ps       = mps/smooth_ps
 		bins_spike   = find_spikes(self.dev.get(rel_ps))
+
 		# If we detect a spike at the very beginning, in the extrapolated region, then it's
 		# unreliable
 		if len(bins_spike) > 0 and bins_spike[0,0] == 0: bins_spike = bins_spike[1:]

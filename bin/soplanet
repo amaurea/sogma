@@ -1,9 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/env -S python -u
 import numpy as np, os, time, sys
 from pixell import config, enmap, utils, mpi, colors, bench
 from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils, soeph
 # for its config
 from sogma.loaders import sofast
+# Allow us to map at higher resolution than gpu_mm normally supports.
+# This breaks xwrapping, but should not be relevant for planet maps
+config.set("cap_xwrap", 64*1024)
+# The glitch cut is usually missing for planet observations
+config.set("cuts_optional", True)
 # Have to do all imports that could contain configuration before
 # building config.ArgumentParser because these may define variables.
 # This means we can't bail out early when called with wrong arguments;
@@ -21,7 +26,7 @@ parser.add_argument("-q", "--quiet",   action="count", default=0)
 parser.add_argument("-L", "--loader",  type=str, default="auto")
 parser.add_argument("-D", "--device",  type=str, default="auto")
 parser.add_argument(      "--ignore",  type=str, default="recover")
-parser.add_argument("-j", "--joint",   type=str, default="obs")
+parser.add_argument("-j", "--joint",   type=str, default="oband")
 parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
 parser.add_argument(      "--tsplit",  type=float, default=None, help="Split obs-groups in time to keep them shorter than this many seconds. See also --split")
 parser.add_argument("-c", "--cont",    action="store_true")
@@ -54,7 +59,9 @@ if len(obsinfo) == 0:
 	sys.exit(1)
 # Define obs-groups
 joint   = loader.group_obs(obsinfo, mode=args.joint)
-joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
+ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
+demod   = mapmaking.demod_settings(ginfo)
+joint   = gutils.time_split(joint, ginfo, demod=demod, maxsize=args.split*1e9, maxdur=args.tsplit)
 # group selection. Sadly this can't be done with the query-level selection, as that
 # happens before grouping.
 jinds   = eval("list(range(%d))[%s]" % (len(joint.groups),args.sel))
@@ -87,14 +94,18 @@ config.set("object_cut",    "planets:5")
 mask = enmap.zeros((3,)+shape[-3:], wcs, dtype_map)
 mask[0] = mask.distance_from([0,0], rmax=mask_rad) < mask_rad
 # Only safe to use buf="pointing" if we perform zero cg steps!
-noise_model = nmat.PseudoNmatGapfill(mask=mask, sys=sys, buf="pointing", dev=dev)
+noise_model = nmat.NmatWhite(dev=dev)
+filter      = nmat.FilterGapfill(mask=mask, sys=sys, buf="pointing", dev=dev)
 # Set up the signals we will solve for
-map_out = ["bin", "ivar"]
+map_out = ["map", "ivar"]
+# Building SignalMapMulti globally like this means that we end up outputting per-band maps
+# even when making oband observations, leading to a lot of empty maps. sogma in perobs
+# mode suffers from the same problem. Need a redesign to avoid this problem.
 if joint.joint:
 	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=dtype_map, sys=sys, outputs=map_out, precon="div")
 else:
 	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype_map, sys=sys, outputs=map_out, precon="div")
 signals    = [signal_map]
 # Setup mapmaker and make the maps
-mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev)
-mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, maxiter=0, ignore=args.ignore, cont=args.cont)
+mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, filter=filter, dev=dev)
+mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, maxiter=5, ignore=args.ignore, cont=args.cont)

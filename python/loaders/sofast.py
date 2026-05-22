@@ -143,7 +143,7 @@ class SoFastLoader:
 				meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
 		# Set up total obs
 		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[], cuts=[])
-		append_fields = [("dets",0),("detids",0),("bands",0),("point_offset",0),
+		append_fields = [("dets",0),("detids",0),("detpix",0),("bands",0),("point_offset",0),
 			("polangle",0),("response",1)]
 		for field, axis in append_fields: otot[field] = []
 		dcum = 0
@@ -170,7 +170,7 @@ class SoFastLoader:
 				otot.boresight = obs.boresight
 				otot.hwp       = obs.hwp
 				otot.site      = obs.site
-				otot.overpole  = obs.overpole
+				otot.bore_ref  = obs.bore_ref
 				# This is where we finally put things in the "tod" pool. Until now, we've
 				# used the input buffer "itod"
 				otot.tod       = self.dev.pools["tod"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
@@ -255,6 +255,7 @@ class FastMeta:
 			if detids is not None: good &= np.isin(detinfo.dets,     detids, assume_unique=True)
 			aman = minisotodlib.AxisManager(minisotodlib.LabelAxis("dets", detinfo.channels[good]))
 			aman.wrap("det_ids", detinfo.dets[good], [(0,"dets")])
+			aman.wrap("det_pix", detinfo.pix [good], [(0,"dets")])
 			aman.wrap("bands",   detname2band(detinfo.dets[good]), [(0,"dets")])
 		ndet_full = aman.dets.count
 		# 2. Load the necessary info from det_cal
@@ -442,7 +443,6 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	timestamps, signal, cuts, raw_cuts, jumps, az, el = [a[...,i1:i2] for a in [data.timestamps,data.signal,cuts,raw_cuts,jumps,data.az,data.el]]
 	hwp_angle = meta.aman.hwp_angle[i1:i2] if "hwp_angle" in meta.aman else None
 	ninit = data.dets.count
-	overpole = el[0]>90
 
 	# prev_obs lets us pass in the result of calibrate run on
 	# a different set of detectors for the same observation.
@@ -451,6 +451,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	if prev_obs is not None:
 		ctime        = prev_obs.ctime
 		el, az, roll = prev_obs.boresight
+		bore_ref     = prev_obs.bore_ref
 	else:
 		with bench.mark("ctime"):
 			ctime   = timestamps * meta.timestamp_to_ctime
@@ -464,6 +465,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 			else:
 				# LAT: corotator angle → roll
 				roll = -data.corot[i1:i2]*utils.degree + el - 60*utils.degree
+		bore_ref = np.array([el[0], az[0], roll[0]])
 		with bench.mark("pointing correction"):
 			az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
 
@@ -573,7 +575,6 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))
 
 	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
-
 	with bench.mark("cuts reformat"):
 		ocuts = cuts.to_simple()
 
@@ -581,6 +582,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	res  = bunch.Bunch()
 	res.dets         = meta.aman.dets.vals[good]
 	res.detids       = meta.aman.det_ids[good]
+	res.detpix       = meta.aman.det_pix[good]
 	res.bands        = meta.aman.bands[good]
 	res.point_offset = meta.aman.focal_plane[good,1::-1]
 	res.polangle     = meta.aman.focal_plane[good,2]
@@ -591,7 +593,10 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	res.cuts         = ocuts
 	res.site         = "so"
 	res.response     = None
-	res.overpole     = overpole # whether el was originally > 90°. TODO: update the other loaders
+	# original value of the first sample of boresight, before the pointing model
+	# preserves the original winding, e.g.. el > 90, az > 360, etc, so can be used
+	# to restore this information where it is necessary
+	res.bore_ref     = bore_ref # [el0,az0,roll0]
 	# Test per-detector response
 	#res.response     = dev.np.zeros((2,len(res.tod)),res.tod.dtype)
 	#res.response[0]  = 2
@@ -665,6 +670,10 @@ class WaferInfo:
 				dets  = np.char.decode(data["dets:det_id"]),
 				bands = np.char.decode(data["dets:wafer.bandpass"]),
 				types = np.char.decode(data["dets:wafer.type"]),
+				array = np.char.decode(data["dets:wafer.array"]),
+				rhombus = np.char.decode(data["dets:wafer.rhombus"]),
+				row   = data["dets:wafer.det_row"],
+				col   = data["dets:wafer.det_col"],
 				raw   = data)
 
 # Should extend DetCache to also include wafer_info. wafer_info
@@ -729,20 +738,30 @@ class DetCache:
 			ainds, winds = utils.common_inds([ainfo.dets, winfo.dets])
 			# Group by band:type
 			band_type = np.char.add(np.char.add(winfo.bands[winds],":"),winfo.types[winds])
+			# Build a pixel id. This is the same for all detectors that are co-located
+			# in the focal plane, and is usedful for pair differencing etc
+			pixid = build_pixid(winfo.array[winds], winfo.rhombus[winds], winfo.row[winds], winfo.col[winds])
 			bts, order, edges = utils.find_equal_groups_fast(band_type)
 			for bti, bt in enumerate(bts):
 				band, type = bt.split(":")
 				subid = "%s:%s:%s:%s" % (obsid, sinfo.wslot, band, type)
-				inds  = ainds[order[edges[bti]:edges[bti+1]]]
+				ginds = order[edges[bti]:edges[bti+1]]
+				inds  = ainds[ginds]
 				self.det_cache[subid] = bunch.Bunch(
 						channels = ainfo.channels[inds],
 						dets     = ainfo.dets[inds],
 						detset   = dset,
 						band     = band,
 						type     = type,
+						pix      = pixid[ginds],
 				)
 			self.detset_cache[obsid][sinfo.wslot] = dset
 		self.done.add(obsid)
+
+def build_pixid(array, rhombus, row, col):
+	# Annoying that numpy.char doesn't provide any real vectorized
+	# operations for this, only pretend ones
+	return np.array(["%s_%sr%02dc%02d" % (a,R,r,c) for a,R,r,c in zip(array, rhombus, row, col)])
 
 class Subid:
 	def __init__(self, obsid, wslot, band, type="OPTC"):

@@ -36,6 +36,7 @@ class NmatNull(Nmat):
 	def __init__(self, dev=None):
 		self.dev   = dev or device.get_device()
 		self.ready = True
+		self.ivar  = np.zeros(10000,np.float32)
 	def build(self, tod, srate, **kwargs): return self
 	def apply(self, tod, inplace=True):
 		if not inplace: tod = tod.copy()
@@ -58,9 +59,18 @@ class NmatDebug(Nmat):
 	def build(self, tod, srate, **kwargs):
 		nsamp  = tod.shape[1]
 		nblock = nsamp//self.bsize
-		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
+		vars   = self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1)
+		# Robustness for cases with huge gapfilled regions
+		fallback = vars*0 + self.dev.np.var(tod,-1)[:,None]
+		bad    = vars==0
+		vars[bad] = fallback[bad]
+		var    = self.dev.np.median(vars,-1)
 		with utils.nowarn():
 			ivar = utils.without_nan(1/var)*self.downweight
+		# More robustness
+		ref    = self.dev.np.median(ivar)
+		if ref == 0: ivar[:] = 0
+		else: ivar[ivar>ref*100] = 0
 		f = self.dev.np.fft.rfftfreq(nsamp, 1/srate)
 		with utils.nowarn():
 			profile = 1/(1+(f/self.fknee)**self.alpha)
@@ -225,7 +235,8 @@ class NmatDetvecs(Nmat):
 		tod   = self.dev.np.asarray(tod)
 		gutils.apply_window(tod, nwin)
 		#bunch.write("test_sogma_full.hdf", bunch.Bunch(tod=tod, srate=srate))
-		ft    = self.dev.lib.rfft(tod)
+		ft    = self.dev.pools["ft"].empty((ndet,nfreq), utils.complex_dtype(dtype))
+		self.dev.lib.rfft(tod, ft)
 		# Unapply window again
 		gutils.apply_window(tod, nwin, -1)
 		#del tod
@@ -362,10 +373,10 @@ class NmatDetvecsScaled(Nmat):
 		nwin  = utils.nint(self.window*srate)
 		ndet, nsamp = tod.shape
 		nfreq = nsamp//2+1
-		tod   = self.dev.np.asarray(tod)
 		gutils.apply_window(tod, nwin)
 		#bunch.write("test_sogma_full.hdf", bunch.Bunch(tod=tod, srate=srate))
-		ft    = self.dev.lib.rfft(tod)
+		ft    = self.dev.pools["ft"].empty((ndet,nfreq), utils.complex_dtype(dtype))
+		self.dev.lib.rfft(tod, ft)
 		# Unapply window again
 		gutils.apply_window(tod, nwin, -1)
 
@@ -473,7 +484,124 @@ class NmatDetvecsScaled(Nmat):
 				window=data.window, nwin=data.nwin, sampvar=data.sampvar, bsize_mean=data.bsize_mean, himps=data.himps,
 				bins=data.bins, D=data.D, V=data.V, E=data.E, ivar=data.ivar, dev=dev)
 
+class NmatPairRot(Nmat):
+	""""Rotate" from normal tod to pair-diffs and pair-sums before constructing
+	another noise model."""
+	def __init__(self, nmat, frange=[0.01,0.1], wrange=[10,20], rot=None, ivar=None, dev=None):
+		if dev is None: dev = device.get_device()
+		self.dev     = dev
+		self.nmat    = nmat
+		self.frange  = np.array(frange)
+		self.wrange  = np.array(wrange)
+		self.rot     = rot
+		self.ivar    = ivar
+		self.ready   = nmat.ready and rot is not None and ivar is not None
+	def build(self, tod, srate, obs, extra=False, **kwargs):
+		# Find pairs and singles. This will throw an error if
+		# we get triples or higher, which this class doesn't
+		# know how to deal with
+		singles, pairs = gutils.find_det_tuples(obs, nmin=2, transpose=True)
+		# Will determine our pair scaling using a small range in fourier spac3
+		df   = srate/tod.shape[1]
+		ifrange = utils.ceil(self.frange/df)
+		iwrange = utils.ceil(self.wrange/df)
+		with self.dev.pools["ft"].as_allocator():
+			ft = self.dev.lib.rfft(tod)
+		# Estimate unrotated white noise level, which we need for our .ivar member
+		ivar = tod.shape[1]/self.dev.np.mean(np.abs(ft[:,iwrange[0]:iwrange[1]])**2,-1)
+		pft  = ft[pairs,ifrange[0]:ifrange[1]] # [2,npair,:]
+		pft  = pft.view(utils.real_dtype(pft.dtype))
+		# Find what pft[1] must be multiplied by to minimize its diff with pft[0]
+		amps = self.dev.np.sum(pft[0]*pft[1],-1)/self.dev.np.sum(pft[1]*pft[1],-1)
+		# Apply our rotation so we can forward to our inner model. Would
+		# normally overwrite tod, but will need it after this. Could unrotate, but
+		# that could lose some precision, so we make a copy instead
+		rot  = PairRot(singles, pairs, amps, pool=self.dev.pools["ft"], dev=self.dev)
+		wtod = self.dev.pools["pointing"].array(tod)
+		rot.apply(wtod)
+		# We forward obs, but beware that the det order is messed up!
+		nmat = self.nmat.build(wtod, srate, obs=obs, extra=extra, **kwargs)
+		return NmatPairRot(nmat, frange=self.frange, rot=rot, ivar=ivar, dev=self.dev)
+	def apply(self, tod, inplace=True):
+		# Have Q = cov(Rd) = R<dd'>R' = RNR' => N = R"'Q"R" => N" = RQR'
+		# R  = rotate*scale*reorder
+		# R' = reorder'*scale'*rotate'
+		# rotate   = [[1,1],[1,-1]] = rotate'
+		# reorder' = reorder"
+		# scale'   = scale
+		# Hence, R' = R", except the scaling isn't inverted
+		self.check_ready()
+		t1 = self.dev.time()
+		if not inplace: tod = tod.copy()
+		self.rot.apply(tod)
+		t2 = self.dev.time()
+		self.nmat.apply(tod)
+		t3 = self.dev.time()
+		self.rot.adjoint(tod)
+		t4 = self.dev.time()
+		L.print("iN sub rot %6.4f child %6.4f rot' %6.4f ndet %3d nsamp %5d" % (t2-t1,t3-t2,t4-t3,tod.shape[0],tod.shape[1]), level=3)
+		return tod
+	#def white(self, tod, inplace=True, nwin=None):
+	#	# Consider just using ivar here...
+	#	self.check_ready()
+	#	if not inplace: gtod.copy()
+	#	self.rot.apply(tod)
+	#	self.nmat.white(tod, nwin=nwin)
+	#	self.rot.adjoint(tod)
+	#	return tod
+	def white(self, tod, inplace=True, nwin=None):
+		self.check_ready()
+		if not inplace: tod.copy()
+		if nwin is None: nwin = self.nmat.nwin
+		gutils.apply_window(tod, nwin)
+		tod *= self.ivar[:,None]
+		gutils.apply_window(tod, nwin)
+		return tod
+	def write(self, fname): raise NotImplementedError
+	@staticmethod
+	def from_bunch(data, dev=None): raise NotImplementedError
 
+class PairRot:
+	def __init__(self, singles, pairs, amps, pool=None, dev=None):
+		if dev  is None: dev  = device.get_device()
+		if pool is None: pool = self.dev.np
+		self.singles = singles
+		self.pairs   = pairs
+		self.amps    = amps
+		self.pool    = pool
+		self.dev     = dev
+	@property
+	def ns(self): return self.singles.shape[1]
+	def apply(self, tod, work=None):
+		if work is None: work = self.pool.empty(tod.shape, tod.dtype)
+		sshape = self.singles.shape+tod.shape[-1:]
+		pshape = self.pairs  .shape+tod.shape[-1:]
+		# Extract into contiguous blocks
+		wstod = self.dev.np.take(tod, self.singles, axis=0, out=work[:self.ns].reshape(sshape))
+		wptod = self.dev.np.take(tod, self.pairs,   axis=0, out=work[self.ns:].reshape(pshape))
+		# Apply scaling
+		wptod[1] *= self.amps[:,None]
+		# Apply the "rotation" into tod
+		gutils.pair_rotate(wptod, tod[self.ns:].reshape(pshape))
+		tod[:self.ns] = wstod[0]
+		return tod
+	def adjoint(self, tod, work=None):
+		return self.unapply(tod, work=work, adjoint=True)
+	def unapply(self, tod, work=None, adjoint=False):
+		if work is None: work = self.pool.empty(tod.shape, tod.dtype)
+		pshape = self.pairs  .shape+tod.shape[-1:]
+		# Unapply the rotation into work
+		wptod = work[self.ns:].reshape(pshape)
+		gutils.pair_rotate(tod[self.ns:].reshape(pshape), wptod)
+		# Copy over singles too
+		work[:self.ns] = tod[:self.ns]
+		# Unapply scaling
+		if adjoint: wptod[1] *= self.amps[:,None]
+		else:       wptod[1] /= self.amps[:,None]
+		# Insert at original positions
+		tod[self.singles.reshape(-1)] = work[:self.ns]
+		tod[self.pairs  .reshape(-1)] = work[self.ns:]
+		return tod
 
 # Originally considered a model of this form,
 #  ps = ps_detcov * Δperdet * Δmean * Δtweak
@@ -807,27 +935,24 @@ class NmatAdaptive(Nmat):
 				b["%s%02d" % (name,i)] = self.dev.get(v)
 		bunch.write(fname, b)
 
-class PseudoNmatGapfill(Nmat):
-	def __init__(self, mask, sys="equ,on=saturn", bsize=256, ivar=None, cuts=None, srate=None, buf="model", dev=None):
+class Filter:
+	def __init__(self, dev=None):
+		"""Initialize the filter. In subclasses this will typically set up parameters"""
+		self.dev   = dev or device.get_device()
+	def apply(self, tod, srate=1, obs=None):
+		"""Apply the filter to tod, overwriting it with the result"""
+		pass
+
+class FilterNone(Filter): pass
+
+class FilterGapfill(Filter):
+	def __init__(self, mask, sys="equ,on=saturn", buf="model", dev=None):
 		self.dev   = dev or device.get_device()
 		assert mask.ndim == 3 and mask.shape[0] == 3 and mask.dtype == np.float32
 		self.mask  = mask
 		self.sys   = sys
-		self.bsize = bsize
 		self.buf   = buf
-		self.nwin  = 0
-		self.srate = srate
-		self.ivar  = None if ivar is None else self.dev.np.asarray(ivar)
-		self.cuts  = cuts
-	@property
-	def ready(self): return self.ivar is not None and self.cuts is not None and self.srate is not None
-	def build(self, tod, srate, obs, **kwargs):
-		# First measure the white noise level
-		nsamp  = tod.shape[1]
-		nblock = nsamp//self.bsize
-		var    = self.dev.np.median(self.dev.np.var(tod[:,:nblock*self.bsize].reshape(-1,nblock,self.bsize),-1),-1)
-		with utils.nowarn():
-			ivar = utils.without_nan(1/var)
+	def apply(self, tod, srate, obs, **kwargs):
 		# Then build our cut object. Very similar to socal.object_cut, but it didn't quite
 		# match what I wanted here. It didn't allow one to specify a coordinate system
 		from . import pmat, tiling
@@ -839,30 +964,11 @@ class PseudoNmatGapfill(Nmat):
 		# turn non-zero values into a cuts object
 		from . import socal
 		cuts = socal.mask2cut(wtod, dev=self.dev)
-		return PseudoNmatGapfill(mask=self.mask, sys=self.sys, bsize=self.bsize,
-			ivar=ivar, cuts=cuts, srate=srate, buf=self.buf, dev=self.dev)
-	def apply(self, tod, inplace=True):
-		"""Doesn't actually act like multiplying by a noise matrix.
-		Instead it uses the areas outside the mask to predict and subtract the
-		correlated noise inside the mask"""
-		self.check_ready()
-		if not inplace: tod.copy()
 		# Build our gapfilled model
 		model = self.dev.pools[self.buf].array(tod)
-		gutils.estimate_atm_tod(model, self.cuts, srate=self.srate, dev=self.dev, pool=self.dev.pools["ft"])
+		gutils.estimate_atm_tod(model, cuts, srate=srate, dev=self.dev, pool=self.dev.pools["ft"])
 		# subtract prediction from tod to clean the atmosphere
 		tod -= model
-		return tod
-	def white(self, tod, inplace=True, nwin=None):
-		# This is the only part of this "Nmat" that actually acts as a noise matrix
-		self.check_ready()
-		if not inplace: gtod.copy()
-		gtod *= self.ivar[:,None]
-		return gtod
-	def write(self, fname): return NotImplementedError
-	@staticmethod
-	def from_bunch(data, dev=None): return NotImplementedError
-
 
 #################
 # Helpers below #
@@ -1095,7 +1201,6 @@ def noise_modes_hybrid(ft, bins, weight=None, mask=None, eig_lim=16, single_lim=
 	#    narrow bins.
 	if weight is not None: ft *= weight # avoids copy, at cost of weight=0 breaking
 	V     = find_modes_merged(ft, bins, eig_lim=eig_lim, single_lim=single_lim).astype(wtype, copy=False)
-	print("V.shape", V.shape)
 	if weight is not None: ft /= weight
 	nglob = V.shape[1]
 	nmax  = min(nmax, ndet//2)

@@ -221,6 +221,30 @@ class TileDistribution:
 		if buf: arr = buf.zeros(self.work.shape, dtype, reset=reset)
 		else:   arr = self.dev.np.zeros(self.work.shape, dtype)
 		return self.dev.lib.LocalMap(self.work.lp, arr)
+	# How to get the coordinates of each cell we own. Sadly cumbersome because
+	# of the messy structure in this class.
+	# 1. shape, wcs is the fullsky geometry that we're tiling
+	# 2. downer[ty,tx] is the owner of fullsky[ty*tsize:(ty+1)*tsize,tx*tsize:(tx+1)*tsize]
+	# 3. corners = np.array(np.where(downer==comm.rank)).T*tsize are the corner coordinates
+	#    of each of the tiles we own
+	# 4. We assume car, so given tpix = np.mgrid[:tsize,:tsize], the coordinate of each
+	#    tile-pixel will be tpix*wcs.wcs.cdelt[1::-1,None,None]
+	def dpixmap(self):
+		"""Return the global pixel-coordinates of each pixel in our dmap
+		as pixmap[{y,x},ntile,ny,nx]"""
+		corners = np.array(np.where(self.dist.owner==self.comm.rank))*self.tsize
+		relpix  = np.mgrid[:self.tshape,:self.tshape]
+		return corners[:,:,None,None]+relpix
+	def dposmap(self):
+		"""Returns the global sky-coordinates of each pixel in our dmap
+		as posmap[{dec,ra},ntile,ny,nx].
+		Assumes CAR! Could easily be generalized"""
+		assert self.wcs.wcs.ctype[0][-3:] == "CAR"
+		posmap  = self.dpixmap().astype(float)
+		posmap -= self.wcs.wcs.crpix[1::-1,None,None,None]
+		posmap *= cdelt[1::-1,None,None,None]*utils.degree
+		posmap += self.wcs.wcs.crval[1::-1,None,None,None]*utils.degree
+		return posmap
 
 def build_dist_tiling(dist_owner, comm, tsize=1):
 	dist = bunch.Bunch(owner=dist_owner)
@@ -418,22 +442,43 @@ def distribute_global_tiles_exposed_simple(loc_cells, comm):
 	owner[mask] = np.arange(nhit)*comm.size//nhit
 	return owner
 
-def distribute_tods_simple(obsinfo, nsplit):
+def get_weight_detsamps(obsinfo, joint=None):
+	if joint is None: return obsinfo.ndet.astype(int)*obsinfo.nsamp
+	ntot = []
+	for g in joint.groups:
+		ndet  = np.sum(obsinfo.ndet [g])
+		nsamp = np.sum(obsinfo.nsamp[g])
+		# int to get 8-byte, to avoid overflow
+		ntot.append(int(ndet)*nsamp)
+	return np.array(ntot)
+
+def distribute_tods_simple(obsinfo, nsplit, joint=None):
 	return bunch.Bunch(
 		owner   = np.arange(len(obsinfo))%nsplit,
 		weights = np.ones(nsplit),
 	)
 
-def distribute_tods_ra(obsinfo, nsplit, verbose=False):
+def distribute_tods_ra_plain(obsinfo, nsplit, joint=None, verbose=False):
+	"""Split tods by the typical ra value without weighting."""
+	ra     = np.mean(obsinfo.sweep[:,:,0],-1)
+	order  = np.argsort(ra)
+	owner  = np.zeros(len(obsinfo),int)
+	owner[order] = np.arange(len(obsinfo))*nsplit//len(obsinfo)
+	return bunch.Bunch(
+		owner   = owner,
+		weights = np.ones(nsplit),
+	)
+
+def distribute_tods_ra(obsinfo, nsplit, weight, verbose=False):
 	"""Split tods by the typical ra value. This isn't optimal, but it's
 	fast and robust, unlike distribute_tods_semibrute, that sometimes fails
-	and leaves things very unbalanced."""
+	and leaves things very unbalanced. This version tries to keep the total
+	number of det-samples per split the same."""
 	ntod  = len(obsinfo)
 	# Handle special cases
 	if nsplit == 1: return bunch.Bunch(owner=np.zeros(ntod,int), weight=np.ones(ntod))
 	if ntod <= nsplit: return bunch.Bunch(owner=np.arange(ntod), weight=np.ones(ntod))
 	ra     = np.mean(obsinfo.sweep[:,:,0],-1)
-	weight = obsinfo.ndet*obsinfo.nsamp
 	# Hand out blocks in ra-sorted space
 	order  = np.argsort(ra)
 	cweight= np.cumsum(weight[order])
@@ -447,7 +492,7 @@ def distribute_tods_ra(obsinfo, nsplit, verbose=False):
 	wper   = np.bincount(owner, weight, minlength=nsplit)
 	return bunch.Bunch(owner=owner, weights=wper)
 
-def distribute_tods_semibrute(obsinfo, nsplit, npass=2, niter=10, verbose=False):
+def distribute_tods_semibrute(obsinfo, nsplit, weight, npass=2, niter=10, verbose=False):
 	"""Split into nsplit groups such that the groups are
 	are approximately maximally-separated in state-space,
 	and each group has approximately the same weight.
@@ -466,7 +511,6 @@ def distribute_tods_semibrute(obsinfo, nsplit, npass=2, niter=10, verbose=False)
 	pos   = np.array([obsinfo.sweep[:,:,1],obsinfo.sweep[:,:,0]]) # [{y,x},ntod,npoint]
 	state = np.moveaxis(pos,1,0).reshape(ntod,-1) # [ntod,ncoord]
 	# TODO: Do I need to unwind state here?
-	weight= obsinfo.ndet*obsinfo.nsamp
 	# Start from the point with the lowest state-sub
 	refs, dists  = find_refs_rimwise(state, nsplit)
 	gid, gweight = assign_to_group_semibrute(dists, weight, nsplit, niter=niter, state=state, verbose=verbose)

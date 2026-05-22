@@ -14,13 +14,27 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	which   = config.get("autocut", which)
 	if which == "none" or len(which) == 0: return obs
 	which   = which.split(",")
+	# The functions that implement each autocut type
 	cutfuns = {"objects": object_cut, "sidelobes": sidelobe_cut}
+	# Whether these are generally bright enough that they should
+	# be gapfilled. This is the case if they are bright enough that
+	# they would distort the noise model, or if they represent a sudden
+	# jump in signal that the smooth degrees of freedom in the polynomial
+	# cut would not be able to represent. Not gapfilling is beneficial for
+	# broad regions like sidelobe cuts, which can be tens of degrees across,
+	# since removing these would mess up the noise model too.
+	bright  = {"objects": True,       "sidelobes": False}
 	cuts = [obs.cuts]
+	fill = [obs.cuts]
 	for i, cutname in enumerate(which):
-		cuts += cutfuns[cutname](obs, id=id, geo=geo, dev=dev)
+		cut   = cutfuns[cutname](obs, id=id, geo=geo, dev=dev)
+		cuts += cut
+		if bright[cutname]: fill += cut
 	cuts = socut.Simplecut.merge(cuts)
+	fill = socut.Simplecut.merge(fill)
 	#cuts.gapfill(obs.tod, dev=dev)
 	obs.cuts = cuts
+	obs.fill = fill
 	return obs
 
 # TODO: This function takes around 1 sec, dominated by ephem_map+lmap+pmap
@@ -428,14 +442,17 @@ def get_object_list(object_list=None, planet_list=None, asteroid_list=None, dedu
 		"asteroids": nonempty(config.get("asteroid_list", asteroid_list).split(",")),
 	}
 	res = []
-	for tok in object_list.split(","):
-		subs = tok.split(":")
+	def expand(entry, rad=30*utils.arcmin):
+		subs = entry.split(":")
 		name = subs[0]
-		rad  = float(subs[1]) if len(subs) > 1 else 30
-		rad *= utils.arcmin
+		if len(subs) > 1:
+			rad = float(subs[1])*utils.arcmin
+		return name, rad
+	for tok in object_list.split(","):
+		name, rad = expand(tok)
 		if name in groups:
 			for member in groups[name]:
-				res.append((member,rad))
+				res.append(expand(member, rad))
 		else:
 			res.append((name,rad))
 	if dedup:

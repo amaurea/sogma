@@ -42,16 +42,10 @@ def cumsum0(vals, endpoint=False):
 def detsum_ps(ftod):
 	"""Given complex ftod[:,:], return the equivalent of
 	np.sum(np.abs(ftod)**2,0), but without creating large
-	temporaries"""
-	ap    = device.anypy(ftod)
-	dtype = utils.real_dtype(ftod.dtype)
-	assert ftod.strides[-1] == ftod.dtype.itemsize, "Must be contiguous in last dimension"
-	rtod  = ftod.view(dtype)
-	# I tried doing this in one step with einsum("aic,aic->i"), where c
-	# was a len-2 axis for the real and complex parts, but that was 20x
-	# slower!
-	ps    = ap.einsum("ai,ai->i", rtod, rtod)
-	ps    = ap.sum(ps.reshape(-1,2),-1)
+	temporaries."""
+	ap   = device.anypy(ftod)
+	ps   = ap.linalg.norm(ftod,axis=0)
+	ps **= 2
 	return ps
 
 def detmean_ps(ftod):
@@ -504,7 +498,7 @@ def logint(arr, x):
 
 def obs_group_info(obsinfo, groups, inds=None, sampranges=None):
 	"""Given an obsinfo (ala socommon.finish_query), group definitions
-	groups[ngroup][obsinds], and optionally a lis of which groups to actually include,
+	groups[ngroup][obsinds], and optionally a list of which groups to actually include,
 	returns information about number of detectors and samples per group,
 	per member etc, which would be useful for precallocating buffers."""
 	if inds is None: inds = np.arange(len(groups))
@@ -630,16 +624,18 @@ def select_groups(joint, inds):
 		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
 
 def alloc_rfft(ishape, idtype, axes=[-1], dev=None, pool=None):
-	if dev  is None: dev  = device.get_device()
-	if pool is None: pool = dev.np
+	if pool is None:
+		if dev is None: dev = device.get_device()
+		pool = dev.np
 	ctype  = np.result_type(idtype, 0j)
 	oshape = fft.rfft_shape(ishape, axes=axes)
 	ft     = pool.empty(oshape, ctype)
 	return ft
 
 def alloc_irfft(ishape, idtype,  axes=[-1], n=None, dev=None, pool=None):
-	if dev  is None: dev  = device.get_device()
-	if pool is None: pool = dev.np
+	if pool is None:
+		if dev is None: dev = device.get_device()
+		pool = dev.np
 	rtype  = np.zeros(1, idtype).real.dtype
 	oshape = fft.irfft_shape(ishape, axes=axes, n=n)
 	tod    = pool.empty(oshape, rtype)
@@ -679,7 +675,7 @@ def jacobi(tod, op, iop=lambda x:x, niter=4):
 		res += op(tod-iop(res))
 	return res
 
-def lowpass(tod, fknee, alpha=-8, srate=1, dev=None, pool=None, inplace=False):
+def lowpass(tod, fknee, alpha=8, srate=1, dev=None, pool=None, inplace=False):
 	if dev is None: dev = device.get_device()
 	if not inplace: tod = tod.copy()
 	ft  = alloc_rfft(tod.shape, tod.dtype, dev=dev, pool=pool)
@@ -690,6 +686,9 @@ def lowpass(tod, fknee, alpha=-8, srate=1, dev=None, pool=None, inplace=False):
 	ft *= flt / tod.shape[-1]
 	dev.lib.irfft(ft, tod)
 	return tod
+
+def highpass(tod, fknee, alpha=8, srate=1, dev=None, pool=None, inplace=False):
+	return lowpass(tod, fknee, alpha=-alpha, srate=srate, dev=dev, pool=pool, inplace=inplace)
 
 def svd_filter(tod, eiglim=1e-3, dev=None):
 	if dev is None: dev = device.get_device()
@@ -751,7 +750,7 @@ def estimate_atm_tod(tod, cut=None, srate=400, fmax=10, fmin=0.05, niter=None, e
 	ndet, nsamp = tod.shape
 	# 1. Start with simple gapfilling, so we don't have potentially huge values
 	#    messing things up
-	cut.gapfill(tod)
+	cut.gapfill(tod, dev=dev)
 	# 2. Downsample to target fmax. This not only greatly reduces our
 	#    resource requirements, it also protects us from whtie noise leakage
 	n     = utils.floor(tod.shape[1]*fmax/(srate/2))
@@ -763,7 +762,7 @@ def estimate_atm_tod(tod, cut=None, srate=400, fmax=10, fmin=0.05, niter=None, e
 	for it in range(niter):
 		# Redo gapfilling relative to the best model so far
 		if model is not None:
-			dtod = dcut.gapfill(dtod-model)+model
+			dtod = dcut.gapfill(dtod-model, dev=dev)+model
 		work = dtod.copy()
 		# 3. Factor out super-slow modes, which we may be unrepresentative.
 		model   = lowpass(work, fmin, srate=fmax, dev=dev)
@@ -843,7 +842,7 @@ def read_detnames(fname):
 class LinResamp:
 	"""Helper for resampling arrays using linear interpolation
 	in a way that's compatible with fourier-resampling. Useful for
-	e.g. ctime or boresight (though az must be unwound first"""
+	e.g. ctime or boresight (though az must be unwound first)"""
 	def __init__(self, nin, nout):
 		self.nin, self.nout = nin, nout
 		x  = np.arange(nout)*nin/nout
@@ -856,6 +855,41 @@ class LinResamp:
 		axis= axis % arr.ndim
 		pre = (slice(None),)*axis
 		return arr[pre+(self.x1,)]*self.r1 + arr[pre+(self.x2,)]*self.r2
+
+def find_det_tuples(obs, nmin=0, transpose=False):
+	"""Return a list of the 1-tuples, 2-tuples, ...,
+	where the 1-tuples are unpaired detectors, 2-tuples
+	are paired detectors and the rest are tripled,
+	etc. detectors (not present in SO). The entry for
+	the N-tuples has shape [:,N] if transpose is False
+	and [N,:] if transpose is True, and contains integer
+	indices."""
+	labels  = utils.label_multi([obs.detpix, obs.bands])
+	# Slow implementation
+	groups  = utils.find_equal_groups(labels)
+	tupless = [[] for i in range(nmin)]
+	for gi, group in enumerate(groups):
+		n = len(group)
+		while n > len(tupless):
+			tupless.append([])
+		tupless[n-1].append(group)
+	for i in range(len(tupless)):
+		tupless[i] = np.array(tupless[i],int)
+		if transpose: tupless[i] = tupless[i].T
+	return tupless
+
+def pair_rotate(iptod, optod, normalize=True):
+	"""Given iptod[2,npair,nsamp], construct optod[2,npair,nsamp]
+	such that optod[0] = iptod[0]+iptod[1] and optod[1] = iptod[0]-iptod[1].
+	If normalize is True, then this function is its own inverse.
+	Otherwise, the round trip applies a factor of 2.
+	This function does not allocate."""
+	optod[0]  = iptod[0]
+	optod[0] += iptod[1]
+	optod[1]  = iptod[0]
+	optod[1] -= iptod[1]
+	if normalize: optod /= 2**0.5
+	return optod
 
 def check_demod(demod="auto", has_hwp=False):
 	if demod not in ["auto", "yes", "no"]:
@@ -1013,7 +1047,7 @@ def merge_metadbs(ifnames, ofname, verbose=False):
 	utils.mkdir(os.path.dirname(ofname))
 	utils.rm(ofname)
 	npfile = 0
-	with sqlite.open(ofname) as ofile:
+	with sqlite.open(ofname, mode="rwc") as ofile:
 		for fi, ifname in enumerate(ifnames):
 			if verbose: print(ifname)
 			idir = os.path.dirname(ifname)
@@ -1050,7 +1084,7 @@ def merge_obsdbs(ifnames, ofname, verbose=False):
 	# Prepare to write a new file db from scratch
 	utils.mkdir(os.path.dirname(ofname))
 	utils.rm(ofname)
-	with sqlite.open(ofname) as ofile:
+	with sqlite.open(ofname, mode="rwc") as ofile:
 		for fi, ifname in enumerate(ifnames):
 			if verbose: print(ifname)
 			idir = os.path.dirname(ifname)
@@ -1069,7 +1103,7 @@ def merge_obsfiledbs(ifnames, ofname, verbose=False):
 	# Prepare to write a new file db from scratch
 	utils.mkdir(os.path.dirname(ofname))
 	utils.rm(ofname)
-	with sqlite.open(ofname) as ofile:
+	with sqlite.open(ofname, mode="rwc") as ofile:
 		for fi, ifname in enumerate(ifnames):
 			if verbose: print(ifname)
 			idir = os.path.dirname(ifname)

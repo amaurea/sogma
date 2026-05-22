@@ -42,8 +42,8 @@ args = parser.parse_args()
 # Should some of this be factored out into an
 # SO-specific mapmaker class?
 
-if   args.mode in ["individual","depth1"]: separate = True
-elif args.mode in ["full", "dump"]:        separate = False
+if   args.mode in ["individual","depth1"]:    separate = True
+elif args.mode in ["full", "dump", "fplane"]: separate = False
 else: raise ValueError("Unknown mode '%s'" % (str(args.mode)))
 comm_all   = mpi.COMM_WORLD
 comm_per   = mpi.COMM_SELF if separate else mpi.COMM_WORLD
@@ -51,7 +51,8 @@ mpi.install_abort_hook()
 dtype_tod  = np.float32
 dtype_map  = np.float32
 shape, wcs = enmap.read_map_geometry(args.area)
-dump       = [int(w) for w in args.dump.split(",")]
+if args.dump == "none" or "": dump = []
+else: dump = [int(w) for w in args.dump.split(",")]
 ocomps     = utils.parse_ints(args.ocomps)
 # Set up our device
 dev = device.get_device(args.device)
@@ -164,10 +165,10 @@ elif args.nmat == "jon_nowin": noise_model = nmat.NmatDetvecs(dev=dev, window=0)
 elif args.nmat == "new2":   noise_model = nmat.NmatAdaptive2(dev=dev)
 elif args.nmat == "newtest":noise_model = nmat.NmatAdaptive(dev=dev, atm_res=2**0.5)
 elif args.nmat == "jons":   noise_model = nmat.NmatDetvecsScaled(dev=dev)
+elif args.nmat == "prot":   noise_model = nmat.NmatPairRot(nmat.NmatDetvecsScaled(dev=dev), dev=dev)
 else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 # Set up the mapmaker
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, dev=dev, outputs=ml_out)
-
 if   args.mode == "full":
 	mapmaking.make_map(mapmaker, loader, obsinfo, comm_all, joint=joint, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "individual":
@@ -176,4 +177,6 @@ elif args.mode == "depth1":
 	mapmaking.make_maps_depth1(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
 elif args.mode == "dump":
 	mapmaking.dump_tod(loader, obsinfo, noise_model, comm_all, dev=dev, joint=joint, prefix=prefix, ignore=args.ignore, dets=dets, detids=detids)
+elif args.mode == "fplane":
+	mapmaking.fplane_movie(shape, wcs, loader, obsinfo, comm_all, dev=dev, joint=joint, prefix=prefix, ignore=args.ignore, dets=dets, detids=detids, autocrop=args.autocrop)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

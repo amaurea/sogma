@@ -50,6 +50,7 @@ class Simplecut:
 		yield self.dets
 		yield self.starts
 		yield self.lens
+	def to_simple(self): return self
 	def to_sampcut(self):
 		ranges = np.zeros((self.nrange,2),np.int32)
 		ranges[:,0] = self.starts
@@ -209,6 +210,7 @@ class Sampcut:
 	@staticmethod
 	def merge(cuts):
 		return merge_sampcuts(cuts)
+	def to_sampcut(self): return self
 	def to_simple(self):
 		ndet, nsamp = self.shape
 		dets = self.range_dets()

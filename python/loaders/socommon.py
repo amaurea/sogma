@@ -35,7 +35,7 @@ def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, ta
 	# it temporarily to obsdb so we can write to it
 	res_db  = sqlite.SQL()
 	with sqlite.attach(obsdb, res_db, "res", mode="rw"):
-		# Attach preprocess db if availabl
+		# Attach preprocess db if available
 		with sqlite.attach(obsdb, predb, "pre", mode="r") if predb else contextlib.nullcontext():
 			if qinfo.idfile:
 				# Ok, an obslist was passed. The _oblist stuff is
@@ -174,6 +174,8 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 			elif tok == "night": tok = tag_op("(mod(timestamp/3600,24) not between 11 and 23)", op)
 			elif tok == "day":   tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
 			elif tok == "spin":  tok = tag_op("(hwp_freq_mean!=0)", op)
+			elif tok == "rising":tok = tag_op("(mod(az_center+180,360)-180>10)")
+			elif tok == "setting":tok = tag_op("(mod(az_center+180,360)-180<-10)")
 			elif tok.upper() in ["DARK","OPTC"]:
 				if "det_type" in cols: tok = tag_op("(det_type = '%s')" % tok.upper(), op)
 				else:                  tok = "1"
@@ -191,8 +193,10 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 			elif tok == "dur": tok = "duration"
 			elif tok == "nsamp": tok = "n_samples"
 			# Constants
-			elif tok == "tcorot": tok = "1749513600"
-			elif tok == "tfoc2":  tok = "1756684800"
+			elif tok == "tcorot": tok = "1749513600" # so corot problem fixed here
+			elif tok == "tfoc2":  tok = "1756684800" # so focus changed here
+			elif tok == "taso":   tok = "1770000000" # aso starts here
+			elif tok == "twire":  tok = "1777208400" # aso wires contaminate signal before this
 			# Don't interpret columns as tags if they conflict
 			elif tok in cols: pass
 			# Actual tags
@@ -203,6 +207,8 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 				# The or 0 handles the case where there are no planets defined
 				sel = "(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)"
 				tok = tag_op("(obs_id in (select obs_id from tags where %s))" % sel, op)
+			elif tok in sqlite.functions:
+				pass
 			else:
 				# Stuff that doesn't fit in. These are more limited than the others,
 				# and can't be parts of complicated expressions.
@@ -231,26 +237,27 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		query += " and (det_type = 'OPTC')"
 	# Filter on valid preprocess
 	pjoin = ""
-	if not prep_sel["set"]: prep_sel["good"] = True
-	if prep_sel["good"] and prep_sel["bad"]:
-		# Want both good and bad, so no prep restriction required
-		pass
-	elif prep_sel["good"] and not prep_sel["bad"]:
-		if "band" in cols:
-			# band is present if we have a subobsdb
-			pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id]"
-			if "dets:wafer_slot" in pre_cols:
-				pjoin += " and instr(obs.wafer_slots_list, pre.map.[dets:wafer_slot])"
-			if "dets:wafer.bandpass" in pre_cols:
-				pjoin += " and obs.band = pre.map.[dets:wafer.bandpass]"
+	if pre_cols is not None:
+		if not prep_sel["set"]: prep_sel["good"] = True
+		if prep_sel["good"] and prep_sel["bad"]:
+			# Want both good and bad, so no prep restriction required
+			pass
+		elif prep_sel["good"] and not prep_sel["bad"]:
+			if "band" in cols:
+				# band is present if we have a subobsdb
+				pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id]"
+				if "dets:wafer_slot" in pre_cols:
+					pjoin += " and instr(obs.wafer_slots_list, pre.map.[dets:wafer_slot])"
+				if "dets:wafer.bandpass" in pre_cols:
+					pjoin += " and obs.band = pre.map.[dets:wafer.bandpass]"
+			else:
+				query += "  and obs.obs_id in (select [obs:obs_id] from pre.map)"
+		elif prep_sel["bad"] and not prep_sel["good"]:
+			# Selecting only bad was cumbersome to implement...
+			raise ValueError("Selecting only bad observations not supported yet")
 		else:
-			query += "  and obs.obs_id in (select [obs:obs_id] from pre.map)"
-	elif prep_sel["bad"] and not prep_sel["good"]:
-		# Selecting only bad was cumbersome to implement...
-		raise ValueError("Selecting only bad observations not supported yet")
-	else:
-		# Neither good nor bad. So disqalify all obs
-		query += " and 0"
+			# Neither good nor bad. So disqalify all obs
+			query += " and 0"
 	return bunch.Bunch(where=query, join=pjoin, idfile=idfile, pycode=pycode, slices=slices)
 
 def tag_op(expr, op, noneg=False):
@@ -588,9 +595,6 @@ def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=10000):
 	good    &= rms_uKrts < ref/med_tol
 	return good
 
-# This one is robust to planets, but fails in the
-# presence of a hwp, since all the blocks would be
-# impacted.
 _rms_der_norm = [1,2,6,20,70,252]
 def measure_rms_der(tod, dt=1, nder=3, bsize=32, nblock=10):
 	ap  = device.anypy(tod)

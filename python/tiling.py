@@ -108,6 +108,7 @@ class TileDistribution:
 		self.ncomp  = 3
 		self.tsize  = self.ncomp*np.prod(self.tshape)
 		self.dev    = dev or device.get_device()
+		self.comm   = comm
 		# Shortcut, since we'll be referring to it a lot
 		lp = local_pixelization
 		# Our geometry
@@ -232,9 +233,9 @@ class TileDistribution:
 	def dpixmap(self):
 		"""Return the global pixel-coordinates of each pixel in our dmap
 		as pixmap[{y,x},ntile,ny,nx]"""
-		corners = np.array(np.where(self.dist.owner==self.comm.rank))*self.tsize
-		relpix  = np.mgrid[:self.tshape,:self.tshape]
-		return corners[:,:,None,None]+relpix
+		corners = np.array(np.where(self.dist.owner==self.comm.rank))*np.array(self.tshape)[:,None]
+		relpix  = np.mgrid[:self.tshape[0],:self.tshape[1]]
+		return corners[:,:,None,None]+relpix[:,None,:,:]
 	def dposmap(self):
 		"""Returns the global sky-coordinates of each pixel in our dmap
 		as posmap[{dec,ra},ntile,ny,nx].
@@ -242,7 +243,7 @@ class TileDistribution:
 		assert self.wcs.wcs.ctype[0][-3:] == "CAR"
 		posmap  = self.dpixmap().astype(float)
 		posmap -= self.wcs.wcs.crpix[1::-1,None,None,None]
-		posmap *= cdelt[1::-1,None,None,None]*utils.degree
+		posmap *= self.wcs.wcs.cdelt[1::-1,None,None,None]*utils.degree
 		posmap += self.wcs.wcs.crval[1::-1,None,None,None]*utils.degree
 		return posmap
 

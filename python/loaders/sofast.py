@@ -68,7 +68,7 @@ class SoFastLoader:
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
-	def load(self, subid, catch="expected", dets=None, detids=None, demod=None):
+	def load(self, subid, catch="expected", dets=None, detids=None, demod=None, dtype=np.float32):
 		catch_list = catch2list(catch)
 		try:
 			with bench.mark("load_meta"):
@@ -80,7 +80,7 @@ class SoFastLoader:
 				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 			# Calibrate the data
 			with bench.mark("load_calib"):
-				obs = calibrate(data, meta, mul=self.mul, dev=self.dev)
+				obs = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
 			if demod is not None and demod.demod:
 				with bench.mark("load_demod"):
 					obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
@@ -94,7 +94,7 @@ class SoFastLoader:
 		# Record any non-fatal errors
 		obs.errors = []
 		return obs
-	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, demod=None):
+	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, demod=None, dtype=np.float32):
 		"""Load multiple concurrent subids into a single obs"""
 		# FIXME: This is inefficient:
 		# * bands and dark detectors for the same wafer are stored in the same files,
@@ -154,7 +154,7 @@ class SoFastLoader:
 					data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 				# This uses buffers "tod" and "ft"
 				with bench.mark("load_calib"):
-					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev)
+					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
 				if demod is not None and demod.demod:
 					with bench.mark("load_demod"):
 						obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
@@ -221,9 +221,7 @@ class FastMeta:
 		wafer_info = WaferInfo(sqlite.open(cmeta_lookup(context, "wafer_info")))
 		self.det_cache  = DetCache(self.obsfiledb, smurf_info, match_info, wafer_info)
 		# 4. Absolute calibration
-		with sqlite.open(cmeta_lookup(context, "abscal")) as index:
-			acalfile = get_acalfile(index)
-		self.acal_cache = AcalCache(acalfile)
+		self.acal_cache = AcalCache(cmeta_lookup(context, "abscal"))
 		# 4. Focal plane
 		self.fp_cache   = FplaneCache(cmeta_lookup(context, "focal_plane"))
 		# 5. Pointing model, which seems to be static for now
@@ -366,7 +364,7 @@ class FastMeta:
 		# Get our absolute calibration
 		with bench.mark("fm_abscal"):
 			stream_id = "_".join(detset.split("_")[:2])
-			abscal_cmb = self.acal_cache.get(stream_id=stream_id, wafer=wslot, band=band).abscal_cmb
+			abscal_cmb = self.acal_cache.get_by_subid(subid, stream_id=stream_id).abscal_cmb
 		with bench.mark("pointing_model"):
 			pointing_model = self.pointing_model_cache.get_by_subid(subid)
 		# Get our sensitivity limits
@@ -423,7 +421,7 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 debug_det = None # "Mv21_f090_Ar00c02A"
 
 # This config moved to loading.py because sofast is only imported conditionally
-def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
+def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 	from pixell import fft
 	if dev is None: dev = device.get_device()
 	# Merge the cuts and jumps separately. Easier to deal with just a single cuts object
@@ -472,8 +470,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None):
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
 		signal_ = dev.pools["ft"].array(signal)
-	with bench.mark("signal → float32", tfun=dev.time):
-		signal  = dev.pools["itod"].empty(signal.shape, np.float32)
+	with bench.mark("signal → dtype", tfun=dev.time):
+		signal  = dev.pools["itod"].empty(signal.shape, dtype)
 		signal[:] = signal_
 
 	if debug_det:
@@ -907,51 +905,29 @@ def pointing_row_to_params(row):
 		params[name] = val
 	return params
 
-class AcalCache:
+class EpochDb:
 	def __init__(self, fname):
-		self.fname  = fname
-		self.raw    = bunch.read(fname).abscal
-		self.lookup = {}
-		self.key = (utils.firstin(self.raw.dtype.names, ["dets:stream_id", "dets:wafer_slot"]), "dets:wafer.bandpass")
-		for row in self.raw:
-			key = ":".join([row[k].decode() for k in self.key])
-			self.lookup[key] = bunch.Bunch(
-				abscal_cmb = row["abscal_cmb"],
-				abscal_rj  = row["abscal_rj"],
-				#beam_fwhm  = row["beam_fwhm"],
-				#beam_solid_angle = row["beam_solid_angle"],
-				#cal_source = row["cal_source"].decode(),
-			)
-	def get(self, stream_id=None, wafer=None, band=None):
-		"""Either get("ufm_mv13:f150") or get("ufm_mv13", "f150") work"""
-		if   self.key[0] == "dets:stream_id":  key = stream_id
-		elif self.key[0] == "dets:wafer_slot": key = wafer
-		else: raise ValueError("Inconsistent key0: %s" % str(self.key[0]))
-		key += ":" + band
-		return self.lookup[key]
+		self.fname = fname
+		with sqlite.open(fname) as sfile:
+			query = trange_fmt(sfile, "select {t1}, {t2}, files.name, dataset from map inner join files on file_id = files.id")
+			# Get the mapping from time-range to hdf-file and dataset.
+			# Also make relative paths work
+			self.index = [(t1, t2, os.path.join(os.path.dirname(fname), fn), group) for t1,t2,fn,group in sfile.execute(query)]
+	def lookup(self, t):
+		for i, entry in enumerate(self.index):
+			if entry[0] <= t and t < entry[1]:
+				return entry[2:]
+		# Return latest entry by default
+		return entry[2:]
 
 class RelcalCache:
 	def __init__(self, fname):
-		self.fname  = fname
+		self.epochs = EpochDb(fname)
 		self.cache  = {}
-		# Build the time-cache
-		with sqlite.open(fname) as sfile:
-			query = trange_fmt(sfile, "select {t1}, {t2}, files.name, dataset from map inner join files on file_id = files.id")
-			# Get the mapping from time-range to hdf-file and dataset
-			self.index = list(sfile.execute(query))
-	def find_entry(self, t):
-		for i, entry in enumerate(self.index):
-			if entry[0] <= t and t < entry[1]:
-				return entry
-		# Return latest entry by default
-		return entry
 	def get(self, subid):
 		# Infer the time from the subid
 		info  = split_subid(subid)
-		entry = self.find_entry(info.ctime)
-		fname, group = entry[2:4]
-		# Make file-name relative
-		fname = os.path.join(os.path.dirname(self.fname),fname)
+		fname, group = self.epochs.lookup(info.ctime)
 		key = (fname, group)
 		if key not in self.cache:
 			with h5py.File(fname, "r") as hfile:
@@ -961,6 +937,38 @@ class RelcalCache:
 					utils.getrec(data, ["relcal", "rel_factor"])
 				)
 		return self.cache[key]
+
+class AcalCache:
+	def __init__(self, fname):
+		self.epochs = EpochDb(fname)
+		self.cache  = {}
+	def get(self, t, stream_id, wafer, band):
+		fname, group = self.epochs.lookup(t)
+		# Try to look up both alternatives in cache
+		try: return self.cache[(fname, group, stream_id, band)]
+		except KeyError: pass
+		try: return self.cache[(fname, group, wafer, band)]
+		except KeyError: pass
+		# If we got here, the cache doesn't have it, so try to read it
+		raw = bunch.read(fname)[group]
+		for wafid in ["dets:stream_id", "dets:wafer_slot"]:
+			if wafid not in raw.dtype.names: continue
+			for row in raw:
+				self.cache[(fname, group, row[wafid].decode(), row["dets:wafer.bandpass"].decode())] = bunch.Bunch(
+					abscal_cmb = row["abscal_cmb"],
+					abscal_rj  = row["abscal_rj"],
+				)
+		# Try to look up again
+		try: return self.cache[(fname, group, stream_id, band)]
+		except KeyError: pass
+		try: return self.cache[(fname, group, wafer, band)]
+		except KeyError: pass
+		# Couldn't find it!
+		raise ValueError("Couldn't find abscal for %.0f %s %s %s" % (t, stream_id, wafer, band))
+	def get_by_subid(self, subid, stream_id):
+		toks  = split_subid(subid)
+		ctime = float(toks.obsid.split("_")[1])
+		return self.get(ctime, stream_id, toks.wslot, toks.band)
 
 # This takes 0.3 s the first time and 0 s later.
 # Considering that the python version takes 0.3 ms,

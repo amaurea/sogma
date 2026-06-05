@@ -95,19 +95,27 @@ class PmatCutNull:
 	def clear(self, tod): pass
 
 class PmatCutFull:
-	def __init__(self, cuts, dev=None):
+	def __init__(self, cuts, clear=True, dev=None):
 		dets, starts, lens = cuts
 		self.dev    = dev or device.get_device()
+		# If clear is False, we do d += Pc (fwd) and c = P'd (bwd)
+		# Otherwise, we do d = Pc (fwd) and c = P'd; d=0 (bwd)
+		# The latter is useful when implementing cuts, where the cut samples
+		# should overwrite other stuff, and we want to take care of them so
+		# others don't need to deal with them. That's why clear is the default
+		self.clear_ = clear
 		self.dets   = self.dev.np.asarray(dets,   np.int32)
 		self.starts = self.dev.np.asarray(starts, np.int32)
 		self.lens   = self.dev.np.asarray(lens,   np.int32)
 		self.ndof   = np.sum(lens)  # number of values to solve for
 		self.nsamp  = self.ndof     # number of samples covered
 		self.offs   = self.dev.np.asarray(gutils.cumsum0(lens), np.int32)
-	def forward(self, tod, junk):
-		self.dev.lib.insert_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
-	def backward(self, tod, junk=None, clear=True):
+	def forward(self, tod, junk, clear=None):
+		if clear is None: clear = self.clear_
+		self.dev.lib.insert_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens, add=not clear)
+	def backward(self, tod, junk=None, clear=None):
 		if junk is None: junk = self.dev.np.zeros(self.nsamp)
+		if clear is None: clear = self.clear_
 		self.dev.lib.extract_ranges(tod, junk, self.offs, self.dets, self.starts, self.lens)
 		# Zero-out the samples we used, so the other signals (e.g. the map)
 		# don't need to care about them
@@ -144,19 +152,20 @@ class PmatCutFull:
 # of it. The ivar scaling will be handled with a separate product.
 
 class PmatCutPoly:
-	def __init__(self, cuts, dev=None, basis=None, order=None, bsize=None):
+	def __init__(self, cuts, dev=None, basis=None, order=None, bsize=None, dtype=np.float32):
 		dets, starts, lens = cuts
-		self.dev = dev or device.get_device()
+		self.dev   = dev or device.get_device()
+		self.dtype = dtype
 		# Either construct or use an existing basis
 		if basis is None:
 			if bsize is None: bsize = 400
 			if order is None: order = 3
-			self.basis = gutils.legbasis(order, bsize)
+			self.basis = gutils.legbasis(order, bsize, dtype=dtype)
 		else:
 			assert order is None and bsize is None, "Specify either basis or order,bsize, not both"
 			order = basis.shape[0]-1
 			bsize = basis.shape[1]
-			self.basis = self.dev.np.asarray(basis, dtype=np.float32)
+			self.basis = self.dev.np.asarray(basis, dtype=dtype)
 		# Subdivide ranges that are longer than our block size
 		dets, starts, lens = gutils.split_ranges(dets, starts, lens, bsize)
 		self.dets   = self.dev.np.asarray(dets,   np.int32)
@@ -198,7 +207,6 @@ class PmatCutPoly:
 class PmatElMod:
 	def __init__(self, el, dev=None, order=None, B=None, dtype=np.float32):
 		self.dev   = dev or device.get_device()
-		assert dtype == np.float32, "Only float32 supported"
 		self.dtype = dtype
 		self.nsamp = len(el)
 		# Either construct or use an existing basis
@@ -227,7 +235,7 @@ class PmatElMod:
 		assert amps.flags["C_CONTIGUOUS"]
 		assert tod.dtype == self.dtype
 		assert amps.dtype == self.dtype
-		self.dev.lib.sgemm("N", "N", nsamp, ndet, self.order, 1, self.B, nsamp, amps, self.order, 1, tod, nsamp)
+		self.dev.lib.gemm("N", "N", nsamp, ndet, self.order, 1, self.B, nsamp, amps, self.order, 1, tod, nsamp)
 	def backward(self, tod, amps):
 		# amps[d,a] += B[a,t]*tod[d,t] => fortran amps[a,d] += B'[a,t]*tod[t,d]
 		ndet, nsamp = tod.shape
@@ -235,7 +243,7 @@ class PmatElMod:
 		assert amps.flags["C_CONTIGUOUS"]
 		assert tod.dtype == self.dtype
 		assert amps.dtype == self.dtype
-		self.dev.lib.sgemm("T", "N", self.order, ndet, nsamp, 1, self.B, nsamp, tod, nsamp, 1, amps, self.order)
+		self.dev.lib.gemm("T", "N", self.order, ndet, nsamp, 1, self.B, nsamp, tod, nsamp, 1, amps, self.order)
 
 def _normalize_bfun(a):
 	ap = device.anypy(a)
@@ -411,7 +419,9 @@ class PointingFit:
 		# Cublas is column-major though, so we're doing pointing = B*coeffs
 		npre = coeffs.shape[0]*coeffs.shape[1]
 		ndof, nsamp = B.shape
-		self.dev.lib.sgemm("N", "N", nsamp, npre, ndof, 1, B, nsamp, coeffs.reshape(npre,ndof), ndof, 0, pointing.reshape(npre,nsamp), nsamp)
+		self.dev.lib.gemm("N", "N", nsamp, npre, ndof, 1, B, nsamp, coeffs.reshape(npre,ndof), ndof, 0, pointing.reshape(npre,nsamp), nsamp)
+		# Can emulate nearest neighbor mapmaking like this, but inefficient
+		#self.dev.np.round(pointing, out=pointing)
 		t4 = self.dev.time()
 		L.print("eval pointing %8.4f %8.4f %8.4f" % (t2-t1,t3-t2,t4-t3), level=3)
 		return pointing # [{y,x,psi},ndet,nsamp], on device

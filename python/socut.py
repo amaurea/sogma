@@ -92,8 +92,8 @@ class Simplecut:
 		return self.to_device(dev=dev).gapfill(tod, w=w)
 	def clear(self, tod, dev=None):
 		return self.to_device(dev=dev).clear(tod)
-	def insert(self, tod, vals, dev=None):
-		return self.to_device(dev=dev).insert(tod, vals)
+	def insert(self, tod, vals, add=False, dev=None):
+		return self.to_device(dev=dev).insert(tod, vals, add=add)
 	def extract(self, tod, out=None, dev=None):
 		return self.to_device(dev=dev).extract(tod, out=out)
 	# These helpers are used by the helper class Devicecut
@@ -229,8 +229,8 @@ class Sampcut:
 		return self.to_device(dev=dev).gapfill(tod, w=w)
 	def clear(self, tod, dev=None):
 		return self.to_device(dev=dev).clear(tod)
-	def insert(self, tod, vals, dev=None):
-		return self.to_device(dev=dev).insert(tod, vals)
+	def insert(self, tod, vals, add=False, dev=None):
+		return self.to_device(dev=dev).insert(tod, vals, add=add)
 	def extract(self, tod, out=None, dev=None):
 		return self.to_device(dev=dev).extract(tod, out=out)
 
@@ -280,10 +280,10 @@ class Devicecut:
 	def clear(self, tod):
 		self.dev.lib.clear_ranges(tod, self.dets, self.starts, self.lens)
 		return tod
-	def insert(self, tod, vals):
+	def insert(self, tod, vals, add=False):
 		if self.offs is None:
 			self.offs = self.dev.np.asarray(gutils.cumsum0(self.lens), np.int32)
-		self.dev.lib.insert_ranges(tod, vals, self.offs, self.dets, self.starts, self.lens)
+		self.dev.lib.insert_ranges(tod, vals, self.offs, self.dets, self.starts, self.lens, add=add)
 		return tod
 	def extract(self, tod, out=None):
 		if self.offs is None:

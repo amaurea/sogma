@@ -1,14 +1,14 @@
-import numpy as np
+import numpy as np, contextlib
 from pixell import utils, bunch
 from . import gutils, device
 from .logging import L
 
 class Nmat:
-	def __init__(self, dev=None):
+	def __init__(self, dtype=np.float32, dev=None):
 		"""Initialize the noise model. In subclasses this will typically set up parameters, but not
 		build the details that depend on the actual time-ordered data"""
 		self.dev   = dev or device.get_device()
-		self.ivar  = dev.np.ones(1, dtype=np.float32)
+		self.ivar  = dev.np.ones(1, dtype=dtype)
 		self.ready = True
 	def build(self, tod, **kwargs):
 		"""Measure the noise properties of the given time-ordered data tod[ndet,nsamp], and
@@ -33,10 +33,10 @@ class Nmat:
 			raise ValueError("Attempt to use partially constructed %s. Typically one gets a fully constructed one from the return value of nmat.build(tod)" % type(self).__name__)
 
 class NmatNull(Nmat):
-	def __init__(self, dev=None):
+	def __init__(self, dtype=np.float32, dev=None):
 		self.dev   = dev or device.get_device()
 		self.ready = True
-		self.ivar  = np.zeros(10000,np.float32)
+		self.ivar  = np.zeros(10000, dtype)
 	def build(self, tod, srate, **kwargs): return self
 	def apply(self, tod, inplace=True):
 		if not inplace: tod = tod.copy()
@@ -412,6 +412,12 @@ class NmatDetvecsScaled(Nmat):
 			b = np.maximum(1,b)
 			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
 		del Nd, ft
+
+
+		print("FIXME Nmat")
+		E /= 10
+
+
 		# Also compute a representative white noise level. This needs to take
 		# into account the scaling we've already done. Sadly the bins don't map
 		# cleanly onto each other, but at least the scaling bin-size is constant,
@@ -682,7 +688,7 @@ class NmatAdaptive(Nmat):
 		# data-type to use in mode-finding. At some point it seemed like
 		# this needed to be float64, but float32 turned out to be fine
 		# after fixing some issues with overfit correlations
-		wtype = np.float32
+		wtype = utils.real_dtype(ftod)
 		# [Step 1]: Build a detector-uncorrelated noise model
 		# 1a. Measure power spectra
 		ps  = self.dev.np.abs(ftod)**2  # full-res ps
@@ -939,7 +945,7 @@ class Filter:
 	def __init__(self, dev=None):
 		"""Initialize the filter. In subclasses this will typically set up parameters"""
 		self.dev   = dev or device.get_device()
-	def apply(self, tod, srate=1, obs=None):
+	def apply(self, tod, obs=None):
 		"""Apply the filter to tod, overwriting it with the result"""
 		pass
 
@@ -947,28 +953,57 @@ class FilterNone(Filter): pass
 
 class FilterGapfill(Filter):
 	def __init__(self, mask, sys="equ,on=saturn", buf="model", dev=None):
-		self.dev   = dev or device.get_device()
+		super().__init__(dev=dev)
 		assert mask.ndim == 3 and mask.shape[0] == 3 and mask.dtype == np.float32
 		self.mask  = mask
 		self.sys   = sys
 		self.buf   = buf
-	def apply(self, tod, srate, obs, **kwargs):
+	def apply(self, tod, obs, **kwargs):
 		# Then build our cut object. Very similar to socal.object_cut, but it didn't quite
 		# match what I wanted here. It didn't allow one to specify a coordinate system
-		from . import pmat, tiling
-		lmap = tiling.enmap2lmap(self.mask, dev=self.dev)
-		pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight,
-			obs.point_offset, obs.polangle, sys=self.sys, partial=True, dev=self.dev)
-		wtod = self.dev.pools["ft"].empty(tod.shape, tod.dtype)
-		pmap.forward(wtod, lmap.lmap)
-		# turn non-zero values into a cuts object
 		from . import socal
-		cuts = socal.mask2cut(wtod, dev=self.dev)
+		srate = (len(obs.ctime)-1)/(obs.ctime[-1]-obs.ctime[0])
+		cuts = socal.mask2cut_map(obs, self.mask, sys=self.sys, dev=self.dev, tod_pool=self.dev.pools["ft"])
 		# Build our gapfilled model
 		model = self.dev.pools[self.buf].array(tod)
 		gutils.estimate_atm_tod(model, cuts, srate=srate, dev=self.dev, pool=self.dev.pools["ft"])
 		# subtract prediction from tod to clean the atmosphere
 		tod -= model
+
+# Nprep is meant for any temporary changes to the tod that must be made
+# before the noise model can be estimated. Typically this would be masking
+# bright signals that we do want to map, but don't want to be treated as
+# noise in the noise model.
+
+class Nprep:
+	def __init__(self, dev=None):
+		self.dev = dev or device.get_device()
+	@contextlib.contextmanager
+	def __call__(self, tod, obs):
+		try: yield
+		finally: return
+
+class NprepNone(Nprep): pass
+
+class NprepMask(Nprep):
+	def __init__(self, mask, sys="equ", dev=None):
+		super().__init__(dev=dev)
+		self.mask = mask
+		self.sys  = sys
+	@contextlib.contextmanager
+	def __call__(self, tod, obs):
+		from . import socal
+		cuts = socal.mask2cut_map(obs, self.mask, sys=self.sys, dev=self.dev, tod_pool=self.dev.pools["ft"])
+		cuts = cuts.to_device(self.dev)
+		try:
+			# Save old values in area to be gapfilled before estimating the nosie model
+			vals = cuts.extract(tod)
+			# Then yield gapfilled version
+			cuts.gapfill(tod)
+			yield
+		finally:
+			# Restore the values
+			cuts.insert(tod, vals)
 
 #################
 # Helpers below #
@@ -994,15 +1029,15 @@ def apply_vecs(ftod, iD, V, Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 		# We want to perform out = iD ftod - (iD V Kh)(iD V Kh)' ftod
 		# 1. divtmp = iD V      [ndet,nmode]
 		# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
-		dev.lib.sdgmm("R", nmode, ndet, V, nmode, iD[bi], 1, divtmp, nmode)
+		dev.lib.dgmm("R", nmode, ndet, V, nmode, iD[bi], 1, divtmp, nmode)
 		# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
-		dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi:bi+1], nmode, divtmp, nmode, 0, vtmp, nmode)
+		dev.lib.gemm("N", "N", nmode, ndet, nmode, 1, Kh[bi:bi+1], nmode, divtmp, nmode, 0, vtmp, nmode)
 		# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
-		dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, nmode, 0, tmp[:,:bsize], tmp.shape[1])
+		dev.lib.gemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, nmode, 0, tmp[:,:bsize], tmp.shape[1])
 		# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
-		dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
+		dev.lib.dgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
 		# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
-		dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, nmode, 1, out[:,i1:i2], nfreq)
+		dev.lib.gemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, nmode, 1, out[:,i1:i2], nfreq)
 
 def apply_vecs2(ftod, iD, V, Vinds,  Kh, bins, tmp, vtmp, divtmp, dev=None, out=None):
 	"""Jon's core for the noise matrix. Does not allocate any memory itself. Takes the work
@@ -1037,15 +1072,15 @@ def apply_vecs2(ftod, iD, V, Vinds,  Kh, bins, tmp, vtmp, divtmp, dev=None, out=
 			dev.np.take(V, Vinds[bi], axis=1, out=vtmp[:,:nmode])
 			# 1. divtmp = iD V      [ndet,nmode]
 			# Cublas is column-major though, so to it we're doing divtmp = V iD [nmode,ndet]. OK
-			dev.lib.sdgmm("R", nmode, ndet, vtmp[:,:nmode], maxnmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
+			dev.lib.dgmm("R", nmode, ndet, vtmp[:,:nmode], maxnmode, iD[bi], 1, divtmp[:,:nmode], maxnmode)
 			# 2. vtmp   = iD V Kh   [ndet,nmode] -> vtmp = Kh divtmp [nmode,ndet]. OK
-			dev.lib.sgemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
+			dev.lib.gemm("N", "N", nmode, ndet, nmode, 1, Kh[bi], nmode, divtmp, maxnmode, 0, vtmp, maxnmode)
 			# 3. tmp    = (iD V Kh)' ftod  [nmode,bsize] -> tmp = ftod vtmp.T [bsize,nmode]. OK
-			dev.lib.sgemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, maxnmode, 0, tmp[:,:bsize], tmp.shape[1])
+			dev.lib.gemm("N", "T", bsize, nmode, ndet, 1, ftod[:,i1:i2], nfreq, vtmp, maxnmode, 0, tmp[:,:bsize], tmp.shape[1])
 			# 4. out    = iD ftod  [ndet,bsize] -> out = ftod iD [bsize,ndet]. OK
-			dev.lib.sdgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
+			dev.lib.dgmm("R", bsize, ndet, ftod[:,i1:i2], nfreq, iD[bi], 1, out[:,i1:i2], nfreq)
 			# 5. out    = iD ftod - (iD V Kh)(iD V Kh)' ftod [ndet,bsize] -> out = ftod iD - ftod vtmp.T vtmp [bsize,ndet]. OK
-			dev.lib.sgemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, maxnmode, 1, out[:,i1:i2], nfreq)
+			dev.lib.gemm("N", "N", bsize, ndet, nmode, -1, tmp[:,:bsize], tmp.shape[1], vtmp, maxnmode, 1, out[:,i1:i2], nfreq)
 
 # TODO: This one allocates temporary tod and cov arrays.
 # Use dev.lib.sgemm to avoid cov copies?

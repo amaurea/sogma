@@ -38,23 +38,20 @@ class MMDeviceMinimal(device.DeviceCpu):
 		self.lib.fft_factors = [2,3,5,7]
 		# BLAS. May need to find a way to make this more compact if we need
 		# more of these functions
-		def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
+		def gemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
 			import scipy
-			assert A.dtype == np.float32, "sgemm needs single precision"
-			assert B.dtype == np.float32, "sgemm needs single precision"
-			assert C.dtype == np.float32, "sgemm needs single precision"
-			# Hack: We ignore m, n, k, ldA, ldB, ldC here and assume that
-			# these match the array objects passed! This wouldn't be necessary
-			# if scipy made the underlying blas interface directly available.
-			# Alternatively one could construct proxy arrays using ldA etc,
-			# and pass those in
-			scipy.linalg.blas.sgemm(alpha, A.T, B.T, beta=beta, c=C.T, overwrite_c=True,
-				trans_a = opA.lower()=="t", trans_b=opB.lower()=="t")
-		self.lib.sgemm = sgemm
-		def sdgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
-			assert A.dtype == np.float32, "sdgmm needs single precision"
-			assert X.dtype == np.float32, "sdgmm needs single precision"
-			assert C.dtype == np.float32, "sdgmm needs single precision"
+			assert A.dtype == B.dtype and A.dtype == C.dtype, "Arguments must agree on dtype"
+			if   A.dtype == np.float32:
+				scipy.linalg.blas.sgemm(alpha, A.T, B.T, beta=beta, c=C.T, overwrite_c=True,
+					trans_a = opA.lower()=="t", trans_b=opB.lower()=="t")
+			elif A.dtype == np.float64:
+				scipy.linalg.blas.dgemm(alpha, A.T, B.T, beta=beta, c=C.T, overwrite_c=True,
+					trans_a = opA.lower()=="t", trans_b=opB.lower()=="t")
+			else: raise ValueError("Only float32 and float64 supported")
+		self.lib.gemm = gemm
+		def dgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
+			assert A.dtype == X.dtype and A.dtype == C.dtype, "Arguments must agree on dtype"
+			assert A.dtype == np.float32 or A.dtype == np.float64, "Only float32 and float64 supported"
 			raise NotImplementedError
 		self.lib.sdgmm = sdgmm
 
@@ -105,24 +102,22 @@ try:
 			# BLAS. May need to find a way to make this more compact if we need
 			# more of these functions
 			self.cublas_handle = cupy.cuda.Device().cublas_handle
-			def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
-				assert A.dtype == np.float32, "sgemm needs single precision"
-				assert B.dtype == np.float32, "sgemm needs single precision"
-				assert C.dtype == np.float32, "sgemm needs single precision"
+			def gemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
+				assert A.dtype == B.dtype and A.dtype == C.dtype, "Arguments must agree on dtype"
+				if A.dtype != np.float32: raise ValueError("Only float32 supported")
 				arr_alpha, arr_beta = [np.array(x, np.float32) for x in [alpha, beta]]
 				if handle is None: handle = self.cublas_handle
 				cublas.sgemm(handle, get_cublas_op(opA), get_cublas_op(opB),
 					m, n, k, self.ptr(arr_alpha), self.ptr(A), ldA, self.ptr(B), ldB,
 					self.ptr(arr_beta), self.ptr(C), ldC)
-			self.lib.sgemm = sgemm
-			def sdgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
-				assert A.dtype == np.float32, "sdgmm needs single precision"
-				assert X.dtype == np.float32, "sdgmm needs single precision"
-				assert C.dtype == np.float32, "sdgmm needs single precision"
+			self.lib.gemm = gemm
+			def dgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
+				assert A.dtype == X.dtype and A.dtype == C.dtype, "Arguments must agree on dtype"
+				if A.dtype != np.float32: raise ValueError("Only float32 supported")
 				if handle is None: handle = self.cublas_handle
 				cublas.sdgmm(handle, get_cublas_side(side),
 					m, n, self.ptr(A), ldA, self.ptr(X), incX, self.ptr(C), ldC)
-			self.lib.sdgmm = sdgmm
+			self.lib.dgmm = dgmm
 			# Scaling
 			def block_scale(tod, bscale, bsize=1, inplace=False):
 				if not inplace: tod = tod.copy()
@@ -205,17 +200,15 @@ try:
 			self.lib.LocalPixelization = cpu_mm.LocalPixelization
 			# BLAS. May need to find a way to make this more compact if we need
 			# more of these functions
-			def sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
-				import scipy
-				assert A.dtype == np.float32, "sgemm needs single precision"
-				assert B.dtype == np.float32, "sgemm needs single precision"
-				assert C.dtype == np.float32, "sgemm needs single precision"
-				cpu_mm.sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC)
-			self.lib.sgemm = sgemm
-			def sdgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
-				assert A.dtype == np.float32, "sdgmm needs single precision"
-				assert X.dtype == np.float32, "sdgmm needs single precision"
-				assert C.dtype == np.float32, "sdgmm needs single precision"
+			def gemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
+				assert A.dtype == B.dtype and A.dtype == C.dtype, "Arguments must agree on dtype"
+				if   A.dtype == np.float32: cpu_mm.sgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC)
+				elif A.dtype == np.float64: cpu_mm.dgemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC)
+				else: raise ValueError("Only float32 and float64 supported")
+			self.lib.gemm = gemm
+			def dgmm(side, m, n, A, ldA, X, incX, C, ldC, handle=None):
+				assert A.dtype == X.dtype and A.dtype == C.dtype, "Arguments must agree on dtype"
+				assert A.dtype == np.float32 or A.dtype == np.float64, "Only float32 and float64 supported"
 				# side=='r': C = A.dot(diag(X))
 				# side=='l': C = diag(X).dot(A)
 				# But cublas is column-major, so it thinks our matrices are transposed.
@@ -228,7 +221,7 @@ try:
 				if   side.lower() == 'r': C[:] = X[:,None]*A
 				elif side.lower() == 'l': C[:] = A*X[None,:]
 				else: raise ValueError("Unrecognized side '%s'" % str(side))
-			self.lib.sdgmm = sdgmm
+			self.lib.dgmm = dgmm
 			# Scaling
 			self.lib.block_scale = cpu_mm.block_scale
 

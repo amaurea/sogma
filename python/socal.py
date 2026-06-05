@@ -52,14 +52,8 @@ def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*uti
 	shape, wcs = enmap.downgrade_geometry(shape, wcs, down)
 	# Get our time range
 	t1, t2 = utils.minmax(obs.ctime)
-	map  = ephem_map(shape, wcs, object_list, [t1,t2], dt=dt, dr=dr)
-	# map2tod. ft buffer and the pointing buffers are free
-	lmap = tiling.enmap2lmap(map, dev=dev)
-	pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, site=obs.site, partial=True, dev=dev)
-	tod  = dev.pools["ft"].zeros(obs.tod.shape, obs.tod.dtype)
-	pmap.forward(tod, lmap.lmap)
-	# turn non-zero values into a cuts object. Done with pmap here, so can use pointing pool
-	cuts = mask2cut(tod, dev=dev, pool=dev.pools["pointing"])
+	map  = ephem_map(shape, wcs, object_list, [t1,t2], dt=dt, dr=dr, dtype=obs.tod.dtype)
+	cuts = mask2cut_map(obs, map, dev=dev, tod_pool=dev.pools["ft"], work_pool=dev.pools["pointing"])
 	# return result as length-1 list of cuts
 	# It's a list of cuts because other cut types can return multiple cuts
 	# User must merge with other cuts and gapfill as necessary
@@ -123,7 +117,7 @@ class SidelobeCutter:
 			return socut.Simplecut(ndet=obs.tod.shape[0], nsamp=obs.tod.shape[1])
 		# turn non-zero values into a cuts object. Done with pmap here, so can
 		# use pointing pool
-		cuts = mask2cut(tod, dev=self.dev, pool=self.dev.pools["pointing"])
+		cuts = mask2cut_tod(tod, dev=self.dev, pool=self.dev.pools["pointing"])
 		return cuts
 
 def estimate_mindist(obs, distmap, sys="equ", step=1*utils.degree):
@@ -296,7 +290,7 @@ def measure_el_response(obs, nel=2, natm=2, bsize=1000, tol=0.1, dev=None):
 	for i in range(1,nel): E[i] **= i+1
 	B[:nel] = E[:,:nblock*bsize].reshape(nel,nblock,bsize)
 	# Then atm part
-	B[nel:] = gutils.legbasis(natm-1, bsize, ap=dev.np)[:,None,:]
+	B[nel:] = gutils.legbasis(natm-1, bsize, ap=dev.np, dtype=obs.tod.dtype)[:,None,:]
 	# Fit in blocks
 	rhs   = dev.np.einsum("mbs,dbs->bdm", B, btod) # [nblock,ndet,nmode]
 	div   = dev.np.einsum("mbs,nbs->bmn", B, B)   # [nblock,nmode,nmode]
@@ -336,7 +330,7 @@ def deproj_el_response(tod, fit, dev=None):
 	nel  = fit.amps.shape[1]
 	amps = dev.np.array(fit.amps) # ndet,nel
 	# tod[d,i] += amps[d,m]*B[m,s] => tod[i,d] += B[i,m]*amps[m,d]
-	dev.lib.sgemm("N", "N", nsamp, ndet, nel, -1, fit.E, nsamp, amps, nel, 1, tod, nsamp)
+	dev.lib.gemm("N", "N", nsamp, ndet, nel, -1, fit.E, nsamp, amps, nel, 1, tod, nsamp)
 
 def calc_det_el(bel, roll, xieta):
 	bel, roll, xi, eta = np.broadcast_arrays(bel, roll, *xieta.T[:2])
@@ -360,12 +354,14 @@ def dump_elmod_tfit(fname, fit):
 
 # Helpers
 
-# The previous version of mask2cut was optimized for a small cut fraction, but
+# The previous version of mask2cut_tod was optimized for a small cut fraction, but
 # used 9*todsize*cutfrac memory, which would be huge when cutfrac is big.
 # This version uses todsize/2 + tiny memory, where tiny would only become
 # problematic if the total number of cut ranges gets to O(10%) of the number
 # of samples, which should be impossible at this stage
-def mask2cut(tod, dev=None, pool=None):
+def mask2cut_tod(tod, dev=None, pool=None):
+	"""Given a tod that is non-zero in pixels to be cut,
+	returns a Simplecut representing the cut sample ranges."""
 	if dev  is None: dev  = device.get_device()
 	ndet, nsamp = tod.shape
 	with pool.as_allocator() if pool is not None else contextlib.nullcontext():
@@ -387,14 +383,35 @@ def mask2cut(tod, dev=None, pool=None):
 		dev.get(lens), ndet=tod.shape[0], nsamp=tod.shape[1])
 	return cuts
 
-def ephem_map(shape, wcs, object_list, trange, dt=1000, dr=1*utils.arcsec):
+def pmap_prep_map(map):
+	map = map.preflat[:3]
+	if len(map) == 3 and map.dtype == np.float32: return map
+	omap = enmap.zeros((3,)+map.shape[-2:], map.wcs, map.dtype)
+	omap[:len(map)] = map
+	return omap
+
+def mask2cut_map(obs, mask, sys="equ", tod_pool=None, work_pool=None, dev=None):
+	"""Given an obs and a map "mask" which is non-zero in pixels to be cut,
+	returns a Simplecut representing the cut sample ranges."""
+	mask = pmap_prep_map(mask)
+	if dev is None: dev = device.get_device()
+	if tod_pool is None: tod_pool = dev.np
+	# Create a mask tod from the mask map
+	lmap = tiling.enmap2lmap(mask, dev=dev)
+	pmap = pmat.PmatMap(lmap.fshape, lmap.fwcs, obs.ctime, obs.boresight,
+		obs.point_offset, obs.polangle, sys=sys, partial=True, dtype=obs.tod.dtype, dev=dev)
+	wtod = tod_pool.empty(obs.tod.shape, obs.tod.dtype)
+	pmap.forward(wtod, lmap.lmap)
+	# Then return a cut object build from this mask tod
+	return mask2cut_tod(wtod, dev=dev, pool=work_pool)
+
+def ephem_map(shape, wcs, object_list, trange, dt=1000, dr=1*utils.arcsec, dtype=np.float32):
 	"""Make a map where pixels hit by the objects in object_list [(name,rad),
 	(name,rad),...], over the given ctime range trange are set to 1, and
 	other pixels to zero. A pixel is hit if it's within each object's radius
 	in object_list. The painting is done in steps of at most dt, so dt should
 	be small enough that objects don't have time to move much relative to
 	their masking radius over dt"""
-	dtype = np.float32
 	if len(object_list) == 0:
 		return enmap.zeros((3,)+shape[-2:], wcs, dtype)
 	t1, t2     = trange
@@ -429,10 +446,11 @@ def ephem_map(shape, wcs, object_list, trange, dt=1000, dr=1*utils.arcsec):
 	amps   = np.broadcast_to(amps [:,None], poss.shape[1:]).reshape(-1)
 	pinds  = np.broadcast_to(pinds[:,None], poss.shape[1:]).reshape(-1)
 	poss   = poss.reshape(2,-1)
-	# Finally do the actual painting
-	map    = enmap.zeros((3,)+shape[-2:], wcs, dtype)
+	# Finally do the actual painting. This is float32-only, so convert in the end
+	map    = enmap.zeros((3,)+shape[-2:], wcs, np.float32)
 	pointsrcs.sim_objects(shape, wcs, poss[::-1], amps, profs, prof_ids=pinds, omap=map[0])
 	map[0] = map[0] >= 1
+	map    = map.astype(dtype, copy=False)
 	return map
 
 def get_object_list(object_list=None, planet_list=None, asteroid_list=None, dedup=True):

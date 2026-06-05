@@ -96,9 +96,9 @@ def leakcheck(dev, msg):
 		L.print("%sleak %8.4f MB %s%s" % (colors.lbrown, (m2-m1)/1024**2, msg, colors.reset), level=2)
 
 # These have norm 2/(2i+1)
-def legbasis(order, n, ap=np):
-	x   = ap.linspace(-1, 1, n, dtype=np.float32)
-	out = ap.zeros((order+1, n),dtype=np.float32)
+def legbasis(order, n, ap=np, dtype=np.float32):
+	x   = ap.linspace(-1, 1, n, dtype=dtype)
+	out = ap.zeros((order+1, n),dtype=dtype)
 	out[0] = 1
 	if order>0:
 		out[1] = x
@@ -344,7 +344,6 @@ def find_period_gaps(periods, ttol=60):
 
 def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1, adjoint=False, dev=None):
 	if dev is None: dev = device.get_device()
-	if tod.dtype != np.float32: raise ValueError("Only float32 supported")
 	if not inplace: tod = tod.copy()
 	ndet, nsamp = tod.shape
 	B    = dev.np.empty([2,nsamp],dtype=tod.dtype) # [{a,b},nsamp]
@@ -357,7 +356,7 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 		# tod      = tod_mul*otod
 		# transposed: coeffs' = abmul*otod.dot(B')
 		coeffs = dev.np.zeros((2,ndet), tod.dtype) # [{a,b},ndet]
-		dev.lib.sgemm("T", "N", ndet, 2, nsamp, abmul, tod, nsamp, B, nsamp, 0, coeffs, ndet)
+		dev.lib.gemm("T", "N", ndet, 2, nsamp, abmul, tod, nsamp, B, nsamp, 0, coeffs, ndet)
 		if tod_mul != 1: tod *= tod_mul
 	else:
 		# otod = abmul*coeffs.T.dot(B) + tod_mul*tod
@@ -365,7 +364,7 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 		# In standard form
 		# [otod] = [abmul*B' tod_mul*I] [coeffs tod]'
 		coeffs = dev.np.array([a,b]) # [{a,b},ndet]
-		dev.lib.sgemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
+		dev.lib.gemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
 	return tod, coeffs[0], coeffs[1]
 
 def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, dev=None, external_v=False, return_edges=False):
@@ -837,7 +836,7 @@ def read_detnames(fname):
 	# problem si that if the files start with a comment, then that line is
 	# skipped (as it should be), but numpy insists on warning about that
 	with utils.nowarn():
-		return np.loadtxt(fname, dtype=str, usecols=0)
+		return np.loadtxt(fname, dtype=str, usecols=0, ndmin=1)
 
 class LinResamp:
 	"""Helper for resampling arrays using linear interpolation

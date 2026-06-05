@@ -19,6 +19,7 @@ parser.add_argument("area")
 parser.add_argument("odir")
 parser.add_argument("-C", "--context", type=str, default="lat", help="Either a config.yaml, context.yaml or a telescope name, like lat, satp1, etc.. The most general is config.yaml, which works with both the sofast and soslow loaders. Using just a context only works with sofast, and must be a context that includes the preprocess database. Telescope names expand to the default preprocess context using $SOPATH, which should point to the SO top-level directory (the one that contains the metadata directory).")
 parser.add_argument("-r", "--mask-rad",type=float, default=30, help="The atmospheric context region is this far away from the planet, in arcmin")
+parser.add_argument("-R", "--strong-rad",type=float, default=5, help="The strongest signal is within this radius of the planet. This will be excluded from the noise model")
 parser.add_argument("-Q", "--query",   type=str, default=None)
 parser.add_argument("-p", "--prefix",  type=str, default=None)
 parser.add_argument("-v", "--verbose", action="count", default=1)
@@ -29,17 +30,25 @@ parser.add_argument(      "--ignore",  type=str, default="recover")
 parser.add_argument("-j", "--joint",   type=str, default="oband")
 parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
 parser.add_argument(      "--tsplit",  type=float, default=None, help="Split obs-groups in time to keep them shorter than this many seconds. See also --split")
+parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
+parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
 parser.add_argument("-c", "--cont",    action="store_true")
 parser.add_argument(      "--sel",     type=str, default=":")
+parser.add_argument("-m", "--mode",    type=str, default="fbin", help="fbin for standard use-data-outside-radius-to-predict-atm-inside-and-subtract-then-map-with-white-noise-model and prior for maximum-likelihood-source-subsampling-and-prior")
+parser.add_argument("-I", "--maxiter", type=int, default=500)
+parser.add_argument(      "--maxerr",  type=float, default=1e-7)
+parser.add_argument("-d", "--dump",    type=str, default="none")
+parser.add_argument("-b", "--bits",    type=int, default=32, help="dtype bits in tod and map. 32 or 64")
 args = parser.parse_args()
 
 comm_all   = mpi.COMM_WORLD
 comm_per   = mpi.COMM_SELF
 mpi.install_abort_hook()
-dtype_tod  = np.float32
-dtype_map  = np.float32
+dtype      = {32:np.float32, 64:np.float64}[args.bits]
 shape, wcs = enmap.read_map_geometry(args.area)
 mask_rad   = args.mask_rad*utils.arcmin
+if args.dump == "none" or "": dump = []
+else: dump = [int(w) for w in args.dump.split(",")]
 # Set up our device
 dev = device.get_device(args.device)
 # Set up our logging
@@ -57,6 +66,9 @@ obsinfo = loader.query(args.query)
 if len(obsinfo) == 0:
 	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
 	sys.exit(1)
+# Optional detector restriction
+dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
+detids = gutils.read_detnames(args.detids) if args.detids is not None else None
 # Define obs-groups
 joint   = loader.group_obs(obsinfo, mode=args.joint)
 ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
@@ -90,22 +102,62 @@ planets  = [name for name in planets if name != planet]
 config.set("planet_list", ",".join(planets))
 # Don't bother cutting asteroids
 config.set("object_cut",    "planets:5")
-# Set up noise model
-mask = enmap.zeros((3,)+shape[-3:], wcs, dtype_map)
-mask[0] = mask.distance_from([0,0], rmax=mask_rad) < mask_rad
-# Only safe to use buf="pointing" if we perform zero cg steps!
-noise_model = nmat.NmatWhite(dev=dev)
-filter      = nmat.FilterGapfill(mask=mask, sys=sys, buf="pointing", dev=dev)
 # Set up the signals we will solve for
 map_out = ["map", "ivar"]
-# Building SignalMapMulti globally like this means that we end up outputting per-band maps
-# even when making oband observations, leading to a lot of empty maps. sogma in perobs
-# mode suffers from the same problem. Need a redesign to avoid this problem.
-if joint.joint:
-	signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=dtype_map, sys=sys, outputs=map_out, precon="div")
+if args.mode == "fbin":
+# Only safe to use buf="pointing" if we perform zero cg steps!
+	# Set up noise model
+	mask = enmap.zeros((3,)+shape[-3:], wcs, dtype)
+	mask[0] = mask.distance_from([0,0], rmax=mask_rad) < mask_rad
+	noise_model = nmat.NmatWhite(dev=dev)
+	filters     = [nmat.FilterGapfill(mask=mask, sys=sys, buf="pointing", dev=dev)]
+	# Building SignalMapMulti globally like this means that we end up outputting per-band maps
+	# even when making oband observations, leading to a lot of empty maps. sogma in perobs
+	# mode suffers from the same problem. Need a redesign to avoid this problem.
+	if joint.joint:
+		signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
+	else:
+		signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
+	# Setup mapmaker and make the maps
+	mapmaker = mapmaking.MLMapmaker(signals=[signal_map], dtype=dtype, verbose=True, noise_model=noise_model, filters=filters, dev=dev)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, maxiter=20, dets=dets, detids=detids, ignore=args.ignore, cont=args.cont, dump=dump)
+elif args.mode == "prior":
+	# Build our zero-prior, which will constrain atmospheric modes at the cost of
+	# removing all signal outside that radius
+	prior = mapmaking.PriorDisk(r=mask_rad)
+	# A different mask for nmat inpainting and source subsampling
+	strong_rad  = args.strong_rad*utils.arcmin
+	strong_mask = enmap.zeros((3,)+shape[-3:], wcs, dtype)
+	strong_mask[0] = strong_mask.distance_from([0,0], rmax=strong_rad) < strong_rad
+	nprep = nmat.NprepMask(strong_mask, sys=sys, dev=dev)
+	noise_model = nmat.NmatDetvecs(dev=dev)
+	if joint.joint:
+		signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, prior=prior, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
+	else:
+		signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype, prior=prior, sys=sys, outputs=map_out, precon="div")
+	signal_cut = mapmaking.SignalCutFull(comm_per, dtype=dtype, dev=dev)
+	signal_src = mapmaking.SignalSrcSamp(strong_mask, comm_per, sys=sys, dtype=dtype, dev=dev)
+	# Setup mapmaker and make the maps
+	mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_src,signal_map], dtype=dtype, verbose=True, noise_model=noise_model, nprep=nprep, dev=dev)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, maxiter=args.maxiter, maxerr=args.maxerr, dets=dets, detids=detids, ignore=args.ignore, cont=args.cont, dump=dump)
+elif args.mode == "prior2":
+	# Build our zero-prior, which will constrain atmospheric modes at the cost of
+	# removing all signal outside that radius
+	prior = mapmaking.PriorDisk(r=mask_rad)
+	# A different mask for nmat inpainting
+	strong_rad  = args.strong_rad*utils.arcmin
+	strong_mask = enmap.zeros((3,)+shape[-3:], wcs, dtype)
+	strong_mask[0] = strong_mask.distance_from([0,0], rmax=strong_rad) < strong_rad
+	nprep = nmat.NprepMask(strong_mask, sys=sys, dev=dev)
+	noise_model = nmat.NmatDetvecs(dev=dev)
+	if joint.joint:
+		signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, prior=prior, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
+	else:
+		signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype, prior=prior, sys=sys, outputs=map_out, precon="div")
+	signal_cut = mapmaking.SignalCutFull(comm_per, dtype=dtype, dev=dev)
+	signal_sub = mapmaking.SignalSubSamp(comm_per, dtype=dtype, dev=dev)
+	# Setup mapmaker and make the maps
+	mapmaker = mapmaking.MLMapmaker(signals=[signal_cut, signal_sub, signal_map], dtype=dtype, verbose=True, noise_model=noise_model, nprep=nprep, dev=dev)
+	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, npass=2, maxiter=[10,args.maxiter], maxerr=args.maxerr, dets=dets, detids=detids, ignore=args.ignore, cont=args.cont, dump=dump, restart=True)
 else:
-	signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype_map, sys=sys, outputs=map_out, precon="div")
-signals    = [signal_map]
-# Setup mapmaker and make the maps
-mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype_tod, verbose=True, noise_model=noise_model, filter=filter, dev=dev)
-mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, maxiter=5, ignore=args.ignore, cont=args.cont)
+	raise ValueError("Unrecognized mode '%s'" % str(args.mode))

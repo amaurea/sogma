@@ -108,7 +108,7 @@ class MLMapmaker:
 		self.verbose  = verbose
 		self.noise_model = noise_model or nmat.NmatDetvecs(dev=dev)
 		self.filters  = filters
-		self.nprep    = nprep or nmat.NprepNone()
+		self.nprep    = nprep or nmat.NprepNone(dev=dev)
 		self.set_outputs(outputs)
 		self.reset()
 	def reset(self):

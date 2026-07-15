@@ -261,7 +261,7 @@ def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typi
 	ndet, nsamp = len(offs), bore.shape[1]
 	# Transform the boresight
 	icoord = coordsys.Coords(az=bore[1], el=bore[0], roll=bore[2])
-	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather)
+	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather, bore=icoord)
 	# Apply the detector offsets. Like so3g, we assume that they're all affected
 	# by the same refraction, which is only an approximation
 	if use_so3g == "auto":

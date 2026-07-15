@@ -412,12 +412,6 @@ class NmatDetvecsScaled(Nmat):
 			b = np.maximum(1,b)
 			E[bi], D[bi], Nd[bi] = measure_detvecs(ft[:,b[0]:b[1]], V)
 		del Nd, ft
-
-
-		print("FIXME Nmat")
-		E /= 10
-
-
 		# Also compute a representative white noise level. This needs to take
 		# into account the scaling we've already done. Sadly the bins don't map
 		# cleanly onto each other, but at least the scaling bin-size is constant,
@@ -995,9 +989,9 @@ class NprepMask(Nprep):
 		from . import socal
 		cuts = socal.mask2cut_map(obs, self.mask, sys=self.sys, dev=self.dev, tod_pool=self.dev.pools["ft"])
 		cuts = cuts.to_device(self.dev)
+		# Save old values in area to be gapfilled before estimating the nosie model
+		vals = cuts.extract(tod)
 		try:
-			# Save old values in area to be gapfilled before estimating the nosie model
-			vals = cuts.extract(tod)
 			# Then yield gapfilled version
 			cuts.gapfill(tod)
 			yield

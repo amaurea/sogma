@@ -53,7 +53,7 @@ class MMDeviceMinimal(device.DeviceCpu):
 			assert A.dtype == X.dtype and A.dtype == C.dtype, "Arguments must agree on dtype"
 			assert A.dtype == np.float32 or A.dtype == np.float64, "Only float32 and float64 supported"
 			raise NotImplementedError
-		self.lib.sdgmm = sdgmm
+		self.lib.dgmm = dgmm
 
 device_types.minimal = MMDeviceMinimal
 

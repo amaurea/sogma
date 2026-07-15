@@ -171,6 +171,7 @@ class SoFastLoader:
 				otot.hwp       = obs.hwp
 				otot.site      = obs.site
 				otot.bore_ref  = obs.bore_ref
+				otot.sampoff   = obs.sampoff
 				# This is where we finally put things in the "tod" pool. Until now, we've
 				# used the input buffer "itod"
 				otot.tod       = self.dev.pools["tod"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
@@ -465,7 +466,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 				roll = -data.corot[i1:i2]*utils.degree + el - 60*utils.degree
 		bore_ref = np.array([el[0], az[0], roll[0]])
 		with bench.mark("pointing correction"):
-			az, el, roll = apply_pointing_model(az, el, roll, meta.pointing_model)
+			fp = meta.aman.focal_plane
+			az, el, roll, fp[:] = apply_pointing_model(az, el, roll, fp, meta.pointing_model)
 
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
@@ -578,6 +580,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 
 	# Our goal is to output what sogma needs. Sogma works on these fields:
 	res  = bunch.Bunch()
+	res.sampoff      = i1
 	res.dets         = meta.aman.dets.vals[good]
 	res.detids       = meta.aman.det_ids[good]
 	res.detpix       = meta.aman.det_pix[good]
@@ -662,16 +665,22 @@ class WaferInfo:
 	def _prepare(self, wafer_name):
 		if wafer_name in self.info: return
 		hfname, group = get_wafer_file(self.wafer_index, wafer_name)
+		def mget(data, name, default):
+			try: return np.char.decode(data[name])
+			except TypeError: return np.full(len(data),default)
 		with h5py.File(hfname, "r") as hfile:
 			data = hfile[group][()]
+			# Sadly some of the are only sometimes present.
+			# LF doesn't have rhombus. Made the ones we don't
+			# absolutely need optional
 			self.info[wafer_name] = bunch.Bunch(
 				dets  = np.char.decode(data["dets:det_id"]),
 				bands = np.char.decode(data["dets:wafer.bandpass"]),
-				types = np.char.decode(data["dets:wafer.type"]),
-				array = np.char.decode(data["dets:wafer.array"]),
-				rhombus = np.char.decode(data["dets:wafer.rhombus"]),
-				row   = data["dets:wafer.det_row"],
-				col   = data["dets:wafer.det_col"],
+				types = mget(data,"dets:wafer.type", "?"),
+				array = mget(data,"dets:wafer.array", "?"),
+				rhombus = mget(data, "dets:wafer.rhombus", "?"),
+				row   = mget(data, "dets:wafer.det_row", 0),
+				col   = mget(data, "dets:wafer.det_col", 0),
 				raw   = data)
 
 # Should extend DetCache to also include wafer_info. wafer_info
@@ -878,7 +887,7 @@ class PointingModelCache:
 				elif isinstance(d, h5py.Dataset):
 					# Sigurd per-subid format. Precompute a hash map
 					table = d[()]
-					index = {name.decode():i for i,name in enumerate(table["subid"])}
+					index = {subid.decode():i for i,subid in enumerate(table["subid"])}
 					self.cache[key] = ("subid", index, table)
 				else: raise ValueError("%s/%s is neither a group or dataset" % (fname, gname))
 		return self.cache[key]
@@ -891,7 +900,8 @@ class PointingModelCache:
 		elif match[0] == "subid":
 			# Look up row in table, and reformat it as bunch
 			#print("%s in pointing: %d" % (str(subid), str(subid) in match[1]))
-			row = match[2][match[1][str(subid)]]
+			try: row = match[2][match[1][str(subid)]]
+			except KeyError: raise ValueError("Missing pointing correction")
 			return pointing_row_to_params(row)
 		else:
 			raise ValueError("Unrecognized PointingModelCache entry '%s'" % str(match[0]))
@@ -1171,13 +1181,13 @@ def polar_2d(x, y):
 
 # This takes 250 ms! And the quaternion stuff would be tedious
 # (but not difficult as such) to implement on the gpu
-def apply_pointing_model(az, el, roll, model):
+def apply_pointing_model(az, el, roll, detoffs, model):
 	"""Apply the given pointing model to az, el, roll, returning corrected values.
 	The coordinates will also be normalized to -pi/2 <= el <= pi/2, see fix_overpole"""
 	import pixell.coordsys as quat
 	# Ensure they're arrays, and avoid overwriting. These are
 	# small arrays anyways
-	[az, el, roll] = [np.array(a) for a in [az,el,roll]]
+	[az, el, roll, detoffs] = [np.array(a) for a in [az,el,roll, detoffs]]
 	if   model.version == "sat_naive":
 		if el[0] > np.pi/2: fix_overpole(az, el, roll, inline=True)
 	elif model.version == "sat_v1":
@@ -1275,8 +1285,45 @@ def apply_pointing_model(az, el, roll, model):
 		# Finally back to coordinates
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1
+	elif model.version == "arc":
+		# Calcluate the rad-roll-arc offsets based on the position in the focal plane
+		r2    = detoffs[:,0]**2 + detoffs[:,1]**2
+		scale = model.arc_amp * (1-r2/model.arc_r0**2)
+		ang   = np.mean(roll)-model.arc_roll0
+		dxi   = scale * (np.cos(ang)-1)
+		deta  = scale * np.sin(ang)
+		# Apply this and the wafer offset
+		detoffs[:,0] += dxi  + model.waf_off_xi
+		detoffs[:,1] += deta + model.waf_off_eta
+		# The rest is like the v2 model
+		# Reconstruct the corotator angle
+		corot = el - roll - 60*utils.degree
+		# Apply offsets
+		az    += model.enc_offset_az
+		el    += model.enc_offset_el
+		corot += model.enc_offset_cr
+		# El sag. Should the quadratic term preserve the sign?
+		Δel = el     - model.el_sag_pivot
+		el += Δel    * model.el_sag_lin
+		el += Δel**2 * model.el_sag_quad
+		# Main part
+		q_lonlat     = quat.rotation_lonlat(-az, el)
+		q_mir_center = ~quat.rotation_xieta(model.mir_center_xi0, model.mir_center_eta0)
+		q_el_roll    = quat.euler(2, el - 60*utils.degree)
+		q_el_axis_center = ~quat.rotation_xieta(model.el_axis_center_xi0, model.el_axis_center_eta0)
+		q_cr_roll    = quat.euler(2, -corot)
+		q_cr_center  = ~quat.rotation_xieta(model.cr_center_xi0, model.cr_center_eta0)
+		# Base tilt is a bit more complicated
+		phi = np.arctan2(model.base_tilt_sin, model.base_tilt_cos)
+		amp = (model.base_tilt_sin**2 + model.base_tilt_cos**2)**0.5
+		q_base = quat.euler(2,phi) * quat.euler(1, amp) * quat.euler(2, -phi)
+		# Compose into the full model
+		q_tot  = q_base * q_lonlat * q_mir_center * q_el_roll * q_el_axis_center * q_cr_roll * q_cr_center
+		# Finally back to coordinates
+		az, el, roll = quat.decompose_lonlat(q_tot)
+		az          *= -1
 	else: raise ValueError("Unrecognized model '%s'" % str(model.version))
-	return az, el, roll
+	return az, el, roll, detoffs
 
 def fix_overpole(az, el, roll, inline=False):
 	if not inline: az, el, roll = az.copy(), el.copy(), roll.copy()

@@ -68,7 +68,7 @@ class SoFastLoader:
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
-	def load(self, subid, catch="expected", dets=None, detids=None, demod=None, dtype=np.float32):
+	def load(self, subid, catch="expected", dets=None, detids=None, post=None, dtype=np.float32):
 		catch_list = catch2list(catch)
 		try:
 			with bench.mark("load_meta"):
@@ -81,9 +81,12 @@ class SoFastLoader:
 			# Calibrate the data
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
-			if demod is not None and demod.demod:
+			if post is not None and post.demod:
 				with bench.mark("load_demod"):
-					obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
+					obs = socommon.demodulate(obs, comps=post.comps, dev=self.dev)
+			if post is not None and post.down:
+				with bench.mark("load_down"):
+					obs = socommon.downsample(obs, down=post.down, dev=self.dev)
 		except catch_list as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
@@ -94,7 +97,7 @@ class SoFastLoader:
 		# Record any non-fatal errors
 		obs.errors = []
 		return obs
-	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, demod=None, dtype=np.float32):
+	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, post=None, dtype=np.float32):
 		"""Load multiple concurrent subids into a single obs"""
 		# FIXME: This is inefficient:
 		# * bands and dark detectors for the same wafer are stored in the same files,
@@ -135,7 +138,7 @@ class SoFastLoader:
 		# Restrict them to a common sample range
 		sinfo    = get_obs_sampinfo(self.obsdb.conn, mids)
 		ndet_raw = make_metas_compatible(metas, sinfo)[0]
-		ndet     = socommon.get_full_ndet(ndet_raw, demod=demod)
+		ndet     = socommon.get_full_ndet(ndet_raw, post=post)
 		# Restrict to target sample range
 		if samprange is not None:
 			for meta in metas:
@@ -155,9 +158,12 @@ class SoFastLoader:
 				# This uses buffers "tod" and "ft"
 				with bench.mark("load_calib"):
 					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
-				if demod is not None and demod.demod:
+				if post is not None and post.demod:
 					with bench.mark("load_demod"):
-						obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
+						obs = socommon.demodulate(obs, comps=post.comps, dev=self.dev)
+				if post is not None and post.down:
+					with bench.mark("load_down"):
+						obs = socommon.downsample(obs, down=post.down, dev=self.dev)
 				obs.subids = [subid]
 				obs.errors = []
 			except catch_list as e:

@@ -1016,8 +1016,8 @@ def find_scanning(az, down=10, tol=0.01, pad=1):
 # For ndown, we would need to know how much downsampling there will be.
 # That depends on the hwp speed. Is this available in obsdb?
 
-def get_full_ndet(ndet, demod):
-	if demod and demod.demod: return ndet*len(demod.comps)
+def get_full_ndet(ndet, post):
+	if post and post.demod: return ndet*len(post.comps)
 	else: return ndet
 
 def demodulate(data, frel=1, comps="TQU", mul=32, dev=None):
@@ -1127,12 +1127,49 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None):
 	for key in data:
 		if key not in odata:
 			odata[key] = data[key]
+	return odata
 
-	#i = utils.find(data.detids, "Mv19_f150_Ar10c02A")
-	#moo = bunch.Bunch(tod=dev.get(odata.tod[i::ndet]), dets=odetids[i::ndet], polangle=odata.polangle[i::ndet],
-	#	response=odata.response[:,i::ndet], offs=data.point_offset[:1], el=odata.boresight[0], az=odata.boresight[1],
-	#	ctime=odata.ctime)
-	#bunch.write("test_demod.hdf", moo)
-	#1/0
-
+def downsample(data, fsamp=None, down=None, mul=32, dev=None):
+	"""Downsample data either by the given down-factor, or to the given sample rate fsamp.
+	Uses fourier-resampling for the tod, and linear resampling for the rest. The actual
+	sample rate will be adjusted slightly to still be fourier- and gpu-friendly."""
+	# Ok, if we get here, then we can demodulate
+	if dev is None: dev = device.get_device()
+	ndet, insamp = data.tod.shape
+	duration     = data.ctime[-1]-data.ctime[0]
+	srate        = (insamp-1)/duration
+	dtype        = data.tod.dtype
+	ctype        = utils.complex_dtype(dtype)
+	# Get our target sample rate
+	if fsamp is None: fsamp = srate/down
+	# Find our output number of samples. This is ideally determined by
+	# fsamp, but we are also restricted by fourier and mapmaking
+	# considerations via mul
+	onsamp  = fft.fft_len(utils.nint(insamp*fsamp/srate/mul), factors=dev.lib.fft_factors)*mul
+	# Prepare our resampling. For the tod we use fft-resampling. For the others, we use
+	# linear interpolation. Averaging would be better, but these are smooth functions so
+	# it should be good enough
+	linresamp = gutils.LinResamp(insamp, onsamp)
+	# Construct an output data with the given downsampling and detector duplication
+	odata = bunch.Bunch()
+	odata.ctime  = linresamp(data.ctime)
+	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
+	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1])) # az
+	odata.boresight[0] = linresamp(data.boresight[0]) # el
+	odata.boresight[2] = linresamp(data.boresight[2]) # roll
+	# Resample cuts, and duplicate them across the virtual detectors
+	odata.cuts  = data.cuts.to_sampcut().to_simple().resample(onsamp).simplify().to_simple()
+	# Resample the tod
+	work    = dev.pools["wtod"].array(data.tod)
+	ftod    = dev.pools["ft"].empty((ndet, data.tod.shape[-1]//2+1), ctype)
+	dev.lib.rfft(work, ftod)
+	ftod    = dev.pools["ft"].array(dev.pools["wtod"].array(ftod[:,:onsamp//2+1]))
+	ftod   *= 2/insamp
+	# can finally transform back
+	odata.tod = dev.pools["dtod"].zeros((ndet,onsamp), dtype)
+	dev.lib.irfft(ftod, odata.tod)
+	# Everything else will be simply copied over
+	for key in data:
+		if key not in odata:
+			odata[key] = data[key]
 	return odata

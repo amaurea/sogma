@@ -1415,7 +1415,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 	# Check if we'll be demodulating
 	if len(inds) > 0:
 		ginfo = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		demod = demod_settings(ginfo)
+		post  = post_settings(ginfo)
 	# Set up memory pools. Setting these up before-hand is
 	# actually more memory-efficient, as long as our estimate is
 	# good.
@@ -1429,7 +1429,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
 		try:
-			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids, demod=demod, dtype=mapmaker.dtype)
+			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids, post=post, dtype=mapmaker.dtype)
 			# I keep calculating this. It should be a standard member of data
 			# Should probably promote data to a full class
 			srate = (len(data.ctime)-1)/(data.ctime[-1]-data.ctime[0])
@@ -1639,7 +1639,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 	# good.
 	if len(inds) > 0:
 		ginfo  = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		demod  = demod_settings(ginfo)
+		post   = post_settings(ginfo)
 	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo, dtype=mapmaker.dtype)
 	# Process our observations
 	for i, ind in enumerate(inds):
@@ -1648,7 +1648,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		subpre = prefix + name.replace(":","_") + "_"
 		t1     = time.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, demod=demod)
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, post=post)
 		except etypes as e:
 			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue
@@ -1819,7 +1819,7 @@ def fplane_movie(shape, wcs, loader, obsinfo, comm, joint=None, inds=None, prefi
 	# good.
 	if len(inds) > 0:
 		ginfo  = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		demod  = demod_settings(ginfo)
+		post   = post_settings(ginfo)
 	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo, dtype=mapmaker.dtype)
 	# Process our observations
 	for i, ind in enumerate(inds):
@@ -1828,7 +1828,7 @@ def fplane_movie(shape, wcs, loader, obsinfo, comm, joint=None, inds=None, prefi
 		subpre = prefix + name.replace(":","_") + "_"
 		t1     = dev.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, demod=demod)
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, post=post)
 		except etypes as e:
 			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue
@@ -1955,8 +1955,8 @@ class SimpleLoader:
 		# .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
 		joint   = loader.group_obs(obsinfo, mode=args.joint)
 		ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-		demod   = mapmaking.demod_settings(ginfo)
-		joint   = gutils.time_split(joint, ginfo, demod=demod, maxsize=args.split*1e9, maxdur=args.tsplit)
+		post    = mapmaking.post_settings(ginfo)
+		joint   = gutils.time_split(joint, ginfo, post=post, maxsize=args.split*1e9, maxdur=args.tsplit)
 		#joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
 		# group selection. Sadly this can't be done with the query-level selection, as that
 		# happens before grouping.
@@ -1982,12 +1982,12 @@ class SimpleLoader:
 		if dev is None: dev = device.get_device()
 		# Register interface
 		locs = locals()
-		for name in ["args", "dev", "loader", "L", "verbosity", "obsinfo", "joint", "demod", "ginfo", "etypes", "dets", "detids", "prefix"]:
+		for name in ["args", "dev", "loader", "L", "verbosity", "obsinfo", "joint", "post", "ginfo", "etypes", "dets", "detids", "prefix"]:
 			setattr(self, name, locs[name])
 	def get_obs(self, ind):
 		name   = self.joint.names[ind]
 		subids = self.obsinfo.id[self.joint.groups[ind]]
-		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, demod=self.demod)
+		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, post=self.demod)
 	def obs_iter(self, inds=None, fname_fun=None, empty_fun=None):
 		from . import tiling
 		if fname_fun is None: fname_fun = self.fname_fun
@@ -2032,17 +2032,19 @@ def distribute_tasks(obsinfo, joint, comm, taskdist=None):
 	inds = np.where(dist.owner == comm.rank)[0]
 	return inds
 
-def setup_buffers(dev, ginfo, demod=None, dtype=np.float32, nopoint=False):
+def setup_buffers(dev, ginfo, post=None, dtype=np.float32, nopoint=False):
 	# Need to know if we're demodulating, since if affects buffer sizes
-	demod = demod_settings(ginfo, demod)
+	post = post_settings(ginfo, post)
 	ctype = utils.complex_dtype(dtype)
 	# ndown is the post-demodulation sample count
-	if demod.demod:
-		dmul   = len(demod.comps)
+	if post.demod:
+		dmul   = len(post.comps)
 		ndown  = utils.ceil(ginfo.nsamp*np.abs(ginfo.fhwp)/ginfo.fsamp)
 	else:
 		dmul  = 1
 		ndown = ginfo.nsamp
+	if post.down:
+		ndown = utils.ceil(ndown/post.down)
 	ndet   = ginfo.ndet*dmul
 	nf     = ginfo.nsamp//2+1
 	nfdown = ndown//2+1
@@ -2057,7 +2059,7 @@ def setup_buffers(dev, ginfo, demod=None, dtype=np.float32, nopoint=False):
 	if not nopoint: dev.pools["pointing"].empty((3, ndet_ndown), dtype=dtype)
 	# Pools used when reading in data
 	dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
-	if demod.demod:
+	if post.demod:
 		#dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
 		dev.pools["wtod"].empty(nsub_nsamp,      dtype=dtype)
 		dev.pools["dtod"].empty(nsub_ndown*dmul, dtype=dtype)
@@ -2079,12 +2081,14 @@ def trivial_joint(obsids):
 
 config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
 config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")
+config.default("down", 0.0, "Downsampling factor. Set to 0 to disable downsampling")
 
-def demod_settings(ginfo, demod=None, comps=None):
+def post_settings(ginfo, demod=None, comps=None, down=None):
 	fhwp  = np.mean(np.abs(ginfo.fhwp))
 	return bunch.Bunch(
 		demod = gutils.check_demod(config.get("demod", demod), has_hwp=fhwp>0),
 		comps = config.get("comps", comps),
+		down  = config.get("down", down) or None,
 	)
 
 # Zippers

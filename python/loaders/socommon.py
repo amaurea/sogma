@@ -828,8 +828,10 @@ def find_context(path_or_name, type="preprocess"):
 			if os.path.exists(path): return path
 		raise FileNotFoundError
 
-def expand_context(context):
+def expand_context(context, cdir=None):
 	tags = context["tags"]
+	if cdir is not None:
+		tags["cdir"] = cdir
 	return _expand_context_helper(context, tags)
 
 def _expand_context_helper(obj, tags):
@@ -872,7 +874,7 @@ def get_expanded_context(context_or_config_or_name):
 		context = read_yaml(cpath)
 	else: ppath = None
 	# Ok, by now we have a context dict. Expand curly braces in it
-	context = expand_context(context)
+	context = expand_context(context, cdir=os.path.dirname(cpath))
 	# Set the preprocess path if we have one from config
 	if ppath:
 		entry = find_label(context["metadata"], "preprocess", whole=True)

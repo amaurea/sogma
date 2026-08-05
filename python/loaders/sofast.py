@@ -145,7 +145,7 @@ class SoFastLoader:
 				off = meta.aman.samps.offset
 				meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
 		# Set up total obs
-		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[], cuts=[])
+		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[], cuts=[], fill=[])
 		append_fields = [("dets",0),("detids",0),("detpix",0),("bands",0),("point_offset",0),
 			("polangle",0),("response",1)]
 		for field, axis in append_fields: otot[field] = []
@@ -185,6 +185,7 @@ class SoFastLoader:
 			for field, axis in append_fields:
 				otot[field].append(obs[field])
 			otot.cuts.append(obs.cuts)
+			otot.fill.append(obs.fill)
 			otot.subids += obs.subids
 			otot.errors += obs.errors
 			# Copy tod over to the right part of the output buffer
@@ -197,6 +198,7 @@ class SoFastLoader:
 		for field, axis in append_fields:
 			otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
 		otot.cuts = socut.Simplecut.detcat(otot.cuts)
+		otot.fill = socut.Simplecut.detcat(otot.fill)
 		# Trim tod in case we lost some detectors
 		otot.tod = otot.tod[:dcum]
 		# Non-fatal errors
@@ -598,6 +600,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 	res.hwp          = hwp_angle
 	res.tod          = signal
 	res.cuts         = ocuts
+	res.fill         = ocuts
 	res.site         = "so"
 	res.response     = None
 	# original value of the first sample of boresight, before the pointing model

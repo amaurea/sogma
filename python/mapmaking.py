@@ -1186,6 +1186,92 @@ class SignalElMod(Signal):
 	# e.g. rhs and ivar. It doesn't mean an actual sky map
 	valid_outputs = ["map"]
 
+class SignalPickup(Signal):
+	def __init__(self, comm, res=15*utils.arcmin, phase=False,
+			prior=None, dev=None, name="pickup", ofmt="{name}_{id}",
+			dtype=np.float32, outputs=[]):
+		Signal.__init__(self, name=name, ofmt=ofmt, outputs=outputs, ext="fits")
+		self.comm  = comm
+		self.dev   = dev   or self.get_device()
+		self.prior = prior or self.PriorDiv()
+		self.dtype = dtype
+		self.phase = phase
+		self.res   = res
+		self.off   = 0
+		self.rhs   = []
+		self.div   = []
+		self.idiv  = []
+	def add_obs(self, id, obs, iN, iNd):
+		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
+		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
+		P       = pmat.PmatPickup(obs.baz, self.res, phase=self.phase, dev=self.dev)
+		# Build our RHS
+		ndet    = obs.tod.shape[0]
+		obs_rhs = self.dev.np.zeros((ndet,P.nx), self.dtype)
+		pcut.clear(iNd)
+		P.backward(iNd, obs_rhs)
+		obs_rhs = self.dev.get(obs_rhs)
+		# Build our preconditioner. Fully diagonal for now.
+		obs_div = self.dev.np.ones((ndet,P.nx), self.dtype)
+		iNd[:]   = 0
+		P.forward(iNd, obs_div)
+		#pcut.clear(iNd) # unnecessary since white is diagonal
+		iN.white(iNd)
+		pcut.clear(iNd)
+		obs_div[:] = 0
+		P.backward(iNd, obs_div)
+		with utils.nowarn():
+			obs_idiv = utils.without_nan(1/self.dev.get(obs_div)) # back to the cpu
+		# Keep track of our degrees of freedom
+		ndof = obs_rhs.size
+		self.data[id] = bunch.Bunch(P=P, ndet=ndet, i1=self.off, i2=self.off+ndof)
+		self.off += ndof
+		self.rhs.append(obs_rhs.reshape(-1))
+		self.idiv.append(obs_idiv.reshape(-1))
+		self.dev.garbage_collect()
+	def prepare(self):
+		"""Process the added observations, determining our degrees of freedom etc.
+		Should be done before calling forward and backward."""
+		if self.ready: return
+		self.rhs = np.concatenate(self.rhs)  if len(self.rhs) > 0 else np.zeros(0, self.dtype)
+		self.idiv= np.concatenate(self.idiv) if len(self.rhs) > 0 else np.zeros(0, self.dtype)
+		self.prior.prepare(self)
+		self.prior.b(self.rhs)
+		self.prior.iM(self.idiv)
+		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
+		self.ready = True
+	def forward(self, id, tod, pickup):
+		if id not in self.data: return
+		d = self.data[id]
+		d.P.forward(tod, pickup[d.i1:d.i2].reshape((d.ndet,d.P.nx)))
+	def backward(self, id, tod, amp):
+		if id not in self.data: return
+		d = self.data[id]
+		d.P.backward(tod, pickup[d.i1:d.i2].reshape((d.ndet,d.P.nx)))
+	def precon(self, pickup):
+		return pickup*self.idiv
+	def to_work  (self, x): return self.dev.np.array(x)
+	def from_work(self, x): return self.dev.get(x)
+	def owork(self): return self.dev.np.zeros(self.rhs.shape, self.rhs.dtype)
+	def write(self, prefix, m, tag=None, suffix="", force=False):
+		if tag is None: tag = "map" # e.g. cut_map as opposed to cut_ivar
+		if not force and tag not in self.outputs: return
+		# Will output a file per obs
+		for id, d in self.data.items():
+			pickup = m[d.i1:d.i2].reshape((d.ndet,d.P.nx))
+			wcs    = wcsutils.explicit(crval=[d.P.baz0/utils.degree,0], cdelt=[d.P.dbaz/utils.degree,1], crpix=[1,1])
+			pickup = enmap.enmap(pickup, wcs, copy=False)
+			oname  = self.ofmt.format(name=self.name, id=id.replace(":","_"))
+			oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
+			enmap.write_map(oname, pickup)
+		return None
+	def written(self, prefix):
+		# No way to check this given the per-id name format
+		return True
+	# "map" means the main output for the signal here, in contrast with
+	# e.g. rhs and ivar. It doesn't mean an actual sky map
+	valid_outputs = ["map"]
+
 # Actually, doing this as an actual Signal might be cleanest.
 # Requries no changes to Mapmaker, make_map, etc.
 # Slightly hacky since it would have no degrees of freedom though.
@@ -1323,6 +1409,20 @@ class PriorSubSamp(Prior):
 		"""Call with a SignalSubSamp."""
 		self.penalty = self.strength/signal.cvars
 	def new(self): return PriorSubSamp(strength=self.strength)
+	def iM(self, iprec):
+		iprec += self.penalty
+	def A(self, ival, oval):
+		oval += self.penalty*ival
+
+class PriorDiv(Prior):
+	def __init__(self, strength=1e-3):
+		self.strength = strength
+		self.penalty  = None
+	def prepare(self, signal):
+		with utils.nowarn():
+			self.penalty = self.strength/signal.idiv
+		utils.remove_nan(self.penalty)
+	def new(self): return PriorDiv(strength=self.strength)
 	def iM(self, iprec):
 		iprec += self.penalty
 	def A(self, ival, oval):

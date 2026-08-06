@@ -32,6 +32,7 @@ parser.add_argument(      "--sys",     type=str, default="cel")
 parser.add_argument("-o", "--output",  type=str, default="auto", help="map, ivar, hits, rhs, xlink, time, cut, elmod, nmat or auto. auto is equivalent to map,ivar,xlink. In depth1 and individual mode, auto also includes time")
 parser.add_argument(      "--sel",     type=str, default=":")
 parser.add_argument(      "--elmod",   type=int, default=0)
+parser.add_argument(      "--pickup",  type=float, default=0)
 parser.add_argument(      "--precon",  type=str, default="ivar")
 parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
 parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
@@ -113,7 +114,7 @@ L.print(" ".join(sys.argv), level=0, id=0, color=colors.lgreen)
 # support. For now, any field mentioned refers to SignalMap, except for "cut",
 # which enables cut output. "auto" sets up output of map and ivar for full maps,
 # and adds a time-map for short-duration maps.
-map_out, cut_out, info_out, elmod_out, ml_out = [], [], True, [], []
+map_out, cut_out, info_out, elmod_out, ml_out, pickup_out = [], [], True, [], [], []
 for name in args.output.split(","):
 	if name == "auto":
 		map_out += ["map","ivar","xlink"]
@@ -139,6 +140,8 @@ signals.append(signal_cut)
 signals.append(mapmaking.SignalInfo(comm_per, dtype=dtype, dev=dev))
 if args.elmod > 0:
 	signals.append(mapmaking.SignalElMod(comm_per, order=args.elmod, dev=dev, dtype=dtype, outputs=elmod_out))
+if args.pickup > 0:
+	signals.append(mapmaking.SignalPickup(comm_per, res=args.pikcup*utils.arcmin, dev=dev, dtype=dtype, outputs=pickup_out))
 
 # SignalMap must be last, because it currently does d = Pm instead of d += Pm,
 # so it would clobber any other signals. (Signals are evaluated in reverse order)

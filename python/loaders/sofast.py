@@ -1259,12 +1259,15 @@ def apply_pointing_model(az, el, roll, detoffs, model):
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1
 	elif model.version == "lat_v2":
+		# Apply any wafer offsets if applicable
+		if "waf_off_xi" in model:
+			detoffs[:,0] += model.waf_off_xi
+			detoffs[:,1] += model.waf_off_eta
 		# Reconstruct the corotator angle
 		corot = el - roll - 60*utils.degree
 		# Apply offsets
 		az    += model.enc_offset_az
 		el    += model.enc_offset_el
-		corot += model.enc_offset_cr
 		# El sag. Should the quadratic term preserve the sign?
 		Δel = el     - model.el_sag_pivot
 		el += Δel    * model.el_sag_lin

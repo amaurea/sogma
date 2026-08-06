@@ -538,16 +538,18 @@ def obs_group_dur(obsinfo, groups, inds=None, sampranges=None):
 		durs  *= tfracs
 	return durs
 
-def time_split(joint, ginfo, demod=None, maxsize=None, maxdur=None):
+def time_split(joint, ginfo, post=None, maxsize=None, maxdur=None):
 	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
 	into subranges so that the total ndet*nsamp size of each is no larger than
 	maxsize. This can be needed due to memory constraints."""
-	if demod is not None and demod.demod:
+	if post is not None and post.demod:
 		nsamps = utils.ceil(ginfo.nsamp*ginfo.fhwp/ginfo.fsamp)
-		ndets  = ginfo.ndet*len(demod.comps)
+		ndets  = ginfo.ndet*len(post.comps)
 	else:
 		nsamps = ginfo.nsamp
 		ndets  = ginfo.ndet
+	if post is not None and post.down:
+		nsamps = utils.ceil(nsamps/post.down)
 	nsplits = np.ones(len(joint.groups), int)
 	if maxsize is not None:
 		# calculate the total size of each group

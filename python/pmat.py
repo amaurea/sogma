@@ -91,42 +91,44 @@ class PmatPickup:
 		self.baz  = baz
 		self.phase= phase
 		amin, amax= utils.minmax(baz)
-		i1        = utils.floor(amin/baz)
-		i2        = utils.floor(amax/baz)
+		i1        = utils.floor(amin/dbaz)
+		i2        = utils.floor(amax/dbaz)
 		self.baz0 = i1*dbaz
-		m         = i2-i1
-		if not phase:
-			# We cover [0,m] inclusive. Total nx = m+2.
-			# +1 to get a length, +1 because we need an extra element at end for bilinear
-			self.nx = m+2
-		else:
-			# Forward sweep has [0,      m] inclusive
-			# Return  sweep has [m+1,2*m+1] inclusive
-			# Total nx = 2*m+3
-			self.nx = 2*m+3
-			sweeps, sign0  = find_sweeps(baz)
-			self.back_bins = [(self.sweeps[i],self.sweeps[i+1]) for i in range(sign0, len(sweeps)-1, 2)]
+		# We cover [0,m] inclusive, with m=i2-i1 Total nx = m+2.
+		# +1 to get a length, +1 because we need an extra element at end for bilinear
+		self.nx   = i2-i1+2
+		if phase:
+			# back-stroke is separate copy, appended
+			self.nx *= 2
+			sweeps, dir  = utils.find_sweeps(baz, return_dir=True)
+			self.back_bins = sweeps[1-dir::2]
+		self.xs = None
+	def _calc_xs(self, dtype):
+		xs  = self.dev.pools["xs"].array(self.baz, dtype=dtype)
+		xs -= self.baz0
+		xs /= self.dbaz
+		if self.phase:
+			for i1,i2 in self.back_bins:
+				xs[i1:i2] += self.nx//2
+		return xs
 	def forward(self, tod, pickup):
 		t1 = self.dev.time()
-		self.dev.lib.pickup2tod(pickup, tod, self.xs)
+		xs = self.xs if self.xs is not None else self._calc_xs(tod.dtype)
+		self.dev.lib.pickup2tod(pickup, tod, xs)
 		t2 = self.dev.time()
 		L.print("Pcore pck %6.4f" % (t2-t1), level=3)
 		return tod
 	def backward(self, tod, pickup):
 		t1 = self.dev.time()
-		self.dev.lib.tod2pickup(pickup, tod, self.xs)
+		xs = self.xs if self.xs is not None else self._calc_xs(tod.dtype)
+		self.dev.lib.tod2pickup(pickup, tod, xs)
 		t2 = self.dev.time()
 		L.print("P'core pck %6.4f" % (t2-t1), level=3)
 		return pickup
 	def precalc_setup(self, reset_buffer=True):
 		t1  = self.dev.time()
-		xz  = self.dev.pools["xs"].array(self.baz)
-		xz -= self.baz0
-		xs /= self.dbaz
-		if self.phase:
-			for i1,i2 in self.back_bins:
-				xs[i1:i2] = self.nx-2 - xs[i1:i2]
-		self.xs = xs
+		self.xs = self._calc_xs(tod.dtype)
+		print("xs", utils.minmax(xs), self.nx)
 		t2 = self.dev.time()
 		L.print("Pprep pck %6.4f" % (t2-t1), level=3)
 	def precalc_free (self):

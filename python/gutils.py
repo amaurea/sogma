@@ -169,6 +169,17 @@ def safe_invert_ivar(ivar, tol=1e-6):
 	iivar[good] = 1/ivar[good]
 	return iivar
 
+def remove_nan(a):
+	"""Sets nans and infs to 0 in an array in-place. Should have no memory overhead.
+	Also returns the array for convenience."""
+	ap = device.anypy(a)
+	return ap.nan_to_num(a, copy=False, nan=0, posinf=0, neginf=0)
+def without_nan(a):
+	"""Returns a copy of a with nans and infs set to 0. The original
+	array is not modified."""
+	ap = device.anypy(a)
+	return ap.nan_to_num(a, copy=True, nan=0, posinf=0, neginf=0)
+
 # Runs at 0.45 ms per tile on the cpu and 0.03 ms per tile on the gpu.
 # This is much faster than calling the standard linear algebra functions,
 # but still quite slow. The full LAT area has 100k tiles, which would take
@@ -1135,3 +1146,9 @@ def _app(s, table, verbose):
 	cols = ",".join(s.columns(table))
 	sql  = "insert into main.%s (%s) select %s from other.%s" % (table, cols, cols, table)
 	_ex(s, sql, verbose)
+
+def parse_pickup(desc):
+	parser = utils.CommaArgparse()
+	parser.add_argument("mode", choices=["none", "az", "phase"])
+	parser.add_argument("-r", "--res", type=float, default=15)
+	return parser.parse_args(desc)

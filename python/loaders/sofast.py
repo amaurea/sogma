@@ -68,7 +68,7 @@ class SoFastLoader:
 	def query(self, query=None, sweeps=True, output="sogma"):
 		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
-	def load(self, subid, catch="expected", dets=None, detids=None, demod=None, dtype=np.float32):
+	def load(self, subid, catch="expected", dets=None, detids=None, post=None, dtype=np.float32):
 		catch_list = catch2list(catch)
 		try:
 			with bench.mark("load_meta"):
@@ -81,9 +81,12 @@ class SoFastLoader:
 			# Calibrate the data
 			with bench.mark("load_calib"):
 				obs = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
-			if demod is not None and demod.demod:
+			if post is not None and post.demod:
 				with bench.mark("load_demod"):
-					obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
+					obs = socommon.demodulate(obs, comps=post.comps, dev=self.dev)
+			if post is not None and post.down:
+				with bench.mark("load_down"):
+					obs = socommon.downsample(obs, down=post.down, dev=self.dev)
 		except catch_list as e:
 			# FIXME: Make this less broad
 			raise utils.DataMissing(type(e).__name__ + " " + str(e))
@@ -94,7 +97,7 @@ class SoFastLoader:
 		# Record any non-fatal errors
 		obs.errors = []
 		return obs
-	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, demod=None, dtype=np.float32):
+	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, post=None, dtype=np.float32):
 		"""Load multiple concurrent subids into a single obs"""
 		# FIXME: This is inefficient:
 		# * bands and dark detectors for the same wafer are stored in the same files,
@@ -135,14 +138,14 @@ class SoFastLoader:
 		# Restrict them to a common sample range
 		sinfo    = get_obs_sampinfo(self.obsdb.conn, mids)
 		ndet_raw = make_metas_compatible(metas, sinfo)[0]
-		ndet     = socommon.get_full_ndet(ndet_raw, demod=demod)
+		ndet     = socommon.get_full_ndet(ndet_raw, post=post)
 		# Restrict to target sample range
 		if samprange is not None:
 			for meta in metas:
 				off = meta.aman.samps.offset
 				meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
 		# Set up total obs
-		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[], cuts=[])
+		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[], cuts=[], fill=[])
 		append_fields = [("dets",0),("detids",0),("detpix",0),("bands",0),("point_offset",0),
 			("polangle",0),("response",1)]
 		for field, axis in append_fields: otot[field] = []
@@ -155,9 +158,12 @@ class SoFastLoader:
 				# This uses buffers "tod" and "ft"
 				with bench.mark("load_calib"):
 					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
-				if demod is not None and demod.demod:
+				if post is not None and post.demod:
 					with bench.mark("load_demod"):
-						obs = socommon.demodulate(obs, comps=demod.comps, dev=self.dev)
+						obs = socommon.demodulate(obs, comps=post.comps, dev=self.dev)
+				if post is not None and post.down:
+					with bench.mark("load_down"):
+						obs = socommon.downsample(obs, down=post.down, dev=self.dev)
 				obs.subids = [subid]
 				obs.errors = []
 			except catch_list as e:
@@ -179,6 +185,7 @@ class SoFastLoader:
 			for field, axis in append_fields:
 				otot[field].append(obs[field])
 			otot.cuts.append(obs.cuts)
+			otot.fill.append(obs.fill)
 			otot.subids += obs.subids
 			otot.errors += obs.errors
 			# Copy tod over to the right part of the output buffer
@@ -191,6 +198,7 @@ class SoFastLoader:
 		for field, axis in append_fields:
 			otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
 		otot.cuts = socut.Simplecut.detcat(otot.cuts)
+		otot.fill = socut.Simplecut.detcat(otot.fill)
 		# Trim tod in case we lost some detectors
 		otot.tod = otot.tod[:dcum]
 		# Non-fatal errors
@@ -592,6 +600,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 	res.hwp          = hwp_angle
 	res.tod          = signal
 	res.cuts         = ocuts
+	res.fill         = ocuts
 	res.site         = "so"
 	res.response     = None
 	# original value of the first sample of boresight, before the pointing model
@@ -1259,6 +1268,7 @@ def apply_pointing_model(az, el, roll, detoffs, model):
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1
 	elif model.version == "lat_v2":
+		# Apply any wafer offsets if applicable
 		if "waf_off_xi" in model:
 			detoffs[:,0] += model.waf_off_xi
 			detoffs[:,1] += model.waf_off_eta
@@ -1267,7 +1277,6 @@ def apply_pointing_model(az, el, roll, detoffs, model):
 		# Apply offsets
 		az    += model.enc_offset_az
 		el    += model.enc_offset_el
-		corot += model.enc_offset_cr
 		# El sag. Should the quadratic term preserve the sign?
 		Δel = el     - model.el_sag_pivot
 		el += Δel    * model.el_sag_lin

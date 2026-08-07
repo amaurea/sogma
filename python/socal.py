@@ -25,7 +25,7 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	# since removing these would mess up the noise model too.
 	bright  = {"objects": True,       "sidelobes": False}
 	cuts = [obs.cuts]
-	fill = [obs.cuts]
+	fill = [obs.fill]
 	for i, cutname in enumerate(which):
 		cut   = cutfuns[cutname](obs, id=id, geo=geo, dev=dev)
 		cuts += cut

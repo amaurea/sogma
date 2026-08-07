@@ -1186,6 +1186,105 @@ class SignalElMod(Signal):
 	# e.g. rhs and ivar. It doesn't mean an actual sky map
 	valid_outputs = ["map"]
 
+class SignalPickup(Signal):
+	def __init__(self, comm, res=15*utils.arcmin, phase=False,
+			prior=None, dev=None, name="pickup", ofmt="{name}_{id}",
+			dtype=np.float32, outputs=[]):
+		Signal.__init__(self, name=name, ofmt=ofmt, outputs=outputs, ext="fits")
+		self.comm  = comm
+		self.dev   = dev   or self.get_device()
+		self.prior = prior or PriorDiv()
+		self.dtype = dtype
+		self.phase = phase
+		self.res   = res
+		self.off   = 0
+		self.data  = {}
+		self.rhs   = []
+		self.idiv  = []
+	def reset(self):
+		Signal.reset(self)
+		self.dof  = 0
+		self.data = {}
+		self.rhs  = []
+		self.idiv = []
+	def new(self): return SignalPickup(self.comm, res=self.res, phase=self.phase,
+			prior=self.prior.new(), dev=self.dev, name=self.name, ofmt=self.ofmt,
+			dtype=self.dtype, outputs=self.outputs)
+	def add_obs(self, id, obs, iN, iNd):
+		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
+		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
+		P       = pmat.PmatPickup(obs.boresight[1], self.res, phase=self.phase, dev=self.dev)
+		# Build our RHS
+		ndet    = obs.tod.shape[0]
+		obs_rhs = self.dev.np.zeros((ndet,P.nx), self.dtype)
+		pcut.clear(iNd)
+		P.backward(iNd, obs_rhs)
+		obs_rhs = self.dev.get(obs_rhs)
+		# Build our preconditioner. Fully diagonal for now.
+		obs_div = self.dev.np.ones((ndet,P.nx), self.dtype)
+		iNd[:]   = 0
+		P.forward(iNd, obs_div)
+		#pcut.clear(iNd) # unnecessary since white is diagonal
+		iN.white(iNd)
+		pcut.clear(iNd)
+		obs_div[:] = 0
+		P.backward(iNd, obs_div)
+		with utils.nowarn():
+			obs_idiv = utils.without_nan(1/self.dev.get(obs_div)) # back to the cpu
+		# Keep track of our degrees of freedom
+		ndof = obs_rhs.size
+		self.data[id] = bunch.Bunch(P=P, ndet=ndet, i1=self.off, i2=self.off+ndof)
+		self.off += ndof
+		self.rhs.append(obs_rhs.reshape(-1))
+		self.idiv.append(obs_idiv.reshape(-1))
+		self.dev.garbage_collect()
+	def prepare(self):
+		"""Process the added observations, determining our degrees of freedom etc.
+		Should be done before calling forward and backward."""
+		if self.ready: return
+		self.rhs = np.concatenate(self.rhs)  if len(self.rhs)  > 0 else np.zeros(0, self.dtype)
+		self.idiv= np.concatenate(self.idiv) if len(self.idiv) > 0 else np.zeros(0, self.dtype)
+		self.prior.prepare(self)
+		self.prior.b(self.rhs)
+		self.prior.iM(self.idiv)
+		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
+		self.ready = True
+	def forward(self, id, tod, pickup):
+		if id not in self.data: return
+		d = self.data[id]
+		d.P.forward(tod, pickup[d.i1:d.i2].reshape((d.ndet,d.P.nx)))
+	def backward(self, id, tod, pickup):
+		if id not in self.data: return
+		d = self.data[id]
+		d.P.backward(tod, pickup[d.i1:d.i2].reshape((d.ndet,d.P.nx)))
+	def precon(self, pickup):
+		return pickup*self.idiv
+	def to_work  (self, x): return self.dev.np.array(x)
+	def from_work(self, x): return self.dev.get(x)
+	def owork(self): return self.dev.np.zeros(self.rhs.shape, self.rhs.dtype)
+	def write(self, prefix, m, tag=None, suffix="", force=False):
+		if tag is None: tag = "map" # e.g. cut_map as opposed to cut_ivar
+		if not force and tag not in self.outputs: return
+		# Will output a file per obs
+		for id, d in self.data.items():
+			if self.phase: pickup = np.moveaxis(m[d.i1:d.i2].reshape((d.ndet,2,d.P.nx//2)),1,0)
+			else:          pickup = m[d.i1:d.i2].reshape((d.ndet,d.P.nx))
+			wcs    = wcsutils.explicit(crval=[d.P.baz0/utils.degree,0], cdelt=[d.P.dbaz/utils.degree,1], crpix=[1,1])
+			pickup = enmap.enmap(pickup, wcs, copy=False)
+			oname  = self.ofmt.format(name=self.name, id=id.replace(":","_"))
+			oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
+			enmap.write_map(oname, pickup)
+		return None
+	def written(self, prefix):
+		# No way to check this given the per-id name format
+		return True
+	def write_misc(self, prefix):
+		if "rhs"  in self.outputs: self.write(prefix, self.rhs, tag="rhs")
+		if "ivar" in self.outputs: self.write(prefix, gutils.safe_inv(self.idiv), tag="ivar")
+		if "div"  in self.outputs: self.write(prefix, gutils.safe_inv(self.idiv), tag="ivar")
+		if "bin"  in self.outputs: self.write(prefix, self.precon(self.rhs), tag="bin")
+	valid_outputs = ["map","ivar","rhs","div","bin"]
+
 # Actually, doing this as an actual Signal might be cleanest.
 # Requries no changes to Mapmaker, make_map, etc.
 # Slightly hacky since it would have no degrees of freedom though.
@@ -1328,6 +1427,20 @@ class PriorSubSamp(Prior):
 	def A(self, ival, oval):
 		oval += self.penalty*ival
 
+class PriorDiv(Prior):
+	def __init__(self, strength=1e-3):
+		self.strength = strength
+		self.penalty  = None
+	def prepare(self, signal):
+		with utils.nowarn():
+			self.penalty = self.strength/signal.idiv
+			gutils.remove_nan(self.penalty)
+	def new(self): return PriorDiv(strength=self.strength)
+	def iM(self, iprec):
+		iprec += self.penalty
+	def A(self, ival, oval):
+		oval += self.penalty*ival
+
 def restore_winding(bore, ref):
 	el,  az,  roll  = bore
 	el0, az0, roll0 = ref
@@ -1415,7 +1528,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 	# Check if we'll be demodulating
 	if len(inds) > 0:
 		ginfo = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		demod = demod_settings(ginfo)
+		post  = post_settings(ginfo)
 	# Set up memory pools. Setting these up before-hand is
 	# actually more memory-efficient, as long as our estimate is
 	# good.
@@ -1429,7 +1542,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
 		try:
-			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids, demod=demod, dtype=mapmaker.dtype)
+			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids, post=post, dtype=mapmaker.dtype)
 			# I keep calculating this. It should be a standard member of data
 			# Should probably promote data to a full class
 			srate = (len(data.ctime)-1)/(data.ctime[-1]-data.ctime[0])
@@ -1639,7 +1752,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 	# good.
 	if len(inds) > 0:
 		ginfo  = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		demod  = demod_settings(ginfo)
+		post   = post_settings(ginfo)
 	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo, dtype=mapmaker.dtype)
 	# Process our observations
 	for i, ind in enumerate(inds):
@@ -1648,7 +1761,7 @@ def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=N
 		subpre = prefix + name.replace(":","_") + "_"
 		t1     = time.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, demod=demod)
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, post=post)
 		except etypes as e:
 			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue
@@ -1819,7 +1932,7 @@ def fplane_movie(shape, wcs, loader, obsinfo, comm, joint=None, inds=None, prefi
 	# good.
 	if len(inds) > 0:
 		ginfo  = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		demod  = demod_settings(ginfo)
+		post   = post_settings(ginfo)
 	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo, dtype=mapmaker.dtype)
 	# Process our observations
 	for i, ind in enumerate(inds):
@@ -1828,7 +1941,7 @@ def fplane_movie(shape, wcs, loader, obsinfo, comm, joint=None, inds=None, prefi
 		subpre = prefix + name.replace(":","_") + "_"
 		t1     = dev.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, demod=demod)
+			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, post=post)
 		except etypes as e:
 			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
 			continue
@@ -1955,8 +2068,8 @@ class SimpleLoader:
 		# .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
 		joint   = loader.group_obs(obsinfo, mode=args.joint)
 		ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-		demod   = mapmaking.demod_settings(ginfo)
-		joint   = gutils.time_split(joint, ginfo, demod=demod, maxsize=args.split*1e9, maxdur=args.tsplit)
+		post    = mapmaking.post_settings(ginfo)
+		joint   = gutils.time_split(joint, ginfo, post=post, maxsize=args.split*1e9, maxdur=args.tsplit)
 		#joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
 		# group selection. Sadly this can't be done with the query-level selection, as that
 		# happens before grouping.
@@ -1982,12 +2095,12 @@ class SimpleLoader:
 		if dev is None: dev = device.get_device()
 		# Register interface
 		locs = locals()
-		for name in ["args", "dev", "loader", "L", "verbosity", "obsinfo", "joint", "demod", "ginfo", "etypes", "dets", "detids", "prefix"]:
+		for name in ["args", "dev", "loader", "L", "verbosity", "obsinfo", "joint", "post", "ginfo", "etypes", "dets", "detids", "prefix"]:
 			setattr(self, name, locs[name])
 	def get_obs(self, ind):
 		name   = self.joint.names[ind]
 		subids = self.obsinfo.id[self.joint.groups[ind]]
-		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, demod=self.demod)
+		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, post=self.demod)
 	def obs_iter(self, inds=None, fname_fun=None, empty_fun=None):
 		from . import tiling
 		if fname_fun is None: fname_fun = self.fname_fun
@@ -2032,17 +2145,19 @@ def distribute_tasks(obsinfo, joint, comm, taskdist=None):
 	inds = np.where(dist.owner == comm.rank)[0]
 	return inds
 
-def setup_buffers(dev, ginfo, demod=None, dtype=np.float32, nopoint=False):
+def setup_buffers(dev, ginfo, post=None, dtype=np.float32, nopoint=False):
 	# Need to know if we're demodulating, since if affects buffer sizes
-	demod = demod_settings(ginfo, demod)
+	post = post_settings(ginfo, post)
 	ctype = utils.complex_dtype(dtype)
 	# ndown is the post-demodulation sample count
-	if demod.demod:
-		dmul   = len(demod.comps)
+	if post.demod:
+		dmul   = len(post.comps)
 		ndown  = utils.ceil(ginfo.nsamp*np.abs(ginfo.fhwp)/ginfo.fsamp)
 	else:
 		dmul  = 1
 		ndown = ginfo.nsamp
+	if post.down:
+		ndown = utils.ceil(ndown/post.down)
 	ndet   = ginfo.ndet*dmul
 	nf     = ginfo.nsamp//2+1
 	nfdown = ndown//2+1
@@ -2057,7 +2172,7 @@ def setup_buffers(dev, ginfo, demod=None, dtype=np.float32, nopoint=False):
 	if not nopoint: dev.pools["pointing"].empty((3, ndet_ndown), dtype=dtype)
 	# Pools used when reading in data
 	dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
-	if demod.demod:
+	if post.demod:
 		#dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
 		dev.pools["wtod"].empty(nsub_nsamp,      dtype=dtype)
 		dev.pools["dtod"].empty(nsub_ndown*dmul, dtype=dtype)
@@ -2079,12 +2194,14 @@ def trivial_joint(obsids):
 
 config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
 config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")
+config.default("down", 0.0, "Downsampling factor. Set to 0 to disable downsampling")
 
-def demod_settings(ginfo, demod=None, comps=None):
+def post_settings(ginfo, demod=None, comps=None, down=None):
 	fhwp  = np.mean(np.abs(ginfo.fhwp))
 	return bunch.Bunch(
 		demod = gutils.check_demod(config.get("demod", demod), has_hwp=fhwp>0),
 		comps = config.get("comps", comps),
+		down  = config.get("down", down) or None,
 	)
 
 # Zippers

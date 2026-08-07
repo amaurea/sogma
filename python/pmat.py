@@ -49,7 +49,7 @@ class PmatMap:
 		t2 = self.dev.time()
 		self.dev.lib.map2tod(gtod, glmap, pointing, plan, response=self.response, partial_pixelization=self.partial)
 		t3 = self.dev.time()
-		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		L.print("Pcore map pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gtod
 	def backward(self, gtod, glmap):
 		t1 = self.dev.time()
@@ -58,14 +58,14 @@ class PmatMap:
 		t2 = self.dev.time()
 		self.dev.lib.tod2map(glmap, gtod, pointing, plan, response=self.response, partial_pixelization=self.partial)
 		t3 = self.dev.time()
-		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		L.print("P'core map pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return glmap
 	def precalc_setup(self, reset_buffer=True):
 		t1 = self.dev.time()
 		self.pointing = self.pfit.eval(reset_buffer=reset_buffer)
 		self.plan     = self._make_plan(self.pointing, reset_buffer=reset_buffer)
 		t2 = self.dev.time()
-		L.print("Pprep %6.4f" % (t2-t1), level=3)
+		L.print("Pprep map %6.4f" % (t2-t1), level=3)
 	def precalc_free (self):
 		self.pointing = None
 		self.plan     = None
@@ -83,6 +83,56 @@ class PmatMap:
 		res.bore  = gutils.decimate_tod(res.bore,  step, contiguous=False)
 		res.polang= res.polang+Δpolang
 		return res
+
+class PmatPickup:
+	def __init__(self, baz, dbaz, phase=False, dev=None):
+		self.dev  = dev or device.get_device()
+		self.dbaz = dbaz
+		self.baz  = baz
+		self.phase= phase
+		amin, amax= utils.minmax(baz)
+		i1        = utils.floor(amin/dbaz)
+		i2        = utils.floor(amax/dbaz)
+		self.baz0 = i1*dbaz
+		# We cover [0,m] inclusive, with m=i2-i1 Total nx = m+2.
+		# +1 to get a length, +1 because we need an extra element at end for bilinear
+		self.nx   = i2-i1+2
+		if phase:
+			# back-stroke is separate copy, appended
+			self.nx *= 2
+			sweeps, dir  = utils.find_sweeps(baz, return_dir=True)
+			self.back_bins = sweeps[1-dir::2]
+		self.xs = None
+	def _calc_xs(self, dtype):
+		xs  = self.dev.pools["xs"].array(self.baz, dtype=dtype)
+		xs -= self.baz0
+		xs /= self.dbaz
+		if self.phase:
+			for i1,i2 in self.back_bins:
+				xs[i1:i2] += self.nx//2
+		return xs
+	def forward(self, tod, pickup):
+		t1 = self.dev.time()
+		xs = self.xs if self.xs is not None else self._calc_xs(tod.dtype)
+		self.dev.lib.pickup2tod(pickup, tod, xs)
+		t2 = self.dev.time()
+		L.print("Pcore pck %6.4f" % (t2-t1), level=3)
+		return tod
+	def backward(self, tod, pickup):
+		t1 = self.dev.time()
+		xs = self.xs if self.xs is not None else self._calc_xs(tod.dtype)
+		self.dev.lib.tod2pickup(pickup, tod, xs)
+		t2 = self.dev.time()
+		L.print("P'core pck %6.4f" % (t2-t1), level=3)
+		return pickup
+	def precalc_setup(self, reset_buffer=True):
+		t1  = self.dev.time()
+		self.xs = self._calc_xs(tod.dtype)
+		print("xs", utils.minmax(xs), self.nx)
+		t2 = self.dev.time()
+		L.print("Pprep pck %6.4f" % (t2-t1), level=3)
+	def precalc_free (self):
+		self.xs = None
 
 # Cuts
 

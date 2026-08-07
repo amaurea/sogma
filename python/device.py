@@ -186,6 +186,9 @@ try:
 			self.lib.get_border_means= cpu_mm.get_border_means
 			self.lib.dejump          = cpu_mm.dejump
 			self.lib.gapfill         = cpu_mm.gapfill
+			# Pickup
+			self.lib.tod2pickup      = cpu_mm.tod2pickup
+			self.lib.pickup2tod      = cpu_mm.pickup2tod
 			# ffts. No plan caching for now
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				return fft.rfft(dat, ft=out, axes=axis)

@@ -871,6 +871,8 @@ def get_expanded_context(context_or_config_or_name):
 		ppath = os.path.join(os.path.dirname(cpath), context["archive"]["index"])
 		context = read_yaml(cpath)
 	else: ppath = None
+	# Add cdir to tags, so we can have context-dir relative paths
+	context["tags"]["cdir"] = os.path.dirname(cpath)
 	# Ok, by now we have a context dict. Expand curly braces in it
 	context = expand_context(context)
 	# Set the preprocess path if we have one from config

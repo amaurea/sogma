@@ -667,7 +667,7 @@ class WaferInfo:
 		hfname, group = get_wafer_file(self.wafer_index, wafer_name)
 		def mget(data, name, default):
 			try: return np.char.decode(data[name])
-			except TypeError: return np.full(len(data),default)
+			except (TypeError,ValueError): return np.full(len(data),default)
 		with h5py.File(hfname, "r") as hfile:
 			data = hfile[group][()]
 			# Sadly some of the are only sometimes present.
@@ -1259,6 +1259,9 @@ def apply_pointing_model(az, el, roll, detoffs, model):
 		az, el, roll = quat.decompose_lonlat(q_tot)
 		az          *= -1
 	elif model.version == "lat_v2":
+		if "waf_off_xi" in model:
+			detoffs[:,0] += model.waf_off_xi
+			detoffs[:,1] += model.waf_off_eta
 		# Reconstruct the corotator angle
 		corot = el - roll - 60*utils.degree
 		# Apply offsets

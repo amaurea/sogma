@@ -439,14 +439,7 @@ class SignalMap(Signal):
 		# signal_cut to be safest, but only uses .clear which should be the same for all
 		# of them anyway
 		if pmap is None:
-			try:
-				pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, site=obs.site, dev=self.dev, dtype=iNd.dtype)
-			except RuntimeError:
-				# This happens if the pointing fit goes badly wrong, which
-				# can happen if the tod crosses the poles. Too late to cancel
-				# the tod at this point, so instead we will skip it just in this
-				# signal
-				pmap = pmat.PmatDummy()
+			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, site=obs.site, dev=self.dev, dtype=iNd.dtype)
 			self.dev.garbage_collect()
 		if pcut is None:
 			# This doesn't have to match the exact cut type in SignalCut.
@@ -527,7 +520,8 @@ class SignalMap(Signal):
 			tod = self.dev.pools["tod"].full((ndet,nsamp), 1, d.tod_dtype)
 			# override windowing, since we're downsampled
 			d.iN.white(tod, nwin=0)
-			d.pcut.clear(tod)
+			# FIXME: should have a pcut.clear here, but need a downsampled pcut in that case
+			#d.pcut.clear(tod)
 			pmap.backward(tod, dxlink)
 			t2  = time.time()
 			L.print("Init map %s %6.3f %s" % ("xlink", t2-t1, id), level=2)

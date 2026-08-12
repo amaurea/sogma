@@ -1180,7 +1180,7 @@ def subtract_hwpss(signal, hwp_angle, coeffs, dev=None):
 	# We want signal -= coeffs.dot(B): [ndet,n]*[n,nsamp]. Fortran is
 	# column-major though, so it wants [nsamp,n]*[n,ndet]
 	ndet, nsamp = signal.shape
-	dev.lib.sgemm("N", "N", nsamp, ndet, ncoeff, -1, B, nsamp, coeffs, ncoeff, 1, signal, nsamp)
+	dev.lib.gemm("N", "N", nsamp, ndet, ncoeff, -1, B, nsamp, coeffs, ncoeff, 1, signal, nsamp)
 	return signal
 
 def polar_2d(x, y):

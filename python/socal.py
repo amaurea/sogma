@@ -1,10 +1,9 @@
 import numpy as np, os, contextlib
-from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch, colors
+from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch, colors, wcsutils
 from . import pmat, tiling, device, socut, gutils, soeph
 from .logging import L
 
 config.default("autocut",       "objects,sidelobes", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut. sidelobes: The sidelobe cut")
-config.default("object_cut",    "planets:10,asteroids:5")
 # planetas and asteroids defined in sogma.soeph
 
 def autocut(obs, id="?", which=None, geo=None, dev=None):
@@ -15,7 +14,7 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	if which == "none" or len(which) == 0: return obs
 	which   = which.split(",")
 	# The functions that implement each autocut type
-	cutfuns = {"objects": object_cut, "sidelobes": sidelobe_cut}
+	cutfuns = {"objects": object_cut, "sidelobes": sidelobe_cut, "galaxy":galaxy_cut}
 	# Whether these are generally bright enough that they should
 	# be gapfilled. This is the case if they are bright enough that
 	# they would distort the noise model, or if they represent a sudden
@@ -23,7 +22,7 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	# cut would not be able to represent. Not gapfilling is beneficial for
 	# broad regions like sidelobe cuts, which can be tens of degrees across,
 	# since removing these would mess up the noise model too.
-	bright  = {"objects": True,       "sidelobes": False}
+	bright  = {"objects": True,       "sidelobes": False,        "galaxy": False}
 	cuts = [obs.cuts]
 	fill = [obs.fill]
 	for i, cutname in enumerate(which):
@@ -40,6 +39,7 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 # TODO: This function takes around 1 sec, dominated by ephem_map+lmap+pmap
 # Could potentially speed up by using pmap.backward to figure out which tiles
 # are hit, instead of building a fullsky map.
+config.default("object_cut",    "planets:10,asteroids:5")
 def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*utils.arcmin,
 		dt=100, dr=1*utils.arcsec, dev=None):
 	if dev is None: dev = device.get_device()
@@ -57,6 +57,21 @@ def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*uti
 	# return result as length-1 list of cuts
 	# It's a list of cuts because other cut types can return multiple cuts
 	# User must merge with other cuts and gapfill as necessary
+	return [cuts]
+
+config.default("galcut_rad", 2.0, "Degrees of avoidance around the galaxy when the galaxy cut is enabled")
+def galaxy_cut(obs, maxlat=None, id="?", geo=None, dev=None):
+	maxlat = config.get("galcut_rad", maxlat)*utils.degree
+	return lat_cut(obs, [-maxlat,maxlat], id=id, sys="gal", dev=dev)
+
+def lat_cut(obs, latrange, id="?", sys="gal", dev=None):
+	if dev is None: dev = device.get_device()
+	# Make a dummy geometry where pixel coordinatees and gal coordinates are the same thing
+	wcs  = wcsutils.explicit(crval=[0,0], cdelt=[1,1], crpix=[1,1], ctype=["RA---CAR","DEC--CAR"])
+	pfit = pmat.PointingFit(None, wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=sys, dtype=obs.tod.dtype, dev=dev)
+	lat, lon, psi = pfit.eval()
+	gutils.between_inplace(lat, latrange[0]/utils.degree, latrange[1]/utils.degree)
+	cuts = mask2cut_tod(lat, dev=dev, pool=dev.pools["ft"])
 	return [cuts]
 
 config.default("sun_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/sun.fits", "Location of Sun sidelobe mask")

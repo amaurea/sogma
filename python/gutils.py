@@ -53,6 +53,17 @@ def detmean_ps(ftod):
 	ps /= 2*ftod.shape[0]
 	return ps
 
+def between_inplace(x, v1, v2):
+	"""For each element in x, replace it with 0/1 if that element
+	is inside/outside the range (v1,v2) while allocating no new arrays.
+	v1 and v2 are assumed to be plain numbers, not arrays.
+	Yes, x is overwritten with the result."""
+	mid = (v2+v1)/2
+	rad = (v2-v2)/2
+	x  -= mid
+	np.less(x, rad, out=x)
+	return x
+
 def split_ranges(dets, starts, lens, maxlen):
 	# Vectorized splitting of detector ranges into subranges.
 	# Probably premature optimization, since it's a bit hard to read.

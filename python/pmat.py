@@ -1,20 +1,13 @@
 import numpy as np, copy
 import quaternion
 import so3g
-from pixell import utils, enmap, coordsys, bench
+from pixell import utils, enmap, coordsys, bench, bunch
 from . import device, gutils
 from .logging import L
 
-class PmatDummy:
-	def __init__(self): pass
-	def forward(self, gtod, glmap): pass
-	def backward(self, gtod, glmap): pass
-	def precalc_setup(self, reset_buffer=True): pass
-	def precalc_free (self): pass
-
 class PmatMap:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", site=None, response=None,
-			ncomp=3, dev=None, dtype=np.float32, partial=False):
+			ncomp=3, dev=None, dtype=np.float32, partial=False, skip_invalid=True):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels
 
@@ -38,11 +31,28 @@ class PmatMap:
 		self.partial  = partial
 		self.response = dev.np.array(response) if response is not None else None
 		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, site=site, dtype=dtype, dev=self.dev)
-		self.preplan  = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
+		self.skip_invalid = skip_invalid
+		self.skip  = False
+		# PointingFit can produce out-of-bounds values, making the PrePlan fail. This usually
+		# only happens when mapping in weird coordinate systems where the observation crosses a pole.
+		# 
+		# We catch this case, and enable clipping just for those, since it's not free.
+		# But the whole pointing interpolation is dubious in this case... I used to use PmatDummy,
+		# but that required handling things everywhere .__init__() and variant() are called.
+		# If the pointing is too dubious, then it might be better to just make PmatMap itself skip
+		# things if this fails, e.g. self.skip = True
+		try:
+			self.preplan = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
+		except RuntimeError as e:
+			if skip_invalid:
+				L.print("Error building PmatMap. Skipping coupling to sky", level=2)
+				self.skip = True
+			else: raise
 		self.pointing = None
 		self.plan     = None
 	def forward(self, gtod, glmap):
 		"""Argument is a LocalMap or equivalent"""
+		if self.skip: return gtod
 		t1 = self.dev.time()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
@@ -52,6 +62,7 @@ class PmatMap:
 		L.print("Pcore map pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gtod
 	def backward(self, gtod, glmap):
+		if self.skip: return glmap
 		t1 = self.dev.time()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
@@ -61,6 +72,7 @@ class PmatMap:
 		L.print("P'core map pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return glmap
 	def precalc_setup(self, reset_buffer=True):
+		if self.skip: return
 		t1 = self.dev.time()
 		self.pointing = self.pfit.eval(reset_buffer=reset_buffer)
 		self.plan     = self._make_plan(self.pointing, reset_buffer=reset_buffer)
@@ -74,11 +86,15 @@ class PmatMap:
 			return self.dev.lib.PointingPlan(self.preplan, pointing)
 	def variant(self, step=1, down=1, Δpolang=0):
 		res = copy.copy(self)
-		res.pfit    = res.pfit.variant(step=step, down=down, Δpolang=Δpolang)
-		res.preplan = res.dev.lib.PointingPrePlan(res.pfit.eval(), res.pfit.shape[-2], res.pfit.shape[-1], periodic_xcoord=True)
-		res.plan    = None
-		res.pointing = None
-		# We don't need the others, but oh well
+		if not self.skip:
+			res.pfit    = res.pfit.variant(step=step, down=down, Δpolang=Δpolang)
+			try:
+				res.preplan = res.dev.lib.PointingPrePlan(res.pfit.eval(), res.pfit.shape[-2], res.pfit.shape[-1], periodic_xcoord=True)
+			except RuntimeError as e:
+				if res.skip_invalid: res.skip = True
+				else: raise
+			res.plan    = None
+			res.pointing = None
 		res.ctime = gutils.decimate_tod(res.ctime, step, contiguous=False)
 		res.bore  = gutils.decimate_tod(res.bore,  step, contiguous=False)
 		res.polang= res.polang+Δpolang
@@ -382,13 +398,14 @@ class PointingFit:
 		"""
 		# TODO: Consider generalizing to more than just car
 		assert wcs.wcs.ctype[0][-3:] == "CAR", "Only CAR supported for now"
-		self.shape, self.wcs = shape, wcs
+		self.shape, self.wcs = shape, wcs # shape not used
 		self.nt, self.nx, self.ny = nt, nx, ny
 		self.dev   = dev or device.get_device()
 		self.dtype = dtype
 		self.store_basis = store_basis
 		self.subsamp     = subsamp
-		self.nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
+		self.nphi   = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
+		self.ntheta = utils.nint(180/np.abs(wcs.wcs.cdelt[1]))
 		self.sys  = sys
 		self.site = site
 		self.weather = weather

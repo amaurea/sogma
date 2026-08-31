@@ -78,6 +78,9 @@ try:
 			self.lib.get_border_means= gpu_mm.get_border_means
 			self.lib.dejump          = gpu_mm.dejump
 			self.lib.gapfill         = gpu_mm.gapfill
+			# Pickup
+			self.lib.tod2pickup      = gpu_mm.tod2pickup
+			self.lib.pickup2tod      = gpu_mm.pickup2tod
 			# Low-level fft plans
 			self.lib.get_plan_size   = gpu_mm.cufft.get_plan_size
 			self.lib.get_plan_r2c    = gpu_mm.cufft.get_plan_r2c

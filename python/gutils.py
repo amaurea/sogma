@@ -58,10 +58,12 @@ def between_inplace(x, v1, v2):
 	is inside/outside the range (v1,v2) while allocating no new arrays.
 	v1 and v2 are assumed to be plain numbers, not arrays.
 	Yes, x is overwritten with the result."""
+	ap  = device.anypy(x)
 	mid = (v2+v1)/2
-	rad = (v2-v2)/2
+	rad = (v2-v1)/2
 	x  -= mid
-	np.less(x, rad, out=x)
+	ap.abs(x, out=x)
+	ap.less(x, rad, out=x)
 	return x
 
 def split_ranges(dets, starts, lens, maxlen):

@@ -321,36 +321,100 @@ def _normalize_bfun(a):
 
 # Misc
 
+# calc_pointing assumes a standard coordinate system, and breaks if we try to do
+# focal-plane coordinates. In practice we do
+#   lon,lat,psi = qbore*qdetoff*qpolang
+# but focal-plane coordinates need
+#   lon,lat,psi = 1/(qbore*qdetoff)
+#   psi -= polang
+# Adding in polang will be cheap, so can generalize to
+#   q = qbore*qdetoff
+#   if inverse: q **= -1
+#   lon,lat,psi = q
+#   if inverse: psi -= polang
+#   else:       psi += polang
+# Still want transform to be able to transform to sidelobe coordinates though.
+# So may want to let it take care of the qbore inversion and only apply qdetoff myself:
+#   q = transform(bore, inverse)
+#   if inverse: q = 1/qdetoff * q
+#   else:       q *= qdetoff
+#   lon,lat,psi = q
+#   if inverse: psi -= polang
+#   else:       psi += polang
+# To get inverse, expand sys ourselves
+# I think I can pack this into both the so3g and coordsys cases below
+
+#def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typical",
+#		dtype=np.float32, use_so3g="auto"):
+#	offs, polang = np.asarray(offs), np.asarray(polang)
+#	ndet, nsamp = len(offs), bore.shape[1]
+#	# Transform the boresight
+#	icoord = coordsys.Coords(az=bore[1], el=bore[0], roll=bore[2])
+#	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather)
+#	# Apply the detector offsets. Like so3g, we assume that they're all affected
+#	# by the same refraction, which is only an approximation
+#	if use_so3g == "auto":
+#		use_so3g = utils.can_import("so3g")
+#	if use_so3g:
+#		import so3g
+#		fplane  = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], polang)
+#		p       = so3g.ProjEng_CAR_TQU_NonTiled((1, 1, 1., 1., 1., 1.))
+#		q       = so3g.proj.quat.G3VectorQuat(quaternion.as_float_array(ocoord.q))
+#		pos_equ     = np.moveaxis(p.coords(q, fplane.quats, None),2,0)
+#		pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
+#		# Go from c1,s1 to psi
+#		pos_equ[2]  = np.arctan2(pos_equ[3],pos_equ[2])
+#		pos_equ     = pos_equ[:3]
+#	else:
+#		# This part is nicer, but makes the function take 440 ms
+#		# vs. 210 ms with so3g. The main slow part is the decomposition,
+#		# which seems like it needs to be moved to a lower-level language
+#		qdet   = coordsys.rotation_xieta(offs[:,1], offs[:,0], polang)
+#		ocoord = ocoord*qdet[:,None] # {ndet,nsamp}
+#		# Decompose into ra,dec. This step is surprisingly slow
+#		pos_equ= np.array([ocoord.dec, ocoord.ra, ocoord.psi]) # [{dec,ra,psi}]
+#	return pos_equ
+
+
+# q_hor  = q_bore0*q_roll*q_det
+# q_det' = q_roll*q_det
+# 
+
 def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typical",
 		dtype=np.float32, use_so3g="auto"):
 	offs, polang = np.asarray(offs), np.asarray(polang)
 	ndet, nsamp = len(offs), bore.shape[1]
+	el, az, roll = bore
+	# Hack: Inverse coordinate systems like sidelobe coordinates does not fit into
+	# my normal coordinate system logic, so we need some special casing here. In particular,
+	# the detector offsets, polangs and to-rotation must be done differently
+	sys  = coordsys.expand_sys(sys, ctime=ctime, site=site, weather=weather)
+	# Separate out the final to-rotation, since we may need to do detector stuff in between
+	qto  = sys.iupto
+	sys.iupto = np.quaternion(1,0,0,0)
+	# Detector offsets, but no polang!
+	qdet   = coordsys.rotation_xieta(offs[:,1], offs[:,0])
 	# Transform the boresight
-	icoord = coordsys.Coords(az=bore[1], el=bore[0], roll=bore[2])
-	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather, bore=icoord)
-	# Apply the detector offsets. Like so3g, we assume that they're all affected
-	# by the same refraction, which is only an approximation
-	if use_so3g == "auto":
-		use_so3g = utils.can_import("so3g")
-	if use_so3g:
-		import so3g
-		fplane  = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], polang)
-		p       = so3g.ProjEng_CAR_TQU_NonTiled((1, 1, 1., 1., 1., 1.))
-		q       = so3g.proj.quat.G3VectorQuat(quaternion.as_float_array(ocoord.q))
-		pos_equ     = np.moveaxis(p.coords(q, fplane.quats, None),2,0)
-		pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
-		# Go from c1,s1 to psi
-		pos_equ[2]  = np.arctan2(pos_equ[3],pos_equ[2])
-		pos_equ     = pos_equ[:3]
-	else:
-		# This part is nicer, but makes the function take 440 ms
-		# vs. 210 ms with so3g. The main slow part is the decomposition,
-		# which seems like it needs to be moved to a lower-level language
-		qdet   = coordsys.rotation_xieta(offs[:,1], offs[:,0], polang)
-		ocoord = ocoord*qdet[:,None] # {ndet,nsamp}
-		# Decompose into ra,dec. This step is surprisingly slow
-		pos_equ= np.array([ocoord.dec, ocoord.ra, ocoord.psi]) # [{dec,ra,psi}]
-	return pos_equ
+	icoord = coordsys.Coords(az=az, el=el, roll=roll)
+	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather)
+	if sys.inverse: ocoord.q  = 1/qdet[:,None] * ocoord.q
+	else:           ocoord.q  = ocoord.q * qdet[:,None]
+	# Apply our to-rotation
+	ocoord.q = coordsys.mul(qto, ocoord.q)
+	# Decompose
+	pos_out  = np.array([ocoord.dec, ocoord.ra, ocoord.psi])
+	# Apply detector angles
+	if sys.leak:    pos_out[2]  = 0 # probably only makes sense together with inverse
+	if sys.inverse: pos_out[2] -= polang[:,None]
+	else:           pos_out[2] += polang[:,None]
+	# Hack: in postroll-coordinates, we rotate the focal plane back to roll=0
+	if sys.postroll:
+		ocoord = coordsys.Coords(ra=pos_out[1], dec=pos_out[0])
+		ocoord.q = qto*coordsys.euler(2,roll)/qto * ocoord.q
+		pos_out[0]  = ocoord.dec
+		pos_out[1]  = ocoord.ra
+		pos_out[2] -= ocoord.psi
+	return pos_out
 
 # How to evaluate xlink map cheaply?
 # 1. Want to not have to redo the fit. Thankfully eval is linear and coeffs[2]

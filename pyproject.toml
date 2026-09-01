@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sogma"
+version = "0.1.0"
+description = "SO GPU map-making tools"
+requires-python = ">=3.8"
+
+dependencies = [
+    'numpy',
+    'pixell',
+    'numpy-quaternion',
+    'h5py',
+    'scipy>=1.0',
+    "python_dateutil>=2.7",
+]
+
+[tool.setuptools]
+packages = ["sogma"]
+package-dir = { "sogma" = "python" }
+
+script-files = [
+  "bin/sogma",
+  "bin/solist",
+  "bin/soplanet",
+  "bin/sosplit",
+]

@@ -375,11 +375,6 @@ def _normalize_bfun(a):
 #		pos_equ= np.array([ocoord.dec, ocoord.ra, ocoord.psi]) # [{dec,ra,psi}]
 #	return pos_equ
 
-
-# q_hor  = q_bore0*q_roll*q_det
-# q_det' = q_roll*q_det
-# 
-
 def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typical",
 		dtype=np.float32, use_so3g="auto"):
 	offs, polang = np.asarray(offs), np.asarray(polang)

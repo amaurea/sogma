@@ -2139,6 +2139,21 @@ def distribute_tasks(obsinfo, joint, comm, taskdist=None):
 	inds = np.where(dist.owner == comm.rank)[0]
 	return inds
 
+def merge_obsinfo(obsinfo, joint):
+	res    = np.zeros(len(joint.groups), dtype=obsinfo.dtype).view(np.recarray)
+	res.id = joint.names
+	# These ones we can just copy from the first one, since they should all match.
+	# Hack: Including sweep here, even though it should really be some polygon union thing
+	first  = np.array([group[0] for group in joint.groups])
+	for key in ["ctime", "dur", "baz", "waz", "bel", "wel", "roll", "fhwp", "sweep"]:
+		res[key] = obsinfo[key][first]
+	# These need special consideration
+	for gi, group in enumerate(joint.groups):
+		rows = obsinfo[group]
+		res.ndet[gi]  = np.sum(rows.ndet)
+		res.nsamp[gi] = rows.nsamp[0] if joint.sampranges[gi] is None else joint.sampranges[gi][1]-joint.sampranges[gi][0]
+	return res
+
 def setup_buffers(dev, ginfo, post=None, dtype=np.float32, nopoint=False):
 	# Need to know if we're demodulating, since if affects buffer sizes
 	post = post_settings(ginfo, post)

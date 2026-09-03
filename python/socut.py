@@ -128,7 +128,7 @@ class Simplecut:
 		index_map2[:,2]  = self.starts
 		index_map2[:,3]  = self.starts+self.lens
 		return index_map2
-
+	def export(self): return np.array([self.dets, self.starts, self.lens], dtype=np.int32).reshape(3,-1).T
 
 # This class represents cut ranges relative to the tod start, after
 # any offsets in the OffsetAxis in the axismanager have been applied.

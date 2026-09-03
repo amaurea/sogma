@@ -1,0 +1,111 @@
+#!/usr/bin/env -S python -u
+import numpy as np, os, time, sys
+from pixell import config, enmap, utils, mpi, colors, bench, bunch
+from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
+from sogma.loaders import sofast, simple
+# Have to do all imports that could contain configuration before
+# building config.ArgumentParser because these may define variables.
+# This means we can't bail out early when called with wrong arguments;
+# we have to wait for potentially slow imports first. Oh well.
+parser = config.ArgumentParser("sogma")
+parser.add_argument("odir")
+parser.add_argument("-C", "--context", type=str, default="lat", help="Either a config.yaml, context.yaml or a telescope name, like lat, satp1, etc.. The most general is config.yaml, which works with both the sofast and soslow loaders. Using just a context only works with sofast, and must be a context that includes the preprocess database. Telescope names expand to the default preprocess context using $SOPATH, which should point to the SO top-level directory (the one that contains the metadata directory).")
+parser.add_argument("-Q", "--query",   type=str, default=None)
+parser.add_argument("-v", "--verbose", action="count", default=1)
+parser.add_argument("-q", "--quiet",   action="count", default=0)
+parser.add_argument("-L", "--loader",  type=str, default="auto")
+parser.add_argument("-D", "--device",  type=str, default="auto")
+parser.add_argument(      "--ignore",  type=str, default="recover")
+parser.add_argument("-j", "--joint",   type=str, default="oband")
+parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
+parser.add_argument(      "--tsplit",  type=float, default=None, help="Split obs-groups in time to keep them shorter than this many seconds. See also --split")
+parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
+parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
+parser.add_argument("-c", "--cont",    action="store_true")
+parser.add_argument(      "--sel",     type=str, default=":")
+parser.add_argument("-b", "--bits",    type=int, default=32, help="dtype bits in tod and map. 32 or 64")
+args = parser.parse_args()
+
+comm       = mpi.COMM_WORLD
+mpi.install_abort_hook()
+dtype      = {32:np.float32, 64:np.float64}[args.bits]
+# Set up our device
+dev = device.get_device(args.device)
+# Set up our logging
+verbosity  = args.verbose-args.quiet
+L = logging.Logger(dev, id=comm.rank, level=verbosity, fmt="{id:3d} {t:10.6f} {mem:10.6f} {dmem_pools:10.6f} {dmem_rest:10.6f} {dmem_unknown:10.6f} {msg:s}").setdefault()
+bench.set_verbose(verbosity >= 3)
+L.print("Init", level=0, id=0, color=colors.lgreen)
+# Benchmarking
+bench.set_tfun(dev.time)
+# Set up our data loader
+loader  = loading.Loader(args.context, type=args.loader, dev=dev)
+obsinfo = loader.query(args.query)
+if len(obsinfo) == 0:
+	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
+	sys.exit(1)
+# Optional detector restriction
+dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
+detids = gutils.read_detnames(args.detids) if args.detids is not None else None
+# Define obs-groups
+joint   = loader.group_obs(obsinfo, mode=args.joint)
+ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
+post    = mapmaking.post_settings(ginfo)
+joint   = gutils.time_split(joint, ginfo, post=post, maxsize=args.split*1e9, maxdur=args.tsplit)
+# group selection. Sadly this can't be done with the query-level selection, as that
+# happens before grouping.
+jinds   = eval("list(range(%d))[%s]" % (len(joint.groups),args.sel))
+joint   = gutils.select_groups(joint, jinds)
+ngroup  = len(joint.groups)
+if joint.joint:
+	bandmsg = ",".join(joint.bands)
+	if len(joint.nullbands) > 0:
+		bandmsg += " null " + ",".join(joint.nullbands)
+	L.print("Dumping %d tod-groups across %s with %d mpi tasks" % (ngroup, bandmsg, comm.size), level=0, id=0, color=colors.lgreen)
+else:
+	L.print("Dumping %d tods with %d mpi tasks" % (ngroup, comm.size), level=0, id=0, color=colors.lgreen)
+utils.mkdir(args.odir)
+# Set up exception types we will ignore
+if   args.ignore == "all":     etypes, load_catch = (Exception,), "all"
+elif args.ignore == "missing": etypes, load_catch = (utils.DataMissing,), "expected"
+elif args.ignore == "recover": etypes, load_catch = (utils.DataMissing, gutils.RecoverableError), "all"
+elif args.ignore == "none":    etypes, load_catch = (), "none"
+else: raise ValueError("Unrecognized error ignore setting '%s'" % str(args.ignore))
+
+# We will use joint.name as file names for the dumped files, and it's
+# annoying to have to escape : in the file names all the time, so replace them with _
+joint.names = [name.replace(":","_") for name in joint.names]
+
+# Output preliminary obsinfo, in case we get interrupted. This
+# will differ slightly from the final one in that it doesn't know about
+# parts of the data that get skipped
+oinfo = mapmaking.merge_obsinfo(obsinfo, joint)
+if comm.rank == 0: simple.write_obsinfo(args.odir + "/obsinfo.npy", oinfo)
+
+# Loop through and dump
+inds  = mapmaking.distribute_tasks(obsinfo, joint, comm, taskdist="simple")
+oinfo.ndet  = 0
+oinfo.nsamp = 0
+for i, ind in enumerate(inds):
+	name   = joint.names[ind]
+	subids = obsinfo.id[joint.groups[ind]]
+	t1     = time.time()
+	try:
+		data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids, post=post, dtype=dtype)
+	except etypes as e:
+		L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
+		continue
+	if len(data.errors) > 0:
+		# Partial skip
+		L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
+	# Finish our row of oinfo
+	oinfo.ndet, oinfo.nsamp = data.tod.shape
+	# Output our data
+	data.tod = dev.get(data.tod)
+	simple.write_data(args.odir + "/" + name + ".hdf", data)
+	L.print("Processed %d %s %4d %6d" % (ind, name, *data.tod.shape), level=1)
+# Output final obsinfo
+oinfo.ndet  = utils.allreduce(np.ascontiguousarray(oinfo.ndet),  comm)
+oinfo.nsamp = utils.allreduce(np.ascontiguousarray(oinfo.nsamp), comm)
+oinfo = oinfo[oinfo.ndet > 0]
+if comm.rank == 0: simple.write_obsinfo(args.odir + "/" + "obsinfo.npy", oinfo)

@@ -2181,10 +2181,10 @@ def setup_buffers(dev, ginfo, post=None, dtype=np.float32, nopoint=False):
 	dev.pools["ft"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
 	dev.pools["fft_scratch"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
 
-def trivial_joint(obsids):
+def trivial_joint(obsinfo):
 	"""Make a group-info corresponding to a no grouping"""
-	groups=[[i] for i in range(len(obsids))]
-	return bunch.Bunch(groups=groups, names=obsids.id, sampranges=[None for i in range(len(obsids))])
+	groups=[[i] for i in range(len(obsinfo))]
+	return bunch.Bunch(groups=groups, names=obsinfo.id, sampranges=[None for i in range(len(obsinfo))])
 
 config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
 config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")

@@ -602,6 +602,10 @@ def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
 	like projecting a per-obs mask to time domain in order
 	to construct cuts."""
 	if dev is None: dev = device.get_device()
+	# Flatten input map pre-dimensions, so we can get incomp, which we will
+	# need to make sure only the T component of the output gets populated if
+	# the input map is T-only, instead of broadcasting to TQU as it otherwise would
+	map = map.preflat
 	fshape, fwcs, pixbox = infer_fullsky_geometry(map.shape, map.wcs)
 	# Set up the tiling. Have to keep track of the global tiling
 	# and the part we will actually allocate. First the global part
@@ -618,7 +622,7 @@ def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
 	# our local-map cells later
 	buf = np.zeros((ncomp,tinfo.nty,tshape[0],tinfo.ntx,tshape[1]),map.dtype)
 	b2d = buf.reshape(ncomp,tinfo.nty*tshape[0],tinfo.ntx*tshape[1])
-	b2d[:,tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
+	b2d[:len(map),tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
 	# Reshape and then move it to the device
 	buf = np.moveaxis(buf, (0,1,2,3,4), (2,0,3,1,4))
 	buf = buf.reshape(ncell,ncomp,tshape[0],tshape[1])

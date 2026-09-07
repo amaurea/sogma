@@ -50,7 +50,38 @@ from .socommon import cmeta_lookup
 # Code-wise, it would be nicer if demodulation was done after the loading,
 # since it would work the same for all the loaders (probably). But for load_multi,
 # it saves a lot of memory to do it per-subobs, so I'll do it as part of the
-# loading. We won't always want to do demodulation, so 
+# loading. We won't always want to do demodulation, so
+
+# --------
+
+# New design:
+# Each loader goes up to the calibrate stage. Then a unified loading function
+# takes care of demod, downsample, autocuts, autocal and load_multi.
+
+# Should this unified loader function itself be a Loder class, which would take
+# nother loader as input? Would be nice in theory, but in that case its query()
+# should work at the multi-level, so the obsinfo it returns would have group-ids
+# instead of subids. That would mean that we wouldn't need to drag around the
+# joint object all the time, which would clean things up a lot, but it would
+# make it harder to access the underlying subids for the calling code. Solve
+# with a lookup method.
+
+# How should the loader-selection work in this case? Currently I have sogma.loading.Loader(),
+# which selects the appropriate sub-loader based on a config string.
+#
+# 1. The new loader is just one of the loaders. loading.Loader() selects it with a string like
+#    new+sofast. Pro: General. Con: Will always want the new+ part in practice.
+# 2. loading.Loader() *is* the new loader. It would take either a loader object or a dbfile.
+#    Con: Don't like that it forces the whole loading system through the new loader, but could
+#    solve by providing another one that just forwards.
+# 3. Replace loading.Loader() (which is actually a function) with a clearer loading.get_loader()
+#    function. The new loader would be one of the Loaders it uses, but would be used by default.
+#    get_loader's type argument could be a comma-separated list of loaders to nest, and if no
+#    comma is present, the new loader is added to it. To get just a single plain loader, one
+#    would have an empty comma, like how tuples work in python. Alternatively, could have
+#    the user refer to "plain" to get just that one. In that case it might be cleaner to make
+#    the string colon-separated, so it would be post:socommon vs. plain:socommon.
+# Let's go with #3
 
 class SoFastLoader:
 	def __init__(self, context_or_config_or_name, dev=None, mul=32):

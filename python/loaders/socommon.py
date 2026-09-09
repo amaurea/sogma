@@ -474,7 +474,9 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 		utils.dict_lookup(flavor_noptc_per_band, info["tube_flavor"]),
 		utils.dict_lookup(flavor_ndark_per_band, info["tube_flavor"]),
 	)
-	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("fhwp","d"),("r","d"),("sweep","d",(6,2))]
+	# Build a band-string, which is band:det_type, except for normal OPTC
+	# detectors where it's just band
+	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("fhwp","d"),("r","d"),("sweep","d",(6,2)),("band","U100")]
 	obsinfo = np.zeros(len(info), dtype).view(np.recarray)
 	obsinfo.id    = info["subobs_id"]
 	obsinfo.ndet  = ndet
@@ -492,6 +494,8 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 	wafer_centers, obsinfo.r = wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
 	if sweeps:
 		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
+	info.band = np.where(info["det_type"] == "OPTC", info["band"], info["band"] + ":" + info["det_type"])
+
 	# Evaluate pycode
 	good = eval_pycode(pycode, obsinfo)
 	# Apply slices

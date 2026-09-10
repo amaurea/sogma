@@ -173,11 +173,9 @@ class ProbeInfo:
 	relatively light-weight partial read in order to determine the actually readable number
 	of detectors, the number of samples and the absolute sample timing. May also include other
 	information as needed by the individual loaders"""
-	def __init__(self, ndet, nsamp, t0, srate, **kwargs):
-		self.ndet, self.nsamp, self.t0, self.srate = ndet, nsamp, t0, srate
+	def __init__(self, ndet, nsamp, t1, srate, **kwargs):
+		self.ndet, self.nsamp, self.t1, self.srate = ndet, nsamp, t1, srate
 		self.__dict__.update(kwargs)
-
-class Expected(Exception): pass
 
 catch_types = {
 	"all":      (Exception,),
@@ -261,17 +259,14 @@ class PostLoader(Loader):
 		if len(pinfos) == 0:
 			# FIXME: DataMissing should inherit from Expected
 			raise utils.DataMissing(format_multi_exception(exceptions, eids))
-		# Target samprange for our time-chunk (from time_split)
-		subrange  = linfo.sampranges[oind]
-		# Adjust per subobs (e.g. different wafers or optics tubes) in case they have different
-		# start offsets. The resulting samprangs (one per obs) will have the same length but
-		# may have different start offsets to align the samples. If no alignment is possible,
-		# e.g. due to different sample rates, then an exception is thrown.
-		subranges = sample_overlap(subrange, pinfos)
+		# Find the overlapping and aligned sample ranges for the given sampranges, if
+		# possible. FIXME handle exception here
+		subranges = pinfo_overlap(pinfos)
+		subranges = srange_chain(subranges, linfo.sampranges[oind])
 		# And finally return our result, which we will use in load
 		ndet  = sum([pinfo.ndet for pinfo in pinfos])*linfo.detfact
-		nsamp, t0, srate = calc_post_samps(pinfos, subranges)
-		return ProbeInfo(ndet, nsamp, t0, srate, oind=oind, sinds=sinds, subinfo=subinfo, subranges=subranges, pinfos=pinfos)
+		nsamp, t1, srate = calc_post_samps(pinfos, subranges)
+		return ProbeInfo(ndet, nsamp, t1, srate, oind=oind, sinds=sinds, subinfo=subinfo, subranges=subranges, pinfos=pinfos)
 	def load(self, linfo, id, dets=None, detids=None, samprange=None):
 		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
 		subranges = pinfo.subranges
@@ -379,9 +374,9 @@ class SoFastLoader(Loader):
 		# aman.samps.offset:aman.samps.offset+aman.samps.nsamp of this
 		row   = linfo.obsinfo[ind]
 		srate = (row.nsamp-1)/row.dur
-		t0    = row.ctime + meta.aman.samps.offset/srate
+		t1    = row.ctime + meta.aman.samps.offset/srate
 		nsamp = meta.aman.samps.count
-		return ProbeInfo(meta.aman.dets.count, nsamp, t0, srate, meta=meta)
+		return ProbeInfo(meta.aman.dets.count, nsamp, t1, srate, meta=meta)
 	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
 		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
 		# TODO: Exceptions
@@ -512,6 +507,25 @@ def time_split(obsinfo, demod=False, down=None, comps="TQU", maxsize=None, maxdu
 
 def nsplit2bsize(nsplit, nsamp, factors=[2,3,5,7], mul=32):
 	return fft.fft_len(utils.ceil(obsinfo.nsamp/nsplits/mul), factors=factors, direction="above")*mul
+
+def pinfo_overlap(pinfos, tol=0.1):
+	"""Return overlapping sample ranges for the given list of ProbeInfos"""
+	nsamps, t1s, srates = [np.array([pinfo[key] for pinfo in pinfos]) for key in ["nsamp", "t1", "srate"]]
+	t1  = np.max(t1s)
+	t2  = np.min(t1s+nsamps/srates)
+	if t2 <= t1: raise ValueError("no overlap")
+	nsamp = utils.nint((t2-t1)*srates[0])
+	# These are the sample ranges we're interested in, provided
+	# we pass some checks later
+	i1s   = utils.nint((t1-t1s)*srates)
+	i2s   = i1s+nsamp
+	# Check that we are properly aligned
+	misalign1 = np.abs((t1s+i1s/srates-t1)*srates)
+	misalign2 = np.abs((t1s+i2s/srates-t2)*srates)
+	if np.any(misalign1 > tol) or np.any(misalign2 > tol):
+		raise ValueError("incompatible timestamps")
+	sranges = np.concatenate([i1s[...,None],i2s[...,None]],-1)
+	return sranges
 
 def nice_len(n, factors=[2,3,5,7], mul=32):
 	return fft.fft_len(utils.floor(n/mul), factors=factors, direction="below")*mul

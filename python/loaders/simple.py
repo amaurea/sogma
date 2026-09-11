@@ -1,38 +1,45 @@
 import numpy as np, time
 from numpy.lib import recfunctions
 from pixell import utils, fft, bunch
+from . import socommon
 from .. import device
 
-# TODO:
-# * Check if query is compatible
-# * Add load_multi
-
-class SimpleLoader:
-	def __init__(self, infofile, dev=None, mul=32):
+class SimpleLoader(Loader):
+	def __init__(self, infofile, dev=None, dtype=np.float32, catch="expected", pool_map={}):
 		"""context is really just a list of tods and meta here"""
+		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype, catch_catch)
 		self.obsinfo = read_obsinfo(infofile)
-		self.dev     = dev or device.get_device()
-		self.lookup  = {id:i for i,id in enumerate(self.obsinfo.id)}
-		self.mul     = mul
+		self.omap    = {id:i for i,id in enumerate(self.obsinfo.id)}
 	def query(self, query=None, sweeps=False):
-		return self.obsinfo
-	def load(self, id, catch="expected"):
-		ind = self.lookup[id]
-		# Reads pre-calibrated files
-		with bench.mark("read"):
-			obs = read_tod(self.obsinfo[ind].path, mul=self.mul)
-		# Place obs.tod on device
-		with bench.mark("tod2dev"):
-			obs.tod = self.dev.pools["tod"].array(obs.tod)
-		# Add timing info
-		obs.timing = [("read",bench.t.read),("tod2dev",bench.t.tod2dev)]
+		# No actual querying supported for now
+		return SimpleLoadInfo(self, self.obsinfo, omap=self.omap)
+	def probe(self, linfo, id, dets=None, detids=None):
+		# No det-slicing yet, but easy to add
+		ind = linfo.omap[id]
+		row = linfo.obsinfo[ind]
+		return ProbeInfo(row.ndet, row.nsamp, row.ctime, (row.nsamp-1)/row.dur, ind=ind)
+	def load(self, linfo, id, dets=None, detids=None, samprange=None):
+		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
+		with bench.mark("SimpleLoader read"):
+			obs = read_tod(self.obsinfo[ind].path, mul=self.dev.lib.bsize)
+		with bench.mark("SimpleLoader tod2dev"):
+			obs.tod = self.pool("tod").array(obs.tod)
+		obs.subids = [srange_suffix(id, samprange)]
 		return obs
+	def prealloc(self, linfo):
+		def s(ndet, nsamp): return utils.ceil(np.max(ndet+(nsamp+2))) # fourier-safe size
+		# Max size of our output tod
+		obsinfo = linfo.obsinfo
+		nout = s(obsinfo.ndet, obsinfo.nsamp)
+		self.pool("tod").empty(nout, dtype=self.dtype)
+
+class SimpleLoadInfo(socommon.LoadInfo): pass
 
 # Helpers below
 
 def read_obsinfo(fname, nmax=None):
 	# FIXME: Currently missing baz, bel and waz. Not present in current text files
-	dtype = [("path","U256"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2))]
+	dtype = [("path","U256"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("r","d"),("sweep","d",(4,2)),("band","U100")]
 	info  = np.loadtxt(fname, dtype=dtype, max_rows=nmax, ndmin=1).view(np.recarray)
 	ids   = np.char.rpartition(np.char.rpartition(info.path,"/")[:,2],".")[:,0]
 	info  = recfunctions.rec_append_fields(info, "id", ids)

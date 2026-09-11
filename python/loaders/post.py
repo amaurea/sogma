@@ -1,3 +1,17 @@
+import numpy as np
+from pixell import utils, bunch, bench
+from .. import errors
+from . import socommon
+from .socommon import srange_chain, srange_expand
+
+# Pool remapping
+# --------------
+# Currently use pool_map, but this is cumbersome. Would be nice to have an object
+# that acts just like dev.pools, but
+# 1. It remaps names transparently
+# 2. We can still access the remapping, since we will need it
+#    for the avoid function
+
 # Exceptions
 # ----------
 #
@@ -130,53 +144,6 @@
 # Obsmap is a bad name. Obsinfo is better, but what should the table be called then?
 # obstab? That's ok I guess.
 
-class Loader:
-	def __init__(self, dev=None, pool_map={}, catch="expected", dtype=np.float32):
-		self.dev      = dev or device.get_device()
-		self.pool_map = pool_map
-		self.catch    = catch
-		self.etypes   = catch_types[catch]
-		self.dtype    = dtype
-	def query(self, query=None):
-		raise NotImplementedError
-	def probe(self, linfo, id, dets=None, detids=None)
-		raise NotImplementedError
-	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
-		raise NotImplementedError
-	def group_obs(self, obsinfo, mode="obs"):
-		raise NotImplementedError
-	def prealloc(self, linfo):
-		raise NotImplementedError
-	def avoid_pools(self, names):
-		for typname, bufname in self.pool_map:
-			if bufname in names:
-				self.pool_map[typname] = bufname + '*'
-	def pool(self, name): return self.dev.pools[self.pool_map[name]]
-
-class LoadInfo:
-	"""Class representing a set of observations to load, and metadata needed to load it.
-	Contains at least the .obsinfo member a numpy table of the observations and their properties,
-	and provides the load() meathod for reading in an observation"""
-	def __init__(self, loader, obsinfo, **kwargs):
-		self.loader  = loader
-		self.obsinfo = obsinfo
-		self.__dict__.update(kwargs)
-	def probe(self, id, dets=None, detids=None):
-		return self.loader.probe(self, id, dets=dets, detids=detids)
-	def load(self, id, dets=None, detids=None, samprange=None):
-		return self.loader.load(self, id, dets=dets, detids=detids, samprange=samprange)
-	def prealloc(self):
-		return self.loader.prealloc(self)
-
-class ProbeInfo:
-	"""Class representing the result of probing an observation, which means doing a
-	relatively light-weight partial read in order to determine the actually readable number
-	of detectors, the number of samples and the absolute sample timing. May also include other
-	information as needed by the individual loaders"""
-	def __init__(self, ndet, nsamp, t1, srate, **kwargs):
-		self.ndet, self.nsamp, self.t1, self.srate = ndet, nsamp, t1, srate
-		self.__dict__.update(kwargs)
-
 catch_types = {
 	"all":      (Exception,),
 	"expected": (Expected,),
@@ -187,18 +154,32 @@ config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes alw
 config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")
 config.default("down", 0.0, "Downsampling factor. Set to 0 to disable downsampling")
 
-class PostLoader(Loader):
-	def __init__(self, loader, group="obs", split=None, tsplit=None, order="band", dev=None, dtype=np.float32, catch="expected", pool_map={"tod":"tod", "ft":"ft", "dtod":"dtod", "ftod":"ftod"}):
-		super().__init__(dev=dev or loader.dev, pool_map=pool_map, dtype=dtype, catch=catch)
+class PostLoader(socommon.Loader):
+	"""Uses the memory pools tod, ft, wtod, dtod. The last 3 only if demod/down. Pass pool_map
+	to change which pools are used"""
+	def __init__(self, loader, group="obs", split=None, tsplit=None, order="band", dev=None,
+			dtype=None, catch="expected", pool_map=None):
+		super().__init__(dev=dev or loader.dev, pool_map=pool_map, dtype=dtype or loader.dtype, catch=catch)
 		# Tell the underlying loader which pools we reserve. This is not the same as
 		# which pools we use; it only covers the pools that need to be preserved while the sub-loader works
-		loader.avoid_pools([self.pool_map["tod"]])
+		self.conflicts  = ["tod"]
+		loader.avoid_pools(utils.vmap(self.pool_map, self.conflicts))
 		self.loader     = loader
 		# These define how our  higher-level ids will map to actual subids
 		self.group      = group
 		self.split      = split
 		self.tsplit     = tsplit
 		self.order      = order
+	def avoid_pools(self, names):
+		# Overridden to allow for chaining
+		forward = list(names)
+		for typname, bufname in self.pool_map:
+			if bufname in names:
+				newname = bufname + '*'
+				self.pool_map[typname] = newname
+				if typename in self.conflicts:
+					forward.append(newname)
+		self.loader.avoid(forward)
 	def query(self, query=None):
 		# Forward query to underlying loader, then transform.
 		# linfo:[obsinfo:[id,ndet,nsamp,ctime,dur,bas,waz,bel,wel,roll,fhwp,r,sweep], ...]
@@ -223,12 +204,12 @@ class PostLoader(Loader):
 		obsinfo.nsamp = utils.nint(obsinfo.nsamp/tinfo.downfact)
 		obsinfo.ndet *= obsinfo.detfact
 		# Build the final it→id map
-		omap = {id:oi for oi,id in enumerate(obsinfo.id)}
 		imap = [groups[ind] for ind in ind_map]
 		# sampranges refers to the raw subobs ranges we want. It has the same length as obsinfo,
 		# but refers to raw samples, not demodulated ones
-		return LoadInfo(self, obsinfo, sublinfo=linfo, imap=imap, omap=omap, sampranges=sampranges,
-			demod=demod, comps=comps, down=down, downfact=tinfo.downfact, detfact=tinfo.detfact)
+		return PostLoadInfo(self, obsinfo, sublinfo=linfo, imap=imap,
+			sampranges=sampranges, demod=demod, comps=comps, down=down,
+			downfact=tinfo.downfact, detfact=tinfo.detfact)
 	def probe(self, linfo, id, dets=None, detids=None):
 		"""The job of this function is to find how our subids' samples align, so we
 		can read in consistently aligned samples. It also estimates the resulting ndet and nsamp,
@@ -266,7 +247,7 @@ class PostLoader(Loader):
 		# And finally return our result, which we will use in load
 		ndet  = sum([pinfo.ndet for pinfo in pinfos])*linfo.detfact
 		nsamp, t1, srate = calc_post_samps(pinfos, subranges)
-		return ProbeInfo(ndet, nsamp, t1, srate, oind=oind, sinds=sinds, subinfo=subinfo, subranges=subranges, pinfos=pinfos)
+		return socommon.ProbeInfo(ndet, nsamp, t1, srate, oind=oind, sinds=sinds, subinfo=subinfo, subranges=subranges, pinfos=pinfos)
 	def load(self, linfo, id, dets=None, detids=None, samprange=None):
 		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
 		subranges = pinfo.subranges
@@ -286,11 +267,12 @@ class PostLoader(Loader):
 				if linfo.demod:
 					# Handles both demodulation and downsampling in one go
 					with bench.mark("PostLoader demodulate"):
-						subobs = socommon.demodulate(subobs, comps=linfo.comps, frel=1/linfo.down, dev=self.dev)
+						subobs = demodulate(subobs, comps=linfo.comps, frel=1/linfo.down, dev=self.dev,
+							pools=utils.kmap(self.pool_map, dev.pools))
 				elif linfo.down != 1:
 					# Handles plain downsampling
 					with bench.mark("PostLoader downsample"):
-						subobs = socommon.downsample(subobs, down=linfo.down, dev=self.dev)
+						subobs = downsample(subobs, down=linfo.down, dev=self.dev, pools=utils.kmap(self.pool_map, dev.pools))
 				subobs.subids = [subid]
 				subobs.errors = []
 			except catch_list as e:
@@ -305,7 +287,6 @@ class PostLoader(Loader):
 				obs.site      = subobs.site
 				obs.bore_ref  = subobs.bore_ref
 				obs.sampoff   = subobs.sampoff
-				# reminder: self.pool("tod") = self.dev.pools[self.pool_map["tod"]]
 				obs.tod       = self.pool("tod").zeros((ndet,len(subobs.ctime)), subobs.tod.dtype)
 			# Handle the simple append cases
 			for field, axis in append_fields:
@@ -346,109 +327,177 @@ class PostLoader(Loader):
 			self.pool("dtod").empty(nper, dtype=self.dtype)
 			self.pool("ft")  .empty(nper, dtype=self.dtype)
 
-# Will put these where they belong later
+class PostLoadInfo(socommon.LoadInfo):
+	"""Class representing a set of observations to load, and metadata needed to load it.
+	Contains at least the .obsinfo member a numpy table of the observations and their properties,
+	and provides the load() meathod for reading in an observation"""
+	def __init__(self, loader, obsinfo, sublinfo, imap, sampranges, demod, comps, down, downfact, detfact, omap=None):
+		super().__init__(loader, obsinfo, omap=omap)
+		loc = locals()
+		for key in ["sublinfo", "imap", "sampranges", "demod", "comps", "down", "downfact", "detfact"]:
+			setattr(self, key, getattr(loc, key))
+	def __getitem__(self, sel):
+		res = super().__getitem__(sel)
+		res.sampranges = self.sampranges[sel]
+		res.imap       = utils.listslice(self.imap, sel)
+		res.downfact   = self.downfact[sel]
+		return res
 
-class SoFastLoader(Loader):
-	def __init__(self, context_or_config_or_name, dev=None, dtype=np.float32, catch="expected", pool_map={"tod":"tod", "ft":"ft"}):
-		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype, catch_catch)
-		self.context   = socommon.get_expanded_context(context_or_config_or_name)
-		self.obsdb     = sqlite.open(self.context["obsdb"])
-		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
-		self.fast_meta = FastMeta(self.context)
-		# Precompute the set of valid tags. Sadly this requires a scan through the whole
-		# database, but it's not that slow so far
-		self.tags      = socommon.get_tags(self.obsdb.conn)
-	def query(self, query=None):
-		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
-		obsinfo = socommon.finish_query(res_db, pycode, slices)
-		omap    = {id:oi for oi,id in enumerate(obsinfo.id)}
-		return LoadInfo(self, obsinfo, omap=omap)
-	def probe(self, linfo, id, dets=None, detids=None):
-		# TODO: Think about exception classification and propagation here
-		with bench.mark("SoFastLoader load_meta"):
-			meta = self.fast_meta.read(id, dets=dets, detids=detids)
-			if meta.aman.dets.count == 0:
-				raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
-		# Find which time-range we cover. Natively sample 0:obsinfo.nsamp cover
-		# time obsinfo.ctime:obsinfo.ctime+obsinfo.dur, but we only use the range
-		# aman.samps.offset:aman.samps.offset+aman.samps.nsamp of this
-		row   = linfo.obsinfo[ind]
-		srate = (row.nsamp-1)/row.dur
-		t1    = row.ctime + meta.aman.samps.offset/srate
-		nsamp = meta.aman.samps.count
-		return ProbeInfo(meta.aman.dets.count, nsamp, t1, srate, meta=meta)
-	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
-		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
-		# TODO: Exceptions
-		meta = pinfo.meta
-		# Restrict to target sample range
-		if samprange is not None:
-			off = meta.aman.samps.offset
-			meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
-		# Load the raw data
-		with bench.mark("SoFastLoader fast_data"):
-			data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
-		# Calibrate the data
-		with bench.mark("SoFastLoader calibrate"):
-			obs = calibrate(data, meta, mul=self.dev.lib.bsize, dev=self.dev, dtype=self.dtype)
-		obs.errors = []
-		# Record what data we covered in the obs. Useful for logging
-		obs.subids = [srange_suffix(id, samprange)]
-		return obs
-	def prealloc(self, linfo):
-		def s(ndet, nsamp): return utils.ceil(np.max(ndet+(nsamp+2))) # fourier-safe size
-		# Max size of our output tod
-		obsinfo = linfo.obsinfo
-		nout = s(obsinfo.ndet, obsinfo.nsamp)
-		self.pool("tod").empty(nout, dtype=self.dtype)
-		self.pool("ft") .empty(nout, dtype=self.dtype)
+def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pools=None):
+	# Ok, if we get here, then we can demodulate
+	if dev   is None: dev = device.get_device()
+	if pools is None: pools = dev.pools
+	ncomp        = len(comps)
+	ndet, insamp = data.tod.shape
+	duration     = data.ctime[-1]-data.ctime[0]
+	srate        = (insamp-1)/duration
+	dtype        = data.tod.dtype
+	ctype        = utils.complex_dtype(dtype)
+	# Estimate hwp rotation speed. A bit inefficient, but we don't
+	# require it to be unwound. Should I guarantee that it's unwound
+	# after calibration? The disadvantage is that this reduces precision,
+	# since float32 has 7 digits of precision, and the integer part can
+	# take up 3-4 of those digits, leaving only 3-4 for the important
+	# fractional part. To avoid this, the hwp angle would need to be
+	# double precision.
+	diffs = dev.np.diff(data.hwp)
+	speed = dev.np.mean(diffs[dev.np.abs(diffs)<dev.np.pi])*srate
+	fhwp  = np.abs(speed/(2*np.pi))
+	# Find the last index where we complete a full revolution. We want
+	# a whole number of rotations to avoid fourier bleeding. The cost of truncating
+	# would be at most 0.5 s
+	intrunc = gutils.find_last_crossing(data.hwp, data.hwp[0])
+	# Find our output number of samples. This is ideally determined by
+	# ofmax, but we are also restricted by fourier and mapmaking
+	# considerations via mul
+	ofmax   = float(frel*fhwp)
+	ifmax   = srate/2
+	onsamp  = fft.fft_len(utils.nint(intrunc*ofmax/ifmax/mul), factors=dev.lib.fft_factors)*mul
+	# Prepare our resampling. For the tod we use fft-resampling. For the others, we use
+	# linear interpolation. Averaging would be better, but these are smooth functions so
+	# it should be good enough
+	linresamp = gutils.LinResamp(intrunc, onsamp)
+	# Prepare our output detectors. Our output data will have 2 or 3 times
+	# as many detectors as we started with, since demodulation lets us recover
+	# a T, Q and U-timestream from a single detector.
+	assert comps == "TQU" or comps == "QU"
+	detnames = []
+	detids   = []
+	modfuns  = []
+	if "T"  in comps:
+			detnames.append(np.char.add(data.dets,   "_0"))
+			detids  .append(np.char.add(data.detids, "_0"))
+			# 0.5 compensates for the multiplication by 2 later
+			modfuns .append(lambda x:dev.np.full_like(x, 0.5))
+	if "QU" in comps:
+			detnames.append(np.char.add(data.dets,   "_1"))
+			detnames.append(np.char.add(data.dets,   "_2"))
+			detids  .append(np.char.add(data.detids, "_1"))
+			detids  .append(np.char.add(data.detids, "_2"))
+			modfuns .append(dev.np.cos)
+			modfuns .append(dev.np.sin)
+	ndup    = len(modfuns)
+	odets   = np.concatenate(detnames)
+	odetids = np.concatenate(detids)
+	# Construct an output data with the given downsampling and detector duplication
+	odata = bunch.Bunch()
+	odata.dets   = odets
+	odata.detids = odetids
+	odata.ctime  = linresamp(data.ctime[:intrunc])
+	odata.hwp    = None # already handled
+	odata.point_offset = utils.repeat(data.point_offset, ndup, axis=0)
+	odata.bands     = utils.repeat(data.bands, ndup)
+	odata.polangle  = np.zeros(   len(odets) , dtype) # filled below
+	odata.response  = np.zeros((2,len(odets)), dtype) # filled below
+	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
+	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1,:intrunc])) # az
+	odata.boresight[0] = linresamp(data.boresight[0,:intrunc]) # el
+	odata.boresight[2] = linresamp(data.boresight[2,:intrunc]) # roll
+	# Resample cuts, and duplicate them across the virtual detectors
+	recuts      = data.cuts.to_sampcut()[:,:intrunc].to_simple().resample(onsamp).simplify()
+	odata.cuts  = socut.Simplecut.detcat([recuts]*len(modfuns))
+	odata.tod   = pools["dtod"].zeros((len(odets),onsamp), dtype) # filled below
+	# Ok, here comes the actual demodulation part
+	hwp = dev.np.array(data.hwp[:intrunc].astype(dtype))
+	for i, fun in enumerate(modfuns):
+		carrier = fun(4*hwp)
+		work    = pools["wtod"].array(data.tod[:,:intrunc])
+		# Modulate
+		work    *= carrier
+		gutils.deslope(work, dev=dev, inplace=True)
+		# Fourier-truncate. This step actually performs the filtering/downsampling
+		# Sadly the ft must be contiguous, so we need a work buffer. We use our
+		# tod work buffer for this, since its info has been transferred to fourier
+		# space by then
+		ftod    = pools["ft"].empty((ndet, intrunc//2+1), ctype)
+		dev.lib.rfft(work, ftod)
+		ftod    = pools["ft"].array(pools["wtod"].array(ftod[:,:onsamp//2+1]))
+		ftod   *= 2/intrunc
+		# can finally transform back
+		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
+	odata.cuts.gapfill(odata.tod, dev=dev)
+	gutils.deslope(odata.tod, dev=dev, inplace=True, w=100)
+	# T-detectors have response [1,0,0]
+	if comps == "TQU": odata.response[0,:ndet] = 1
+	elif comps != "QU": raise ValueError("Only comps='TQU' and comps='QU' supported")
+	# cos-detectors have response [0,+detQ,-detU]
+	# Equivalent to -ang
+	odata.polangle[-2*ndet:-ndet] = -data.polangle
+	# sin-detectors have response [0,+detU,+detQ]
+	# Equivalent to (-(2*ang-pi/4)+pi/4)/2 = pi/4-ang
+	odata.polangle[-ndet:] = np.pi/4-data.polangle
+	odata.response[1,-2*ndet:] = 1
+	# Everything else will be simply copied over
+	for key in data:
+		if key not in odata:
+			odata[key] = data[key]
+	return odata
 
-class SimpleLoader(Loader):
-	def __init__(self, infofile, dev=None, dtype=np.float32, catch="expected", pool_map={"tod":"tod"}):
-		"""context is really just a list of tods and meta here"""
-		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype, catch_catch)
-		self.obsinfo = read_obsinfo(infofile)
-		self.omap    = {id:i for i,id in enumerate(self.obsinfo.id)}
-	def query(self, query=None, sweeps=False):
-		# No actual querying supported for now
-		return LoadInfo(self, self.obsinfo, omap=self.omap)
-	def probe(self, linfo, id, dets=None, detids=None):
-		# No det-slicing yet, but easy to add
-		ind = linfo.omap[id]
-		row = linfo.obsinfo[ind]
-		return ProbeInfo(row.ndet, row.nsamp, row.ctime, (row.nsamp-1)/row.dur, ind=ind)
-	def load(self, linfo, id, dets=None, detids=None, samprange=None):
-		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
-		with bench.mark("SimpleLoader read"):
-			obs = read_tod(self.obsinfo[ind].path, mul=self.dev.lib.bsize)
-		with bench.mark("SimpleLoader tod2dev"):
-			obs.tod = self.pool("tod").array(obs.tod)
-		obs.subids = [srange_suffix(id, samprange)]
-		return obs
-	def prealloc(self, linfo):
-		def s(ndet, nsamp): return utils.ceil(np.max(ndet+(nsamp+2))) # fourier-safe size
-		# Max size of our output tod
-		obsinfo = linfo.obsinfo
-		nout = s(obsinfo.ndet, obsinfo.nsamp)
-		self.pool("tod").empty(nout, dtype=self.dtype)
-
-def srange_suffix(id, srange):
-	if srange is None: return id
-	else: return id + "," + "%d:%d" % list(srange)
-
-def srange_trunc(srange, dev):
-	srange = np.array(srange)
-	srange[...,1] = srange[...,0] + dev.goodlen(srange[...,1]-srange[...,0])
-	return srange
-
-def srange_expand(srange, factor=1):
-	return utils.nint(srange*factor)
-
-def srange_chain(srange1, srange2):
-	"""If srange2 is a sub-srange to srange1, what absolute sample range does it actually cover?"""
-	res = srange1[...,0,None] + srange2
-	res[...,1] = np.minimum(res[...,1], srange1[...,1])
-	return res
+def downsample(data, fsamp=None, down=None, mul=32, dev=None, pools=None):
+	"""Downsample data either by the given down-factor, or to the given sample rate fsamp.
+	Uses fourier-resampling for the tod, and linear resampling for the rest. The actual
+	sample rate will be adjusted slightly to still be fourier- and gpu-friendly."""
+	# Ok, if we get here, then we can demodulate
+	if dev   is None: dev = device.get_device()
+	if pools is None: pool = dev.pools
+	ndet, insamp = data.tod.shape
+	duration     = data.ctime[-1]-data.ctime[0]
+	srate        = (insamp-1)/duration
+	dtype        = data.tod.dtype
+	ctype        = utils.complex_dtype(dtype)
+	# Get our target sample rate
+	if fsamp is None: fsamp = srate/down
+	# Find our output number of samples. This is ideally determined by
+	# fsamp, but we are also restricted by fourier and mapmaking
+	# considerations via mul
+	onsamp  = fft.fft_len(utils.nint(insamp*fsamp/srate/mul), factors=dev.lib.fft_factors)*mul
+	# Prepare our resampling. For the tod we use fft-resampling. For the others, we use
+	# linear interpolation. Averaging would be better, but these are smooth functions so
+	# it should be good enough
+	linresamp = gutils.LinResamp(insamp, onsamp)
+	# Construct an output data with the given downsampling and detector duplication
+	odata = bunch.Bunch()
+	odata.ctime  = linresamp(data.ctime)
+	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
+	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1])) # az
+	odata.boresight[0] = linresamp(data.boresight[0]) # el
+	odata.boresight[2] = linresamp(data.boresight[2]) # roll
+	# Resample cuts, and duplicate them across the virtual detectors
+	odata.cuts  = data.cuts.to_sampcut().to_simple().resample(onsamp).simplify().to_simple()
+	# Resample the tod
+	work    = pools["wtod"].array(data.tod)
+	ftod    = pools["ft"].empty((ndet, data.tod.shape[-1]//2+1), ctype)
+	dev.lib.rfft(work, ftod)
+	ftod    = pools["ft"].array(pools["wtod"].array(ftod[:,:onsamp//2+1]))
+	ftod   *= 2/insamp
+	# can finally transform back
+	odata.tod = pools["dtod"].zeros((ndet,onsamp), dtype)
+	dev.lib.irfft(ftod, odata.tod)
+	# Everything else will be simply copied over
+	for key in data:
+		if key not in odata:
+			odata[key] = data[key]
+	return odata
 
 def merge_obsinfo(obsinfo, groups, names):
 	"""Merge obsinfo into groups with the given names. Returns new obsinfo"""
@@ -526,9 +575,6 @@ def pinfo_overlap(pinfos, tol=0.1):
 		raise ValueError("incompatible timestamps")
 	sranges = np.concatenate([i1s[...,None],i2s[...,None]],-1)
 	return sranges
-
-def nice_len(n, factors=[2,3,5,7], mul=32):
-	return fft.fft_len(utils.floor(n/mul), factors=factors, direction="below")*mul
 
 def check_demod(demod="auto", has_hwp=False):
 	if demod not in ["auto", "yes", "no"]:

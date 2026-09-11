@@ -1,243 +1,65 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
 from pixell import utils, bunch, bench, sqlite, coordsys, config
 from .. import device, gutils, socut
-from . import socommon, minisotodlib
+from . import socommon, soquery, minisotodlib
 from .socommon import cmeta_lookup
 
-# We have a "sweeps" member of obsinfo, which encapsulates the
-# area hit by each observation on the sky, in equatorial coordinates.
-# This was motivated by wanting to select e.g. observations that hit some
-# spot on the sky, which is useful. However, the ObsDb does not contain
-# this information, and it's a bit expensive to get at it, especially the
-# wafer center and wafer radius. I also haven't implemented the actual
-# point-in-polygon lookup yet (though it's in ACT). Until ObsDb makes this
-# simpler, sweeps will just assume 0.35 degree radus wafers centered at 0,0.
-# This is not good enough for obs-hits-point calculation, but it's good enough
-# for task distribution, which is the only thing it's currenlty used for
-
-# Reading multiple wafers at the same time
-# ----------------------------------------
-# A) Call fast_meta.read for each, then merge them,
-#    followed by a single fast_data call, and a single calibrate.
-#    A problem with this is that calibrate assumes a common iir_params
-#    for all detectors. Also fast_data assumes that it will get all
-#    all detectors in one go. So this approach would requrie quite a few
-#    changes.
-# B) Call fast_meta.read for each, determining a common sample range.
-#    Restrict each aman to that sample range.
-#    Then loop over them, calling fast_data and calibrate on each.
-#    Finally, merge them into one result.
-#    This approach requres no changes to any of the read functions.
-#    It should also use a bit less memory (fft arrays are smaller).
-#    One problem is that each calibrate thinks it has ownership of
-#    the "tod" buffer, so they would clobber each other. Can fix
-#    this by allocating an output array first, and then copying over
-#    subobs by subobs, instead of doing it all at the end. This
-#    output buffer would ideally also be "tod" though, since it's
-#    assumed that this is the buffer tod lives in later.
-#    Implement a mempool.swap() operation to make this cheap?
-#    Or add an option to calibrate to make it not use a predefined buffer
-#    for the tod? This may be good in any case, as we don't need
-#    the read-in buffer later.
-
-# Fourier-truncation can lose a significant amount of samples, it seems
-# Probably best to switch to fourier-padding instead. Will be some work though,
-# since one needs to keep track of the logical length separately from the full
-# length. Update: I tested this, but the speed loss was significant and not
-# worth it. But in the process, I discovered that I had a typo in the fourier
-# prime list, and after fixing that the amount of truncation went down a lot.
-
-# Code-wise, it would be nicer if demodulation was done after the loading,
-# since it would work the same for all the loaders (probably). But for load_multi,
-# it saves a lot of memory to do it per-subobs, so I'll do it as part of the
-# loading. We won't always want to do demodulation, so
-
-# --------
-
-# New design:
-# Each loader goes up to the calibrate stage. Then a unified loading function
-# takes care of demod, downsample, autocuts, autocal and load_multi.
-
-# Should this unified loader function itself be a Loder class, which would take
-# nother loader as input? Would be nice in theory, but in that case its query()
-# should work at the multi-level, so the obsinfo it returns would have group-ids
-# instead of subids. That would mean that we wouldn't need to drag around the
-# joint object all the time, which would clean things up a lot, but it would
-# make it harder to access the underlying subids for the calling code. Solve
-# with a lookup method.
-
-# How should the loader-selection work in this case? Currently I have sogma.loading.Loader(),
-# which selects the appropriate sub-loader based on a config string.
-#
-# 1. The new loader is just one of the loaders. loading.Loader() selects it with a string like
-#    new+sofast. Pro: General. Con: Will always want the new+ part in practice.
-# 2. loading.Loader() *is* the new loader. It would take either a loader object or a dbfile.
-#    Con: Don't like that it forces the whole loading system through the new loader, but could
-#    solve by providing another one that just forwards.
-# 3. Replace loading.Loader() (which is actually a function) with a clearer loading.get_loader()
-#    function. The new loader would be one of the Loaders it uses, but would be used by default.
-#    get_loader's type argument could be a comma-separated list of loaders to nest, and if no
-#    comma is present, the new loader is added to it. To get just a single plain loader, one
-#    would have an empty comma, like how tuples work in python. Alternatively, could have
-#    the user refer to "plain" to get just that one. In that case it might be cleaner to make
-#    the string colon-separated, so it would be post:socommon vs. plain:socommon.
-# Let's go with #3
-
-class SoFastLoader:
-	def __init__(self, context_or_config_or_name, dev=None, mul=32):
+class SoFastLoader(Loader):
+	"""Uses memory pools tod and ft"""
+	def __init__(self, context_or_config_or_name, dev=None, dtype=np.float32, catch="expected", pool_map={}):
+		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype, catch_catch)
 		self.context   = socommon.get_expanded_context(context_or_config_or_name)
 		self.obsdb     = sqlite.open(self.context["obsdb"])
 		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
+		self.fast_meta = FastMeta(self.context)
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
-		self.tags   = socommon.get_tags(self.obsdb.conn)
-		self.fast_meta = FastMeta(self.context)
-		self.mul     = mul
-		self.dev     = dev or device.get_device()
-		self.catch_list = (Exception,)
-		#self.catch_list = ()
-	def query(self, query=None, sweeps=True, output="sogma"):
-		res_db, pycode, slices = socommon.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
-		return socommon.finish_query(res_db, pycode, slices, sweeps=sweeps, output=output)
-	def load(self, subid, catch="expected", dets=None, detids=None, post=None, dtype=np.float32):
-		catch_list = catch2list(catch)
-		try:
-			with bench.mark("load_meta"):
-				meta = self.fast_meta.read(subid, dets=dets, detids=detids)
-				if meta.aman.dets.count == 0:
-					raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
-			# Load the raw data
-			with bench.mark("load_data"):
-				data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
-			# Calibrate the data
-			with bench.mark("load_calib"):
-				obs = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
-			if post is not None and post.demod:
-				with bench.mark("load_demod"):
-					obs = socommon.demodulate(obs, comps=post.comps, dev=self.dev)
-			if post is not None and post.down:
-				with bench.mark("load_down"):
-					obs = socommon.downsample(obs, down=post.down, dev=self.dev)
-		except catch_list as e:
-			# FIXME: Make this less broad
-			raise utils.DataMissing(type(e).__name__ + " " + str(e))
-		# Add timing info
-		obs.timing = [("meta",bench.t.load_meta),("data",bench.t.load_data),("calib",bench.t.load_calib)]
-		# Record which obs it is. A bit useless for load, but very useful for load_multi
-		obs.subids = [subid]
-		# Record any non-fatal errors
-		obs.errors = []
-		return obs
-	def load_multi(self, subids, order="band", samprange=None, catch="expected", dets=None, detids=None, post=None, dtype=np.float32):
-		"""Load multiple concurrent subids into a single obs"""
-		# FIXME: This is inefficient:
-		# * bands and dark detectors for the same wafer are stored in the same files,
-		#   which are read redundantly
-		# * The first g3 file must always be read, even when we just want a higher samprange
-		# Should group the subids by the ones that live in the same files, and issue a single
-		# fast_data and calibrate for each group. This will require a reorder afterwards, to
-		# get the bands in contiguous order. Reorder will require data copying. Easiest and
-		# most flexible to just copy from one buffer to another. So instead of doing
-		# write to ptbuf (single obs) → append to todbuf, like we do now, we would do
-		# write to todbuf (obs-group) → append to sections in ptbuf → compact into todbuf.
-		# -
-		# With multi-band mapping we will need the bands to be contiguous in memory.
-		# The other argument supports this
-		if   order == "raw":  pass
-		elif order == "band":
-			def srtfun(subid):
-				toks = split_subid(subid)
-				return toks.band + ":" + toks.type
-			subids = sorted(subids, key=srtfun)
-		else: raise ValueError("Unrecognized subid ordering '%s'" % str(order))
-		catch_list = catch2list(catch)
-		# Read all the metadata
-		metas,     mids = [], []
-		exceptions,eids = [], []
-		for si, subid in enumerate(subids):
-			try:
-				with bench.mark("load_meta"):
-					meta = self.fast_meta.read(subid, dets=dets, detids=detids)
-					if meta.aman.dets.count == 0: raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
-					metas.append(meta)
-				mids .append(subid)
-			except catch_list as e:
-				exceptions.append(e)
-				eids      .append(subid)
-		if len(metas) == 0:
-			raise utils.DataMissing(format_multi_exception(exceptions, eids))
-		# Restrict them to a common sample range
-		sinfo    = get_obs_sampinfo(self.obsdb.conn, mids)
-		ndet_raw = make_metas_compatible(metas, sinfo)[0]
-		ndet     = socommon.get_full_ndet(ndet_raw, post=post)
+		self.tags      = socommon.get_tags(self.obsdb.conn)
+	def query(self, query=None):
+		res_db, pycode, slices = soquery.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
+		obsinfo = soquery.finish_query(res_db, pycode, slices)
+		return SoFastLoadInfo(self, obsinfo)
+	def probe(self, linfo, id, dets=None, detids=None):
+		# TODO: Think about exception classification and propagation here
+		with bench.mark("SoFastLoader load_meta"):
+			meta = self.fast_meta.read(id, dets=dets, detids=detids)
+			if meta.aman.dets.count == 0:
+				raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
+		# Find which time-range we cover. Natively sample 0:obsinfo.nsamp cover
+		# time obsinfo.ctime:obsinfo.ctime+obsinfo.dur, but we only use the range
+		# aman.samps.offset:aman.samps.offset+aman.samps.nsamp of this
+		row   = linfo.obsinfo[ind]
+		srate = (row.nsamp-1)/row.dur
+		t1    = row.ctime + meta.aman.samps.offset/srate
+		nsamp = meta.aman.samps.count
+		return socommon.ProbeInfo(meta.aman.dets.count, nsamp, t1, srate, meta=meta)
+	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
+		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
+		# TODO: Exceptions
+		meta = pinfo.meta
 		# Restrict to target sample range
 		if samprange is not None:
-			for meta in metas:
-				off = meta.aman.samps.offset
-				meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
-		# Set up total obs
-		otot = bunch.Bunch(ctime=None, boresight=None, hwp=None, tod=None, subids=[], errors=[], cuts=[], fill=[])
-		append_fields = [("dets",0),("detids",0),("detpix",0),("bands",0),("point_offset",0),
-			("polangle",0),("response",1)]
-		for field, axis in append_fields: otot[field] = []
-		dcum = 0
-		for si, (subid, meta) in enumerate(zip(mids, metas)):
-			try:
-				# read in and calibrate each
-				with bench.mark("load_data"):
-					data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
-				# This uses buffers "tod" and "ft"
-				with bench.mark("load_calib"):
-					obs  = calibrate(data, meta, mul=self.mul, dev=self.dev, dtype=dtype)
-				if post is not None and post.demod:
-					with bench.mark("load_demod"):
-						obs = socommon.demodulate(obs, comps=post.comps, dev=self.dev)
-				if post is not None and post.down:
-					with bench.mark("load_down"):
-						obs = socommon.downsample(obs, down=post.down, dev=self.dev)
-				obs.subids = [subid]
-				obs.errors = []
-			except catch_list as e:
-				exceptions.append(e)
-				eids      .append(subid)
-				continue
-			# Initial otot setup
-			if otot.tod is None:
-				otot.ctime     = obs.ctime
-				otot.boresight = obs.boresight
-				otot.hwp       = obs.hwp
-				otot.site      = obs.site
-				otot.bore_ref  = obs.bore_ref
-				otot.sampoff   = obs.sampoff
-				# This is where we finally put things in the "tod" pool. Until now, we've
-				# used the input buffer "itod"
-				otot.tod       = self.dev.pools["tod"].zeros((ndet,len(obs.ctime)), obs.tod.dtype)
-			# Handle the simple append cases
-			for field, axis in append_fields:
-				otot[field].append(obs[field])
-			otot.cuts.append(obs.cuts)
-			otot.fill.append(obs.fill)
-			otot.subids += obs.subids
-			otot.errors += obs.errors
-			# Copy tod over to the right part of the output buffer
-			otot.tod[dcum:dcum+len(obs.tod)] = obs.tod
-			dcum += len(obs.tod)
-		# Were we left with anything at all?
-		if dcum == 0:
-			raise utils.DataMissing(format_multi_exception(exceptions, eids))
-		# Concatenate the work-lists into the final arrays
-		for field, axis in append_fields:
-			otot[field] = np.concatenate(otot[field],axis) if otot[field][0] is not None else None
-		otot.cuts = socut.Simplecut.detcat(otot.cuts)
-		otot.fill = socut.Simplecut.detcat(otot.fill)
-		# Trim tod in case we lost some detectors
-		otot.tod = otot.tod[:dcum]
-		# Non-fatal errors
-		if len(exceptions) > 0:
-			otot.errors.append(utils.DataMissing(format_multi_exception(exceptions, eids)))
-		return otot
-	def group_obs(self, obsinfo, mode="obs"):
-		return socommon.group_obs(obsinfo, mode=mode)
+			off = meta.aman.samps.offset
+			meta.aman.restrict("samps", slice(samprange[0]+off,samprange[1]+off), in_place=True)
+		# Load the raw data
+		with bench.mark("SoFastLoader fast_data"):
+			data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
+		# Calibrate the data
+		with bench.mark("SoFastLoader calibrate"):
+			obs = calibrate(data, meta, mul=self.dev.lib.bsize, dev=self.dev, dtype=self.dtype)
+		obs.errors = []
+		# Record what data we covered in the obs. Useful for logging
+		obs.subids = [socommon.srange_suffix(id, samprange)]
+		return obs
+	def prealloc(self, linfo):
+		def s(ndet, nsamp): return utils.ceil(np.max(ndet+(nsamp+2))) # fourier-safe size
+		# Max size of our output tod
+		obsinfo = linfo.obsinfo
+		nout = s(obsinfo.ndet, obsinfo.nsamp)
+		self.pool("tod").empty(nout, dtype=self.dtype)
+		self.pool("ft") .empty(nout, dtype=self.dtype)
+
+class SoFastLoadInfo(socommon.LoadInfo): pass
 
 config.default("cuts_optional", False, "If true, it's not an error for the expected cuts to be missing from the preprocess database")
 class FastMeta:
@@ -461,9 +283,10 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 debug_det = None # "Mv21_f090_Ar00c02A"
 
 # This config moved to loading.py because sofast is only imported conditionally
-def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
+def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, pools=None):
 	from pixell import fft
-	if dev is None: dev = device.get_device()
+	if dev   is None: dev   = device.get_device()
+	if pools is None: pools = dev.pools
 	# Merge the cuts and jumps separately. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
 		cut_names  = [key for key in meta.aman.keys() if key.startswith("cuts_")]
@@ -510,9 +333,9 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
-		signal_ = dev.pools["ft"].array(signal)
+		signal_ = pools["ft"].array(signal)
 	with bench.mark("signal → dtype", tfun=dev.time):
-		signal  = dev.pools["itod"].empty(signal.shape, dtype)
+		signal  = pools["tod"].empty(signal.shape, dtype)
 		signal[:] = signal_
 
 	if debug_det:
@@ -551,13 +374,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 	if debug_det: bunch.write("test_deglitch.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
 	with bench.mark("deslope", tfun=dev.time):
-		with dev.pools["ft"].as_allocator():
+		with pools["ft"].as_allocator():
 			gutils.deslope(signal, w=w, dev=dev, inplace=True)
 
 	if debug_det: bunch.write("test_deslope1.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
 	with bench.mark("fft", tfun=dev.time):
-		ftod = dev.pools["ft"].zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
+		ftod = pools["ft"].zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
 		dev.lib.rfft(signal, ftod)
 		norm = 1/signal.shape[1]
 
@@ -575,7 +398,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 		# I can't find an efficient way to do this. BLAS can't
 		# do it since it's a triple multiplication. Hopefully the
 		# gpu won't have trouble with it
-		with dev.pools["itod"].as_allocator(): # tod buffer not in use atm
+		with pools["tod"].as_allocator(): # tod buffer not in use atm
 			#ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
 			# Writing it this way saves some memroy
 			tfact = dev.np.full(ftod.shape, 2j*np.pi, ftod.dtype)
@@ -607,8 +430,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32):
 		nfinal  = dev.np.sum(good)
 		# Prune signal and make it contiguous
 		# Annoying to have to copy twice to get it back into the right buffer
-		signal  = dev.pools["ft"].array(signal[good])
-		signal  = dev.pools["itod"].array(signal)
+		signal  = pools["ft"].array(signal[good])
+		signal  = pools["tod"].array(signal)
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))
@@ -1035,25 +858,6 @@ class AcalCache:
 #		for i in range(bin[0],bin[1]):
 #			bind[i] = bi
 
-def get_ref_subids(subids):
-	"""Return one subid for each :ws:band combination"""
-	subs  = np.char.partition(subids, ":")[:,2]
-	uvals, order, edges = utils.find_equal_groups_fast(subs)
-	uvals = subids[order[edges[:-1]]]
-	return uvals, order, edges
-
-def get_focal_plane(fast_meta, subid):
-	fp_info     = fast_meta.fp_cache.get_by_subid(subid, fast_meta.det_cache)
-	focal_plane = np.array([fp_info["xi"], fp_info["eta"], fp_info["gamma"]]).T # [:,{xi,eta,gamma}]
-	good        = np.all(np.isfinite(focal_plane),1)
-	focal_plane = focal_plane[good]
-	return focal_plane
-
-def get_fplane_extent(focal_plane):
-	mid = np.mean(focal_plane,0)[:2]
-	rad = np.max(utils.angdist(focal_plane[:,:2],mid[:,None]))
-	return mid, rad
-
 def read_cuts(pl, path, optional=False):
 	catch = KeyError if optional else ()
 	try:
@@ -1177,21 +981,6 @@ class WiringCache:
 				status = {field:status[field] for field in self.fields}
 			self.cache[fname] = status
 		return self.cache[fname]
-
-def find_finfo_groups(metas):
-	# convert finfos to strings, so we can easily find grups. A bit inelegant, but
-	# no that inefficient. We assume that the finfo lists are already sorted
-	# consistently
-	finfo_strs = np.array(["%s,%d,%d" % (str(meta.finfos),meta.aman.samps.count,meta.aman.samps.offset) for meta in metas])
-	uvals, order, edges = utils.find_equal_groups_fast(finfo_strs)
-	ginfos = []
-	for gi in range(len(uvals)):
-		group  = order[edges[gi]:edges[gi+1]]
-		finfos = metas[group[0]].finfos
-		samps  = metas[group[0]].aman.samps
-		dets   = minisotodlib.LabelAxis("dets",np.concatenate([metas[i].aman.dets.vals for i in group]))
-		ginfos.append(bunch.Bunch(finfos=finfos, dets=dets, samps=samps, inds=group))
-	return ginfos
 
 def subtract_hwpss(signal, hwp_angle, coeffs, dev=None):
 	if signal.dtype != np.float32: raise ValueError("Only float32 supported")
@@ -1378,39 +1167,6 @@ def fix_overpole(az, el, roll, inline=False):
 	roll += np.pi
 	return az, el, roll
 
-# The idea of this was to effectively gapfill using the
-# common mode. Maybe it could work, but in my test, it
-# didn't really fix the gapfilling artifacts in the map
-# (maybe a small improvement), while it significantly
-# increased both small-scale and large-scale noise in the
-# map, surprisingly.
-def deglitch_commonsep(signal, cuts, w=10, dev=None):
-	# Split signal into common mode and rest
-	ccuts   = merge_det_cuts(cuts)
-	cmode   = robust_common_mode(signal)
-	signal -= cmode
-	# Deglitch common mode subtracted tod
-	cuts.gapfill(signal, w=w, dev=dev)
-	# Deglitch common mode
-	ccuts.gapfill(cmode[None], w=w, dev=dev)
-	# Add back common mode
-	signal += cmode
-
-def robust_common_mode(signal, bsize=8, dev=None):
-	if dev is None: dev = device.get_device()
-	signal = signal[:signal.shape[0]//bsize//bsize*bsize*bsize].reshape(-1,bsize,bsize,signal.shape[-1])
-	return dev.np.median(dev.np.median(dev.np.mean(signal,-2),-2),-2)
-
-def merge_det_cuts(cuts):
-	# 1. Turn cuts into a list of single-det cuts
-	dcuts = []
-	for b in cuts.bins:
-		if b[1] == b[0]: continue
-		dcuts.append(socut.Sampcut((b-b[0])[None], cuts.ranges[b[0]:b[1]], nsamp=cuts.nsamp))
-	# 2. Merge them into a single cut
-	ocuts = socut.Sampcut.merge(dcuts)
-	return ocuts
-
 def format_multi_exception(exceptions, subids):
 	msgs   = np.array([str(ex) for ex in exceptions])
 	uvals, order, inds = utils.find_equal_groups_fast(msgs)
@@ -1420,56 +1176,5 @@ def format_multi_exception(exceptions, subids):
 		omsgs.append(",".join(mysubs) + ": " + uval)
 	return ", ".join(omsgs)
 
-def make_metas_compatible(metas, sinfo, tol=0.1):
-	# sinfo gives us the start and end time of the raw tods,
-	# but we want the ones after any offsets or truncation
-	t1s_raw, t2s_raw, nsamps_raw = sinfo.T
-	dts    = (t2s_raw-t1s_raw)/(nsamps_raw-1)
-	offs   = np.array([meta.aman.samps.offset for meta in metas])
-	nsamps = np.array([meta.aman.samps.count  for meta in metas])
-	# t1s and t2s are absolute timestamps of start/end of current samples
-	t1s  = t1s_raw + dts*offs
-	t2s  = t1s_raw + dts*(offs+nsamps)
-	# Find the narrowest ctime range. This is what we want to restrict to
-	t1 = np.max(t1s)
-	t2 = np.min(t2s)
-	dur = t2-t1
-	if dur <= 0: raise ValueError("no sample overlap")
-	# i1s and i2s are the sample offsets of the target start/end from the absolute start.
-	# These are the offsets axismanager will want
-	i1s = (t1-t1s_raw)/dts
-	i2s = (t2-t1s_raw)/dts
-	# Duration in samples should be the same, to within the tolerance
-	# Sample phase should also be the same
-	idurs = i2s-i1s
-	isubs = utils.rewind(i1s-i1s[0], ref=0, period=1)
-	if np.max(np.abs(isubs)) > tol or np.max(np.abs(idurs-idurs[0])) > tol:
-		raise ValueError("incompatible timestamps")
-	# Restrict sample ranges
-	# i1 is offset relative to our absolute start
-	i1s = utils.nint(i1s)
-	i2s = utils.nint(i2s)
-	for mi, meta in enumerate(metas):
-		meta.aman.restrict("samps", slice(i1s[mi], i2s[mi]), in_place=True)
-	# Could check that detector names are unique here, but it's not really necessary
-	# Return the final sample and detector count
-	ndet  = sum([meta.aman.dets.count for meta in metas])
-	nsamp = metas[0].aman.samps.count
-	return ndet, nsamp
-
-def get_obs_sampinfo(obsdb, subids):
-	sinfo = np.zeros((len(subids),3))
-	for i, subid in enumerate(subids):
-		toks = split_subid(subid)
-		sinfo[i] = next(obsdb.execute("select start_time, stop_time, n_samples from obs where obs_id = ?", [toks.obsid]))
-	return sinfo
-
 def detname2band(detnames):
 	return np.char.partition(np.char.partition(detnames, "_")[:,2],"_")[:,0]
-
-def catch2list(catch):
-	if   isinstance(catch, (list,tuple)): return catch
-	elif catch == "all":      return (Exception,)
-	elif catch == "expected": return (Exception,) # TODO: Actual list here
-	elif catch == "none":     return ()
-	else: raise ValueError("Unrecognized catch '%s'" % str(catch))

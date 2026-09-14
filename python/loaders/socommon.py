@@ -26,10 +26,12 @@ class Loader:
 		raise NotImplementedError
 	def prealloc(self, linfo):
 		raise NotImplementedError
-	def avoid_pools(self, names):
-		for typname, bufname in self.pool_map:
-			if bufname in names:
-				self.pool_map[typname] = bufname + '*'
+	def avoid_pools(self, names, suf="*"):
+		# First register directly
+		for name in names:
+			self.pool_map[name] = name + suf
+		# Then resolve chains
+		self.pool_map = {name:recursive_lookup(self.pool_map,name) for name in self.pool_map}
 	def pool(self, name):
 		try: name = self.pool_map[name]
 		except KeyError: pass
@@ -39,9 +41,12 @@ class LoadInfo:
 	"""Class representing a set of observations to load, and metadata needed to load it.
 	Contains at least the .obsinfo member a numpy table of the observations and their properties,
 	and provides the load() meathod for reading in an observation"""
-	def __init__(self, loader, obsinfo, omap=None):
+	def __init__(self, loader, obsinfo, omap=None, dets=None, detids=None):
 		self.loader  = loader
 		self.obsinfo = obsinfo
+		# Detector restriction
+		self.dets    = dets
+		self.detids  = detids
 		if omap is None:
 			omap = {id:oi for oi,id in enumerate(obsinfo.id)}
 		self.omap    = omap
@@ -69,6 +74,11 @@ class ProbeInfo:
 	def __init__(self, ndet, nsamp, t1, srate, **kwargs):
 		self.ndet, self.nsamp, self.t1, self.srate = ndet, nsamp, t1, srate
 		self.__dict__.update(kwargs)
+
+def recursive_lookup(imap, name):
+	while name in imap:
+		name = imap[name]
+	return name
 
 def srange_suffix(id, srange):
 	if srange is None: return id
@@ -294,3 +304,8 @@ def measure_rms(tod, dt=1, bsize=32, nblock=10):
 	# to µK√s units
 	rms *= dt**0.5
 	return rms
+
+def det_intersect(dets1, dets2):
+	if dets1 is None: return dets2
+	if dets2 is None: return dets1
+	return np.unique(np.concatenate([dets1,dets2]))

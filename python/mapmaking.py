@@ -1522,7 +1522,9 @@ def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], max
 	try: dump = list(dump)
 	except TypeError: dump = [dump]
 	dev = mapmaker.dev
-	if prealloc: setup_buffers(dev, loadinfo.obsinfo[inds], dtype=mapmaker.dtype)
+	if prealloc:
+		loadinfo.prealloc()
+		setup_buffers(dev, loadinfo.obsinfo[inds], dtype=mapmaker.dtype)
 	tdumper = TDumper(mapmaker, prefix=prefix)
 	# Start map from scartch
 	mapmaker.reset()
@@ -1644,7 +1646,9 @@ def make_maps_perobs(mapmaker, loadinfo, comm, comm_per, inds=None, prefix=None,
 	obsinfo = loadinfo.obsinfo
 	if inds is None: list(range(comm.rank, loadinfo.nobs, commm.size))
 	if prefix is None: prefix = ""
-	if prealloc: setup_buffers(mapmaker.dev, obsinfo[inds], dtype=mapmaker.dtype)
+	if prealloc:
+		loadinfo.prealloc()
+		setup_buffers(mapmaker.dev, obsinfo[inds], dtype=mapmaker.dtype)
 	# Map indivdual tods
 	for ind in inds:
 		subpre  = prefix + obsinfo.id.replace(":","_") + "_"
@@ -1675,9 +1679,8 @@ def make_maps_depth1(mapmaker, loadinfo, comm, comm_per, prefix=None, dump=[], n
 	my_pinds = list(range(comm.rank, len(upids), comm.size))
 	# Group nr. pind = my_pinds[i] consists of obs inds=order[edges[pind]:edges[pind+1]]
 	if prealloc:
-		# All the obs-inds that I'm responsible for
-		my_inds = np.concatenate([inds[order[edges[pind]:edges[pind+1]]] for pind in my_pinds])
-		setup_buffers(mapmaker.dev, obsinfo[my_inds], dtype=mapmaker.dtype)
+		loadinfo.prealloc()
+		setup_buffers(mapmaker.dev, obsinfo, dtype=mapmaker.dtype)
 	# Now loop over and map each of our group-groups
 	for pind in my_pinds:
 		pid     = pids[pind]

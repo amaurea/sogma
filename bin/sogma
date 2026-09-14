@@ -69,18 +69,18 @@ bench.set_tfun(dev.time)
 dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
 # Register ephemerides
 soeph.setup()
+# Optional detector restriction
+dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
+detids = gutils.read_detnames(args.detids) if args.detids is not None else None
 # Set up our data loader
 split     = args.split*1e9 if args.split else None
 fast_fail = args.ignore != "none"
 loader    = loading.get_loader(args.context, type=args.loader, group=args.joint, split=split, tsplit=args.tsplit, fast_fail=fast_fail, dev=dev, dtype=dtype)
-linfo   = loader.query(args.query)
+linfo   = loader.query(args.query, dets=dets, detids=detids)
 linfo   = linfo[gutils.parse_slice(args.sel)]
 if linfo.nobs == 0:
 	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
 	sys.exit(1)
-# Optional detector restriction
-dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
-detids = gutils.read_detnames(args.detids) if args.detids is not None else None
 L.print("Mapping %d tods with %d mpi tasks" % (linfo.nobs, comm_all.size), level=0, id=0, color=colors.lgreen)
 prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
@@ -157,11 +157,11 @@ else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 # Set up the mapmaker
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype, verbose=True, noise_model=noise_model, dev=dev, outputs=ml_out)
 if   args.mode == "full":
-	mapmaking.make_map(mapmaker, linfo, comm_all, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
+	mapmaking.make_map(mapmaker, linfo, comm_all, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont)
 elif args.mode == "individual":
-	mapmaking.make_maps_perobs(mapmaker, linfo, comm_all, comm_per, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
+	mapmaking.make_maps_perobs(mapmaker, linfo, comm_all, comm_per, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont)
 elif args.mode == "depth1":
-	mapmaking.make_maps_depth1(mapmaker, linfo, comm_all, comm_per, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dets=dets, detids=detids)
+	mapmaking.make_maps_depth1(mapmaker, linfo, comm_all, comm_per, prefix=prefix, dump=dump, npass=args.npass, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont)
 elif args.mode == "fplane":
-	mapmaking.fplane_movie(shape, wcs, linfo, comm_all, dev=dev, prefix=prefix, ignore=args.ignore, dets=dets, detids=detids, autocrop=args.autocrop)
+	mapmaking.fplane_movie(shape, wcs, linfo, comm_all, dev=dev, prefix=prefix, ignore=args.ignore, autocrop=args.autocrop)
 else: raise ValueError("Unknown mode '%s'" % str(args.mode))

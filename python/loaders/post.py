@@ -37,10 +37,10 @@ class PostLoader(socommon.Loader):
 				if typename in self.conflicts:
 					forward.append(newname)
 		self.loader.avoid(forward)
-	def query(self, query=None):
+	def query(self, query=None, dets=None, detids=None):
 		# Forward query to underlying loader, then transform.
 		# linfo:[obsinfo:[id,ndet,nsamp,ctime,dur,bas,waz,bel,wel,roll,fhwp,r,sweep], ...]
-		linfo   = self.loader.query(query)
+		linfo   = self.loader.query(query, dets=dets, detids=detids)
 		# Settings for demodulation and downsampling
 		fhwp  = np.mean(np.abs(linfo.obsinfo.fhwp))
 		demod = check_demod(config.get("demod"), has_hwp=fhwp>0)
@@ -127,11 +127,11 @@ class PostLoader(socommon.Loader):
 					# Handles both demodulation and downsampling in one go
 					with bench.mark("PostLoader demodulate"):
 						subobs = demodulate(subobs, comps=linfo.comps, frel=1/linfo.down, dev=self.dev,
-							pools=utils.kmap(self.pool_map, dev.pools))
+							pool_map=self.pool_map)
 				elif linfo.down != 1:
 					# Handles plain downsampling
 					with bench.mark("PostLoader downsample"):
-						subobs = downsample(subobs, down=linfo.down, dev=self.dev, pools=utils.kmap(self.pool_map, dev.pools))
+						subobs = downsample(subobs, down=linfo.down, dev=self.dev, pool_map=self.pool_map)
 			except self.catch as e:
 				pinfo.exceptions.append(e)
 				pinfo.eids      .append(subid)
@@ -169,17 +169,15 @@ class PostLoader(socommon.Loader):
 		obs.errors = list(zip(pinfo.eids, pinfo.exceptions))
 		return obs
 	def prealloc(self, linfo):
+		linfo.sublinfo.prealloc()
 		def s(ndet, nsamp): return utils.ceil(np.max(ndet*(nsamp+2))) # fourier-safe size
 		# Max size of our output tod
 		obsinfo = linfo.obsinfo
 		nout = s(obsinfo.ndet, obsinfo.nsamp)
-		print("nout", nout/1e9)
 		# max size of full processed subobs. Differs from nout by having fewer dets
 		nper = s(obsinfo.ndet/linfo.detfact, obsinfo.nsamp)
-		print("nper", nper/1e9)
 		# max size of raw output from subloader
 		nsub = s(obsinfo.ndet/linfo.detfact, obsinfo.nsamp*linfo.downfact)
-		print("nsub", nsub/1e9)
 		self.pool("tod").empty(nout, dtype=self.dtype)
 		if linfo.demod or linfo.down:
 			self.pool("wtod").empty(nsub, dtype=self.dtype)
@@ -202,10 +200,10 @@ class PostLoadInfo(socommon.LoadInfo):
 		res.downfact   = self.downfact[sel]
 		return res
 
-def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pools=None):
+def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pool_map={}):
 	# Ok, if we get here, then we can demodulate
 	if dev   is None: dev = device.get_device()
-	if pools is None: pools = dev.pools
+	pool_ft, pool_dtod, pool_wtod = [dev.pools[name] for name in utils.vmap(pool_map, ["ft","dtod","wtod"])]
 	ncomp        = len(comps)
 	ndet, insamp = data.tod.shape
 	duration     = data.ctime[-1]-data.ctime[0]
@@ -275,12 +273,12 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pools=None):
 	# Resample cuts, and duplicate them across the virtual detectors
 	recuts      = data.cuts.to_sampcut()[:,:intrunc].to_simple().resample(onsamp).simplify()
 	odata.cuts  = socut.Simplecut.detcat([recuts]*len(modfuns))
-	odata.tod   = pools["dtod"].zeros((len(odets),onsamp), dtype) # filled below
+	odata.tod   = pool_dtod.zeros((len(odets),onsamp), dtype) # filled below
 	# Ok, here comes the actual demodulation part
 	hwp = dev.np.array(data.hwp[:intrunc].astype(dtype))
 	for i, fun in enumerate(modfuns):
 		carrier = fun(4*hwp)
-		work    = pools["wtod"].array(data.tod[:,:intrunc])
+		work    = pool_wtod.array(data.tod[:,:intrunc])
 		# Modulate
 		work    *= carrier
 		gutils.deslope(work, dev=dev, inplace=True)
@@ -288,9 +286,9 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pools=None):
 		# Sadly the ft must be contiguous, so we need a work buffer. We use our
 		# tod work buffer for this, since its info has been transferred to fourier
 		# space by then
-		ftod    = pools["ft"].empty((ndet, intrunc//2+1), ctype)
+		ftod    = pool_ft.empty((ndet, intrunc//2+1), ctype)
 		dev.lib.rfft(work, ftod)
-		ftod    = pools["ft"].array(pools["wtod"].array(ftod[:,:onsamp//2+1]))
+		ftod    = pool_ft.array(pool_wtod.array(ftod[:,:onsamp//2+1]))
 		ftod   *= 2/intrunc
 		# can finally transform back
 		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
@@ -312,13 +310,13 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pools=None):
 			odata[key] = data[key]
 	return odata
 
-def downsample(data, fsamp=None, down=None, mul=32, dev=None, pools=None):
+def downsample(data, fsamp=None, down=None, mul=32, dev=None, pool_map=None):
 	"""Downsample data either by the given down-factor, or to the given sample rate fsamp.
 	Uses fourier-resampling for the tod, and linear resampling for the rest. The actual
 	sample rate will be adjusted slightly to still be fourier- and gpu-friendly."""
 	# Ok, if we get here, then we can demodulate
 	if dev   is None: dev = device.get_device()
-	if pools is None: pool = dev.pools
+	pool_ft, pool_dtod, pool_wtod = [dev.pools[name] for name in utils.vmap(pool_map, ["ft","dtod","wtod"])]
 	ndet, insamp = data.tod.shape
 	duration     = data.ctime[-1]-data.ctime[0]
 	srate        = (insamp-1)/duration
@@ -344,13 +342,13 @@ def downsample(data, fsamp=None, down=None, mul=32, dev=None, pools=None):
 	# Resample cuts, and duplicate them across the virtual detectors
 	odata.cuts  = data.cuts.to_sampcut().to_simple().resample(onsamp).simplify().to_simple()
 	# Resample the tod
-	work    = pools["wtod"].array(data.tod)
-	ftod    = pools["ft"].empty((ndet, data.tod.shape[-1]//2+1), ctype)
+	work    = pool_wtod.array(data.tod)
+	ftod    = pool_ft.empty((ndet, data.tod.shape[-1]//2+1), ctype)
 	dev.lib.rfft(work, ftod)
-	ftod    = pools["ft"].array(pools["wtod"].array(ftod[:,:onsamp//2+1]))
+	ftod    = pool_ft.array(pool_wtod.array(ftod[:,:onsamp//2+1]))
 	ftod   *= 2/insamp
 	# can finally transform back
-	odata.tod = pools["dtod"].zeros((ndet,onsamp), dtype)
+	odata.tod = pool_dtod.zeros((ndet,onsamp), dtype)
 	dev.lib.irfft(ftod, odata.tod)
 	# Everything else will be simply copied over
 	for key in data:

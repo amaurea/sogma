@@ -15,12 +15,17 @@ class SoFastLoader(socommon.Loader):
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
 		self.tags      = soquery.get_tags(self.obsdb.conn)
-	def query(self, query=None):
+	def query(self, query=None, dets=None, detids=None):
 		res_db, pycode, slices = soquery.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		obsinfo = soquery.finish_query(res_db, pycode, slices)
-		return SoFastLoadInfo(self, obsinfo)
+		# If detectors are restricted, estimate how many we will end up with
+		if dets   is not None: obsinfo.ndet = np.minimum(obsinfo.ndet, len(dets))
+		if detids is not None: obsinfo.ndet = np.minimum(obsinfo.ndet, len(detids))
+		return SoFastLoadInfo(self, obsinfo, dets=dets, detids=detids)
 	def probe(self, linfo, id, dets=None, detids=None):
 		# TODO: Think about exception classification and propagation here
+		dets   = socommon.det_intersect(linfo.dets,   dets)
+		detids = socommon.det_intersect(linfo.detids, detids)
 		with bench.mark("SoFastLoader load_meta"):
 			meta = self.fast_meta.read(id, dets=dets, detids=detids)
 			if meta.aman.dets.count == 0:
@@ -47,13 +52,14 @@ class SoFastLoader(socommon.Loader):
 			data = fast_data(meta.finfos, meta.aman.dets, meta.aman.samps)
 		# Calibrate the data
 		with bench.mark("SoFastLoader calibrate"):
-			obs = calibrate(data, meta, mul=self.dev.lib.bsize, dev=self.dev, dtype=self.dtype)
+			obs = calibrate(data, meta, mul=self.dev.lib.bsize, dev=self.dev, dtype=self.dtype,
+				pool_map=self.pool_map)
 		obs.errors = []
 		# Record what data we covered in the obs. Useful for logging
 		obs.subids = [socommon.srange_suffix(id, samprange)]
 		return obs
 	def prealloc(self, linfo):
-		def s(ndet, nsamp): return utils.ceil(np.max(ndet+(nsamp+2))) # fourier-safe size
+		def s(ndet, nsamp): return utils.ceil(np.max(ndet*(nsamp+2))) # fourier-safe size
 		# Max size of our output tod
 		obsinfo = linfo.obsinfo
 		nout = s(obsinfo.ndet, obsinfo.nsamp)
@@ -279,10 +285,11 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 debug_det = None # "Mv21_f090_Ar00c02A"
 
 # This config moved to loading.py because sofast is only imported conditionally
-def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, pools=None):
+def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, pool_map={}):
 	from pixell import fft
 	if dev   is None: dev   = device.get_device()
-	if pools is None: pools = dev.pools
+	# Look up our pools
+	pool_tod, pool_ft = [dev.pools[name] for name in utils.vmap(pool_map, ["tod", "ft"])]
 	# Merge the cuts and jumps separately. Easier to deal with just a single cuts object
 	with bench.mark("merge_cuts"):
 		cut_names  = [key for key in meta.aman.keys() if key.startswith("cuts_")]
@@ -329,9 +336,9 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
-		signal_ = pools["ft"].array(signal)
+		signal_ = pool_ft.array(signal)
 	with bench.mark("signal → dtype", tfun=dev.time):
-		signal  = pools["tod"].empty(signal.shape, dtype)
+		signal  = pool_tod.empty(signal.shape, dtype)
 		signal[:] = signal_
 
 	if debug_det:
@@ -370,13 +377,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 	if debug_det: bunch.write("test_deglitch.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
 	with bench.mark("deslope", tfun=dev.time):
-		with pools["ft"].as_allocator():
+		with pool_ft.as_allocator():
 			gutils.deslope(signal, w=w, dev=dev, inplace=True)
 
 	if debug_det: bunch.write("test_deslope1.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
 	with bench.mark("fft", tfun=dev.time):
-		ftod = pools["ft"].zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
+		ftod = pool_ft.zeros((signal.shape[0],signal.shape[1]//2+1), utils.complex_dtype(signal.dtype))
 		dev.lib.rfft(signal, ftod)
 		norm = 1/signal.shape[1]
 
@@ -394,7 +401,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 		# I can't find an efficient way to do this. BLAS can't
 		# do it since it's a triple multiplication. Hopefully the
 		# gpu won't have trouble with it
-		with pools["tod"].as_allocator(): # tod buffer not in use atm
+		with pool_tod.as_allocator(): # tod buffer not in use atm
 			#ftod *= 1 + 2j*np.pi*dev.np.array(meta.aman.tau_eff[:,None])*freqs
 			# Writing it this way saves some memroy
 			tfact = dev.np.full(ftod.shape, 2j*np.pi, ftod.dtype)
@@ -426,8 +433,8 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 		nfinal  = dev.np.sum(good)
 		# Prune signal and make it contiguous
 		# Annoying to have to copy twice to get it back into the right buffer
-		signal  = pools["ft"].array(signal[good])
-		signal  = pools["tod"].array(signal)
+		signal  = pool_ft.array(signal[good])
+		signal  = pool_tod.array(signal)
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
 		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))

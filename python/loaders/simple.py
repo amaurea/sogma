@@ -10,10 +10,12 @@ class SimpleLoader(socommon.Loader):
 		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype)
 		self.obsinfo = read_obsinfo(infofile)
 		self.omap    = {id:i for i,id in enumerate(self.obsinfo.id)}
-	def query(self, query=None):
+	def query(self, query=None, dets=None, detids=None):
 		# No actual querying supported for now
-		return SimpleLoadInfo(self, self.obsinfo, omap=self.omap)
+		return SimpleLoadInfo(self, self.obsinfo, omap=self.omap, dets=None, detids=None)
 	def probe(self, linfo, id, dets=None, detids=None):
+		dets   = socommon.det_intersect(linfo.dets,   dets)
+		detids = socommon.det_intersect(linfo.detids, detids)
 		# No det-slicing yet, but easy to add
 		ind = linfo.omap[id]
 		row = linfo.obsinfo[ind]

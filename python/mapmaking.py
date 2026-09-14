@@ -1644,15 +1644,16 @@ def make_maps_perobs(mapmaker, loadinfo, comm, comm_per, inds=None, prefix=None,
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work."""
 	obsinfo = loadinfo.obsinfo
-	if inds is None: list(range(comm.rank, loadinfo.nobs, commm.size))
+	if inds is None: inds = list(range(comm.rank, loadinfo.nobs, comm.size))
 	if prefix is None: prefix = ""
 	if prealloc:
 		loadinfo.prealloc()
 		setup_buffers(mapmaker.dev, obsinfo[inds], dtype=mapmaker.dtype)
 	# Map indivdual tods
 	for ind in inds:
-		subpre  = prefix + obsinfo.id.replace(":","_") + "_"
-		L.print("Mapping %s" % obsinfo.id)
+		id = obsinfo.id[ind]
+		subpre  = prefix + id.replace(":","_") + "_"
+		L.print("Mapping %s" % id)
 		make_map(mapmaker, loadinfo, comm_per, prefix=subpre, dump=dump, inds=[ind], npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids, restart=restart)
 
 config.default("depth1_maxdur", 24, "Max duration in hours for depth-1 maps. Lower values use less memory to store maps. Longer than 24 hours would no longer be depth-1")
@@ -1709,7 +1710,7 @@ def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 	# Set up memory pools. Setting these up before-hand is
 	# actually more memory-efficient, as long as our estimate is
 	# good.
-	if prealloc and len(inds) > 0: setup_buffers(dev, obsinfo[inds], dtype=mapmaker.dtype)
+	if prealloc and len(inds) > 0: setup_buffers(dev, obsinfo[inds], dtype=loadinfo.loader.dtype)
 	# Process our observations
 	for i, ind in enumerate(inds):
 		id     = obsinfo.id[ind]
@@ -1759,7 +1760,6 @@ def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 		for bi, b1 in enumerate(np.arange(0, onsamp, bsize)):
 			t5 = dev.time()
 			b2 = min(b1+bsize, onsamp)
-			print(bi, b1, b2)
 			blockpre = subpre + "%03d_" % bi
 			# Build the video from the downsampled tod
 			with dev.pools["ft"].as_allocator():

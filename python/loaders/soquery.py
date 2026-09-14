@@ -496,7 +496,7 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 	wafer_centers, obsinfo.r = wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
 	if sweeps:
 		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
-	info.band = np.where(info["det_type"] == "OPTC", info["band"], info["band"] + ":" + info["det_type"])
+	obsinfo.band = np.where(info["det_type"] == "OPTC", info["band"], info["band"] + ":" + info["det_type"])
 
 	# Evaluate pycode
 	good = eval_pycode(pycode, obsinfo)

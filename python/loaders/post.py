@@ -380,7 +380,7 @@ def merge_obsinfo(obsinfo, groups, names):
 		# Ndet accumulates
 		oinfo.ndet[gi] = np.sum(obsinfo.ndet[group])
 		# Band concats
-		oinfo.band[gi] = "+".join(obsinfo.band[group])
+		oinfo.band[gi] = "+".join(np.unique(obsinfo.band[group]))
 	return oinfo
 
 def split_obsinfo(obsinfo, targ_nsamps, fmt=":split%d"):

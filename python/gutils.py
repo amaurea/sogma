@@ -10,6 +10,8 @@ class SignalOrderError(Exception): pass
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 
+def parse_slice(string): return eval("np.s_[%s]" % string)
+
 def blockify(tod, bsize=10):
 	nblock = tod.shape[-1]//bsize
 	return tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))
@@ -519,135 +521,6 @@ def logint(arr, x):
 	larr = ap.log(arr)
 	return ap.exp(larr[...,ix]*(1-rx) + larr[...,ix+1]*rx)
 
-def obs_group_info(obsinfo, groups, inds=None, sampranges=None):
-	"""Given an obsinfo (ala socommon.finish_query), group definitions
-	groups[ngroup][obsinds], and optionally a list of which groups to actually include,
-	returns information about number of detectors and samples per group,
-	per member etc, which would be useful for precallocating buffers."""
-	if inds is None: inds = np.arange(len(groups))
-	info = bunch.Bunch(ndet=[], nsub=[], nsamp=[], fhwp=[], fsamp=[])
-	for ind in inds:
-		group = groups[ind]
-		ginfo = obsinfo[group]
-		info.ndet .append(np.sum(ginfo.ndet))
-		info.nsub .append(np.max(ginfo.ndet))
-		info.nsamp.append(np.max(ginfo.nsamp))
-		# max and min here so that we don't overestimate
-		# the potential downsampling factor fsamp/fhwp
-		info.fhwp .append(np.max(ginfo.fhwp))
-		info.fsamp.append(np.min(ginfo.nsamp/ginfo.dur))
-	for key in info: info[key] = np.array(info[key])
-	info.dur = info.nsamp/info.fsamp
-	if sampranges is not None:
-		# Sampranges is [ngroup,{from,to}]
-		info.nsamp = np.minimum(info.nsamp, sampranges[inds,1])-sampranges[inds,0]
-	return info
-
-def obs_group_size(obsinfo, groups, inds=None, sampranges=None):
-	if inds is None: inds = np.arange(len(groups))
-	if sampranges is None:
-		return np.array([np.sum(obsinfo.ndet[groups[i]]*obsinfo.nsamp[groups[i]]) for i in inds])
-	else:
-		nsamps = sampranges[:,1]-sampranges[:,0]
-		return np.array([np.sum(obsinfo.ndet[groups[i]])*nsamps[i] for i in inds])
-
-def obs_group_dur(obsinfo, groups, inds=None, sampranges=None):
-	if inds is None: inds = np.arange(len(groups))
-	# duration from first member of group. This assumes that a group doesn't
-	# contain multiple time-ranges
-	durs = np.array([obsinfo.dur[groups[i][0]] for i in inds])
-	if sampranges is not None:
-		nsamps = sampranges[:,1]-sampranges[:,0]
-		tfracs = np.array([nsamps[i]/obsinfo.nsamp[groups[i][0]] for i in inds])
-		durs  *= tfracs
-	return durs
-
-def time_split(joint, ginfo, post=None, maxsize=None, maxdur=None):
-	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
-	into subranges so that the total ndet*nsamp size of each is no larger than
-	maxsize. This can be needed due to memory constraints."""
-	if post is not None and post.demod:
-		nsamps = utils.ceil(ginfo.nsamp*ginfo.fhwp/ginfo.fsamp)
-		ndets  = ginfo.ndet*len(post.comps)
-	else:
-		nsamps = ginfo.nsamp
-		ndets  = ginfo.ndet
-	if post is not None and post.down:
-		nsamps = utils.ceil(nsamps/post.down)
-	nsplits = np.ones(len(joint.groups), int)
-	if maxsize is not None:
-		# calculate the total size of each group
-		sizes = nsamps*ndets
-		# number of time splits for each
-		nsplits = np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
-	if maxdur is not None:
-		nsplits = np.maximum(nsplits, utils.floor(ginfo.dur/maxdur)+1)
-	# Do the split
-	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
-		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
-	for gi, (group, name, nsplit) in enumerate(zip(joint.groups, joint.names, nsplits)):
-		# Need the number of samples the group covers. Will assume good time alignment
-		if joint.sampranges is None:
-			i0    = 0
-			nsamp = ginfo.nsamp[gi]
-		else:
-			i0    = joint.sampranges[gi,0]
-			nsamp = joint.sampranges[gi,1]-joint.sampranges[gi,0]
-		for si in range(nsplit):
-			i1 = i0 + si*nsamp//nsplit
-			i2 = i0 + (si+1)*nsamp//nsplit
-			oname = "%s:split%d" % (name,si)
-			ojoint.groups.append(group)
-			ojoint.names.append(oname)
-			ojoint.sampranges.append((i1,i2))
-	ojoint.sampranges = np.array(ojoint.sampranges)
-	return ojoint
-
-#def time_split(obsinfo, joint, maxsize=None, maxdur=None):
-#	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
-#	into subranges so that the total ndet*nsamp size of each is no larger than
-#	maxsize. This can be needed due to memory constraints."""
-#	nsplits = np.ones(len(joint.groups), int)
-#	ginfo   = obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-#
-#
-#
-#	if maxsize is not None:
-#		# calculate the total size of each group
-#		sizes  = obs_group_size(obsinfo, joint.groups, sampranges=joint.sampranges)
-#		# number of time splits for each
-#		nsplits= np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
-#	if maxdur is not None:
-#		durs   = obs_group_dur(obsinfo, joint.groups, sampranges=joint.sampranges)
-#		nsplits= np.maximum(nsplits, utils.floor(durs/maxdur)+1)
-#	# Do the split
-#	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
-#		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
-#	for gi, (group, name, nsplit) in enumerate(zip(joint.groups, joint.names, nsplits)):
-#		# Need the number of samples the group covers. Will assume good time alignment
-#		if joint.sampranges is None:
-#			i0    = 0
-#			nsamp = np.max(obsinfo.nsamp[group])
-#		else:
-#			i0    = joint.sampranges[gi,0]
-#			nsamp = joint.sampranges[gi,1]-joint.sampranges[gi,0]
-#		for si in range(nsplit):
-#			i1 = i0 + si*nsamp//nsplit
-#			i2 = i0 + (si+1)*nsamp//nsplit
-#			oname = "%s:split%d" % (name,si)
-#			ojoint.groups.append(group)
-#			ojoint.names.append(oname)
-#			ojoint.sampranges.append((i1,i2))
-#	ojoint.sampranges = np.array(ojoint.sampranges)
-#	return ojoint
-
-def select_groups(joint, inds):
-	return bunch.Bunch(
-		groups = [joint.groups[i] for i in inds],
-		names  = [joint.names[i]  for i in inds],
-		sampranges=np.array([joint.sampranges[i] for i in inds]),
-		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
-
 def alloc_rfft(ishape, idtype, axes=[-1], dev=None, pool=None):
 	if pool is None:
 		if dev is None: dev = device.get_device()
@@ -915,14 +788,6 @@ def pair_rotate(iptod, optod, normalize=True):
 	optod[1] -= iptod[1]
 	if normalize: optod /= 2**0.5
 	return optod
-
-def check_demod(demod="auto", has_hwp=False):
-	if demod not in ["auto", "yes", "no"]:
-		raise ValueError("demod must be 'auto', 'yes' or 'no', but got '%s'" % str(demod))
-	if demod == "auto": return has_hwp
-	elif demod == "no": return False
-	elif has_hwp: return True
-	else: raise ValueError("Asked to demodulate, but no hwp present")
 
 def estimate_leakage_odr(x, y, down=10, bsize=700):
 	"""Assuming x = signal+noise1, y = signal*a + noise2, estimate

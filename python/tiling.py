@@ -126,7 +126,7 @@ class TileDistribution:
 		# latter could be part of
 		self.work  = bunch.Bunch(lp=lp)
 		self.work.cell_inds = lp.cell_offsets_cpu//self.tsize
-		self.work.ntile     = np.sum(self.work.cell_inds>=0)
+		self.work.ntile     = int(np.sum(self.work.cell_inds>=0))
 		self.work.shape     = (self.work.ntile,self.ncomp)+self.tshape
 		# Set up the distributed tile tiling
 		downer    = distribute_global_tiles_exposed_simple(self.work.cell_inds, comm)
@@ -443,23 +443,13 @@ def distribute_global_tiles_exposed_simple(loc_cells, comm):
 	owner[mask] = np.arange(nhit)*comm.size//nhit
 	return owner
 
-def get_weight_detsamps(obsinfo, joint=None):
-	if joint is None: return obsinfo.ndet.astype(int)*obsinfo.nsamp
-	ntot = []
-	for g in joint.groups:
-		ndet  = np.sum(obsinfo.ndet [g])
-		nsamp = np.sum(obsinfo.nsamp[g])
-		# int to get 8-byte, to avoid overflow
-		ntot.append(int(ndet)*nsamp)
-	return np.array(ntot)
-
-def distribute_tods_simple(obsinfo, nsplit, joint=None):
+def distribute_tods_simple(obsinfo, nsplit):
 	return bunch.Bunch(
 		owner   = np.arange(len(obsinfo))%nsplit,
 		weights = np.ones(nsplit),
 	)
 
-def distribute_tods_ra_plain(obsinfo, nsplit, joint=None, verbose=False):
+def distribute_tods_ra_plain(obsinfo, nsplit, verbose=False):
 	"""Split tods by the typical ra value without weighting."""
 	ra     = np.mean(obsinfo.sweep[:,:,0],-1)
 	order  = np.argsort(ra)
@@ -602,6 +592,10 @@ def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
 	like projecting a per-obs mask to time domain in order
 	to construct cuts."""
 	if dev is None: dev = device.get_device()
+	# Flatten input map pre-dimensions, so we can get incomp, which we will
+	# need to make sure only the T component of the output gets populated if
+	# the input map is T-only, instead of broadcasting to TQU as it otherwise would
+	map = map.preflat
 	fshape, fwcs, pixbox = infer_fullsky_geometry(map.shape, map.wcs)
 	# Set up the tiling. Have to keep track of the global tiling
 	# and the part we will actually allocate. First the global part
@@ -618,7 +612,7 @@ def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
 	# our local-map cells later
 	buf = np.zeros((ncomp,tinfo.nty,tshape[0],tinfo.ntx,tshape[1]),map.dtype)
 	b2d = buf.reshape(ncomp,tinfo.nty*tshape[0],tinfo.ntx*tshape[1])
-	b2d[:,tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
+	b2d[:len(map),tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
 	# Reshape and then move it to the device
 	buf = np.moveaxis(buf, (0,1,2,3,4), (2,0,3,1,4))
 	buf = buf.reshape(ncell,ncomp,tshape[0],tshape[1])

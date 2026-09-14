@@ -1,811 +1,107 @@
 # Things used by both sofast and soslow
-import re, numpy as np, warnings, os, yaml, contextlib
+import re, numpy as np, warnings, os, yaml, contextlib, copy
 from pixell import utils, sqlite, bunch, config, fft
 from .. import device, gutils, socut
 from . import minisotodlib
 
-# Bugs:
-#  * Since the query parsing and evaluation is done in two passes, first
-#    for a plain obsdb and then for a subobsdb, negative queries involving
-#    things that aren't fully determined at the obsdb level only partially
-#    work, and it might not be obvious when they don't work!
-#    It's hard to implement things properly when things like not((complicated)or(other ocmplicated))
-#    can occur, especially with my current token-based approach where the not doesn't know what
-#    expression it's being applied to.
-#    This parsing stuff is getting brittle and hard to maintain. The long-term solution is
-#    probably a proper parser.
+# Base loading classes
 
-def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, pre_cols=None, subobs=True, _obslist=None):
-	"""Given an obsdb SQL and a Simple Query, evaluate the
-	query and return a new SQL object (pointing to a temporary
-	file) containing the resulting observations."""
-	if cols is None: cols = sqlite.columns(obsdb, "obs")
-	if tags is None: tags = get_tags(obsdb)
-	if pre_cols is None and predb is not None: pre_cols = sqlite.columns(predb, "map")
-	if not simple_query: simple_query = "1"
-	# Check if we have a subobsdb or not
-	is_subobs = "subobs_id" in cols
-	# Main parse of the simple query
-	qinfo = parse_query(simple_query, cols, tags, pre_cols=pre_cols, default_good=default_good)
-	qjoin = ""
-	# By default, order by obs_id or subobs id
-	if is_subobs: qsort = "order by subobs_id"
-	else:         qsort = "order by obs_id"
-	# Create database we will put the result in, and attach
-	# it temporarily to obsdb so we can write to it
-	res_db  = sqlite.SQL()
-	with sqlite.attach(obsdb, res_db, "res", mode="rw"):
-		# Attach preprocess db if available
-		with sqlite.attach(obsdb, predb, "pre", mode="r") if predb else contextlib.nullcontext():
-			if qinfo.idfile:
-				# Ok, an obslist was passed. The _oblist stuff is
-				# so we can reuse an already read in obslist in the
-				# subobs pass
-				if _obslist is None: _obslist = load_obslist(qinfo.idfile)
-				if is_subobs and _obslist["subobs"] is not None:
-					# Yes, obsdb, but indirectly res_db. Can't use res_db directly since
-					# we're working on a copy of it due to how attach works
-					add_list(obsdb, "res.targ", _obslist["subobs"])
-					qjoin = "join res.targ on obs.subobs_id = res.targ.id"
-				else:
-					add_list(obsdb, "res.targ", _obslist["obs"])
-					qjoin = "join res.targ on obs.obs_id = res.targ.id"
-				qsort = "order by res.targ.ind"
-			qjoin += qinfo.join
-			# Build the full query
-			query = "select obs.* from obs %s where %s %s" % (qjoin, qinfo.where, qsort)
-			# Use it to build the output table
-			obsdb.execute("create table res.obs as %s" % query)
-			# Also get the tags
-			obsdb.execute("create table res.tags as select tags.* from tags where obs_id in (select obs_id from res.obs)")
-			if qinfo.idfile:
-				# Drop the obslist table we created
-				obsdb.execute("drop table res.targ")
-	# Ok, by this we're detached again, and res_db contains the
-	# resulting obs and tags tables. But we may need a second pass
-	# if we're still at the obsdb level, but need a subobs db
-	if not subobs: return res_db, qinfo.pycode, qinfo.slices # didn't ask for subobs
-	if is_subobs:  return res_db, qinfo.pycode, qinfo.slices # already subobs
-	# Ok, do the subobs expansion
-	with subobs_expansion(res_db) as subobs_db:
-		res_db.close() # don't need this one any more
-		return eval_query(subobs_db, simple_query, predb=predb, default_good=default_good, tags=tags, pre_cols=pre_cols, _obslist=_obslist)
+class Loader:
+	def __init__(self, dev=None, pool_map={}, dtype=np.float32):
+		self.dev      = dev or device.get_device()
+		self.pool_map = pool_map
+		self.dtype    = dtype
+	def query(self, query=None):
+		raise NotImplementedError
+	def probe(self, linfo, id, dets=None, detids=None):
+		raise NotImplementedError
+	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
+		raise NotImplementedError
+	# Grouping doesn't really belong here. What would make more sense would be
+	# something like classify_obs, which would return a list of tags per obs.
+	# Or maybe this should already be a part of what query handles. Instead of
+	# parsing obsids, would be nice to have these things simply available as tags.
+	# Oh well, leaving it for now.
+	def group_obs(self, linfo, mode="obs"):
+		# Default doesn't do any grouping
+		return group_obs(linfo.obsinfo, mode="none")
+	def prealloc(self, linfo):
+		raise NotImplementedError
+	def avoid_pools(self, names, suf="*"):
+		# First register directly
+		for name in names:
+			self.pool_map[name] = name + suf
+		# Then resolve chains
+		self.pool_map = {name:recursive_lookup(self.pool_map,name) for name in self.pool_map}
+	def pool(self, name):
+		try: name = self.pool_map[name]
+		except KeyError: pass
+		return self.dev.pools[name]
 
-def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
-	"""Gven a Simple Query, return an sqlite selection for an obsdb.
-	When cols contains 'band' and wafer_slots_list only has one entry,
-	as in a subobsdb, it will fully handle selections like ws0,f090.
-	Otherwise, as in obsdb, it will select any obs that partially matches.
+class LoadInfo:
+	"""Class representing a set of observations to load, and metadata needed to load it.
+	Contains at least the .obsinfo member a numpy table of the observations and their properties,
+	and provides the load() meathod for reading in an observation"""
+	def __init__(self, loader, obsinfo, omap=None, dets=None, detids=None):
+		self.loader  = loader
+		self.obsinfo = obsinfo
+		# Detector restriction
+		self.dets    = dets
+		self.detids  = detids
+		# Assume future samprange restrictions will cause no more than
+		# this many samples to be read in. Used in prealloc. This is
+		# inelegant...
+		self.maxnsamp = (1<<31)-1
+		if omap is None:
+			omap = {id:oi for oi,id in enumerate(obsinfo.id)}
+		self.omap    = omap
+	@property
+	def nobs(self): return len(self.obsinfo)
+	def probe(self, id, dets=None, detids=None):
+		return self.loader.probe(self, id, dets=dets, detids=detids)
+	def load(self, id, dets=None, detids=None, samprange=None, pinfo=None):
+		return self.loader.load(self, id, dets=dets, detids=detids, samprange=samprange, pinfo=pinfo)
+	def prealloc(self):
+		return self.loader.prealloc(self)
+	def copy(self): return copy.copy(self)
+	def __getitem__(self, sel):
+		# Generic slice that should work for most subclasses
+		res = self.copy()
+		res.obsinfo = self.obsinfo[sel]
+		res.omap    = {id:oi for oi,id in enumerate(res.obsinfo.id)}
+		return res
 
-	Returns:
-		* query: the part of the full SQL select statement that comes after where.
-		  Typically the full query would then be "select obs.* from obs where %s" % query,
-		  but it's up to the user to complete it like that.
-		* idfile: The path to a file with a plain list of obsids or subids, or None if
-		  the simple_query didn't refer to one.
-	"""
-	issub  = "band" in cols
-	# A Simple Query is a comma-separated list of constraints.
-	# Each constraint can be just a tag name, or a full expression
-	# 1. Translate ,-separation into ()and()
-	toks   = utils.split_outside(simple_query, ",", start="([{'\"", end=")]}'\"")
-	# 2. Inital pass through syntax that's only supported at top-level
-	idfile = None
-	otoks  = []
-	pycode = []
-	slices = []
-	det_type_set = False
-	for tok in toks:
-		# Direct tod list. Can be combined with other constraints, but
-		# only to further restrict. Multiple @ per query not supported -
-		# only the last one will be respected. @ must be followed by
-		# the path to a text file with lines starting with an obsid
-		# or subid each. Anything after the obsid is ignored. The file
-		# must be either all-obsid or all-subid, so you can't mix them.
-		# The results will be in the same order as this file. Any entres
-		# not in the database will be silently discarded.
-		if tok.startswith("@"):
-			idfile = tok[1:]
-			# Hack: Count det type to be set if we read in from a file, since
-			# the det type is part of the obs-db. If we don't do this, then
-			# dark detectors will be ignored in the idfile unless +dark is given,
-			# which is confusing. Ideally this would be handled separately for the
-			# file and any other constraints, but this will do for now.
-			det_type_set = True
-		elif is_slice(tok):
-			slices.append(utils.parse_slice("["+tok+"]"))
-		# Very hacky! (See notes above on future directions)
-		# Look for specific function calls that must be implemented in python.
-		# If present, the whole top-level segment will be treated in python!
-		elif contains_pyfuncs(tok):
-			pycode.append(tok)
-		else:
-			otoks.append(tok)
-	toks = otoks
-	# Translate the rest into a general query, so it can all be processed
-	# homogeneously
-	query = " and ".join(["(%s)" % tok for tok in toks])
-	# Translate python code chunks into a single statement
-	pycode = " & ".join(["(%s)" % tok for tok in pycode])
-	# This helper function handles more specific band selection if available
-	if issub: bandsel = lambda ftag, flavor: "(band = '%s')" % ftag
-	else:     bandsel = lambda ftag, flavor: "(tube_flavor = '%s')" % flavor
-	# 3. Loop through all referenced fields, and expand them if necessary.
-	otoks = []
-	prep_sel = {"set": False, "good": True, "bad": False}
-	query = expand_query_subids(query)
-	# Allow us to use & and | as shorthands for ' and ' and ' or '
-	query = utils.replace_outside(r"\|", " or ",  query, start="'\"", end="'\"")
-	query = utils.replace_outside(r"&", " and ", query, start="'\"", end="'\"")
-	for tok, isname in fieldname_iter(query):
-		# If this is not some sort of field, then we leave it mostly as is
-		if not isname:
-			# We didn't do this above because ~ is treated specially for fields
-			if issub: tok = utils.replace_outside(r"~", " not ", tok, start="'\"", end="'\"")
-			else:
-				# FIXME! Negation partially broken at the non-subobs-level. Not just right here
-				# I should probably switch to a proper parser instead of this brittle
-				# regex-based tokenization
-				pass
-		else:
-			# Split out unary op
-			if len(tok) > 0 and tok[0] in "+-~":
-				op, tok = tok[0], tok[1:]
-			else: op = " "
-			# Handle our formats
-			# Restrict as much as we can given any subobs constraints.
-			# This isn't very much, since obsdb doesn't operate on the subobs level
-			if re.match(obsid_fmt, tok):
-				tok = "(obs_id = '%s')" % tok
-			elif re.match(r"ws\d", tok):
-				tok = tag_op("instr(wafer_slots_list, '%s')" % tok, op, noneg=not issub)
-			elif tok in ["f030","f040"]: tok = tag_op(bandsel(tok, 'lf'),  op, noneg=not issub)
-			elif tok in ["f090","f150"]: tok = tag_op(bandsel(tok, 'mf'),  op, noneg=not issub)
-			elif tok in ["f220","f280"]: tok = tag_op(bandsel(tok, 'uhf'), op, noneg=not issub)
-			# Telescope
-			elif tok in ["lat", "satp1", "satp2", "satp3", "satp4", "satp5", "satp6"]:
-				tok = tag_op("(telescope = '%s')" % tok, op)
-			# Optics tube
-			elif tok in ["c1", "i1", "i2", "i3", "i4", "i5", "i6", "o1", "o2", "o3", "o4", "o5", "o6"]:
-				tok = tag_op("(tube_slot = '%s')" % tok, op)
-			# Pseudo-tags
-			elif tok == "obs":   tok = tag_op("(type='obs')", op)
-			elif tok == "cmb":   tok = tag_op("(type='obs' and subtype='cmb')", op)
-			elif tok == "night": tok = tag_op("(mod(timestamp/3600,24) not between 11 and 23)", op)
-			elif tok == "day":   tok = tag_op("(mod(timestamp/3600,24) between 11 and 23)", op)
-			elif tok == "spin":  tok = tag_op("(hwp_freq_mean!=0)", op)
-			elif tok == "rising":tok = tag_op("(mod(az_center+180,360)-180>10)")
-			elif tok == "setting":tok = tag_op("(mod(az_center+180,360)-180<-10)")
-			elif tok.upper() in ["DARK","OPTC"]:
-				if "det_type" in cols: tok = tag_op("(det_type = '%s')" % tok.upper(), op)
-				else:                  tok = "1"
-				det_type_set = True
-			# Aliases
-			elif tok == "&":   tok = " and "
-			elif tok == "|":   tok = " or "
-			elif tok == "t":   tok = "timestamp"
-			elif tok == "yr":  tok = "((timestamp-1735689600.0)/31556926.08+2025)"
-			elif tok == "baz": tok = "az_center"
-			elif tok == "bel": tok = "el_center"
-			elif tok == "roll": tok = "roll_center"
-			elif tok == "waz": tok = "az_throw"
-			elif tok == "wel": tok = "el_throw"
-			elif tok == "dur": tok = "duration"
-			elif tok == "nsamp": tok = "n_samples"
-			# Constants
-			elif tok == "tcorot": tok = "1749513600" # so corot problem fixed here
-			elif tok == "tfoc2":  tok = "1756684800" # so focus changed here
-			elif tok == "taso":   tok = "1770000000" # aso starts here
-			elif tok == "twire":  tok = "1777208400" # aso wires contaminate signal before this
-			# Don't interpret columns as tags if they conflict
-			elif tok in cols: pass
-			# Actual tags
-			elif tok in tags:
-				tok = tag_op("(obs_id in (select obs_id from tags where (tag = '%s')))" % tok, op)
-			# Planet pseudo-tag
-			elif tok == "planet":
-				# The or 0 handles the case where there are no planets defined
-				sel = "(" + " or ".join(["tag = '%s'" % planet for planet in planets if planet in tags]) + " or 0)"
-				tok = tag_op("(obs_id in (select obs_id from tags where %s))" % sel, op)
-			elif tok in sqlite.functions:
-				pass
-			else:
-				# Stuff that doesn't fit in. These are more limited than the others,
-				# and can't be parts of complicated expressions.
-				eq = "!=" if op in "-~" else "="
-				if tok == "good":
-					if   op == " ": prep_sel["good"], prep_sel["bad"] = True, False
-					elif op == "+": prep_sel["good"] = True
-					elif op == "-": prep_sel["good"] = False
-					elif op == "~": prep_sel["good"], prep_sel["bad"] = False, True
-					prep_sel["set"]   = True
-				elif tok == "bad":
-					if   op == " ": prep_sel["bad"], prep_sel["good"] = True, False
-					elif op == "+": prep_sel["bad"] = True
-					elif op == "-": prep_sel["bad"] = False
-					elif op == "~": prep_sel["bad"], prep_sel["good"] = False, True
-					prep_sel["set"]   = True
-				# Unknown tag
-				else:
-					raise ValueError("Name '%s' not a recognized tag or obs table column!" % str(tok))
-				# Handled separately, so just replace with a 1
-				tok = "1"
-		otoks.append(tok)
-	query = "".join(otoks) if len(otoks) > 0 else "1"
-	# Add default OPTC (non-dark) detector selection
-	if not det_type_set and "det_type" in cols:
-		query += " and (det_type = 'OPTC')"
-	# Filter on valid preprocess
-	pjoin = ""
-	if pre_cols is not None:
-		if not prep_sel["set"]: prep_sel["good"] = True
-		if prep_sel["good"] and prep_sel["bad"]:
-			# Want both good and bad, so no prep restriction required
-			pass
-		elif prep_sel["good"] and not prep_sel["bad"]:
-			if "band" in cols:
-				# band is present if we have a subobsdb
-				pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id]"
-				if "dets:wafer_slot" in pre_cols:
-					pjoin += " and instr(obs.wafer_slots_list, pre.map.[dets:wafer_slot])"
-				if "dets:wafer.bandpass" in pre_cols:
-					pjoin += " and obs.band = pre.map.[dets:wafer.bandpass]"
-			else:
-				query += "  and obs.obs_id in (select [obs:obs_id] from pre.map)"
-		elif prep_sel["bad"] and not prep_sel["good"]:
-			# Selecting only bad was cumbersome to implement...
-			raise ValueError("Selecting only bad observations not supported yet")
-		else:
-			# Neither good nor bad. So disqalify all obs
-			query += " and 0"
-	return bunch.Bunch(where=query, join=pjoin, idfile=idfile, pycode=pycode, slices=slices)
+class ProbeInfo:
+	"""Class representing the result of probing an observation, which means doing a
+	relatively light-weight partial read in order to determine the actually readable number
+	of detectors, the number of samples and the absolute sample timing. May also include other
+	information as needed by the individual loaders"""
+	def __init__(self, ndet, nsamp, t1, srate, **kwargs):
+		self.ndet, self.nsamp, self.t1, self.srate = ndet, nsamp, t1, srate
+		self.__dict__.update(kwargs)
 
-def tag_op(expr, op, noneg=False):
-	if   op in " ": return expr # standard
-	elif op in "+": return "1"  # + enables, but everything enabled by default
-	elif op in "-~":
-		if noneg: return "1"
-		else: return "not " + expr # - removes from set, ~ complements. Same for boolean
-	else: raise ValueError("Invalid tag op '%s'" % str(op))
+def recursive_lookup(imap, name):
+	while name in imap:
+		name = imap[name]
+	return name
 
-# FIXME: when splitting bands, we must remember that this
-# also reduces ndet. Otherwise we will end up overestimating
-# memory use later
+def srange_suffix(id, srange):
+	if srange is None: return id
+	else: return id + "," + "%d:%d" % tuple(srange)
 
-def subobs_expansion(obsdb, tags=True):
-	"""Given an obsdb SQL, return a subobsdb SQL using looping in SQL"""
-	# Will keep all columns, except that wafer_slots_list will be replaced with
-	# a single slot
-	cols = [r[1] for r in obsdb.execute("PRAGMA table_info('obs')")]
-	cols.remove("wafer_slots_list")
-	# wafer slot expansion
-	query = """with recursive
-split(obs_id, slot, rest) as (
-	select
-		obs_id,
-		substr(wafer_slots_list, 1, instr(wafer_slots_list||',', ',')-1),
-		substr(wafer_slots_list || ',', instr(wafer_slots_list||',', ',')+1)
-	from obs
-	union all
-	select
-		obs_id,
-		substr(rest, 1, instr(rest,',')-1),
-		substr(rest, instr(rest,',')+1)
-	from split
-	where rest <> ''
-),"""
-	# band expansion
-	case    = "case obs.tube_flavor"
-	flavors = list(flavor_bands.keys())
-	for flavor in flavors:
-		case += " when '%s' then '" % flavor + ",".join(flavor_bands[flavor])+",'"
-	case += " else 'f???,' end"
-	query += """
-list_bands(obs_id, bands) as (
-	select
-		obs_id,
-		%s
-	from obs
-),
-split_bands(obs_id, band, bands) as (
-	select
-		obs_id,
-		substr(bands, 1, instr(bands, ',')-1),
-		substr(bands, instr(bands, ',')+1)
-	from list_bands
-	union all
-	select
-		obs_id,
-		substr(bands, 1, instr(bands, ',')-1),
-		substr(bands, instr(bands, ',')+1)
-	from split_bands
-	where bands <> ''
-)""" % case
-	# dark expansion. Want "" and ":DARK" for each entry. Could do ":OPTC" instead of "",
-	# but that makes the common case needlessly verbose and confusing. "" is slightly
-	# confusing too, though, since one might think that "" would mean "all types".
-	# But we don't support wildcard subids. A subid refers to a specific set of detectors.
-	# the rest
-	det_types = ["OPTC", "DARK"]
-	for i, det_type in enumerate(det_types):
-		idsuf = "" if det_type == "OPTC" else " || ':%s'" % det_type
-		union = " union all " if i > 0 else ""
-		query += """
-%s select obs.obs_id || ':' || slot || ':' || band%s as subobs_id, '%s' as det_type, %s, slot as wafer_slots_list, band from obs join split on obs.obs_id = split.obs_id join split_bands on split_bands.obs_id = obs.obs_id where slot <> '' and band <> ''
-""" % (union, idsuf, det_type, ", ".join(["obs.%s" % col for col in cols]))
-	subobsdb = sqlite.SQL()
-	with obsdb.attach(subobsdb, mode="rw"):
-		obsdb.execute("create table other.obs as %s" % query)
-		obsdb.execute("create table other.tags as select tags.* from tags where obs_id in (select obs_id from other.obs)")
-	return subobsdb
+def srange_trunc(srange, dev):
+	srange = np.array(srange)
+	srange[...,1] = srange[...,0] + dev.goodlen(srange[...,1]-srange[...,0])
+	return srange
 
-# Have to hard-code this, I think
-flavor_bands = {"lf":["f030","f040","DARK"], "mf":["f090","f150","DARK"], "uhf":["f220","f280","DARK"]}
-planets = ["mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune", "moon", "sun"]
+def srange_expand(srange, factor=1):
+	return utils.nint(srange*factor)
 
-##### Helpers #####
-
-obsid_fmt = re.compile(r"\bobs_\w+")
-subid_fmt = re.compile(r"\bobs_\w+(:\w+)*")
-
-def get_tags(db): return [row[0] for row in db.execute("select distinct tag from tags")]
-
-def preproc_fieldnames(fiter, quote="'\""):
-	"""Given a fieldname_iter, expand some fields like obs_ids and subids,
-	and split non-fieldnames to make further substitutions easier. This needs
-	to be a separate function because the main logic in parse_query can't change
-	the number of things to iterate over"""
-	def subid_expand(match): return "("+match.group(0).replace(":","&")+")"
-	for tok, isname in fiter:
-		if isname: yield tok, isname
-		else:
-			subtoks = utils.split_by_group(tok, start=quote, end=quote)
-			for stok in subtoks:
-				if len(stok) == 0: continue
-				elif stok[0] in quote: yield stok, False
-				else:
-					# Ok, we have an unquoted section that's not recognized as a field name.
-					# Split any subids into segments
-					stok = re.subn(subid_fmt, subid_expand, stok)[0]
-					# Split by whitespace and some punctuation
-					for elem in re.split(r"(&|\||\band\b|\bor\b|\(|\)| +)", stok):
-						yield elem, False
-
-def expand_query_subids(query, quote="'\""):
-	"""Given a query, expand a subid=obs:ws:band into individual fields
-	surrounded by (). This is necessary because they form a single unit,
-	while standard tokenization in fieldname_iter would break things like
-	subid1|subid2"""
-	def subid_expand(match): return "("+match.group(0).replace(":","&")+")"
-	return utils.replace_outside(subid_fmt, subid_expand, query, start=quote, end=quote)
-
-def fieldname_iter(query, quote="'\""):
-	toks = utils.split_by_group(query, start=quote, end=quote)
-	#fmt  = re.compile(r"~?\b[a-zA-Z]\w*\b")
-	# word optionally preceded by ~, or +/-, but only if the latter can't be interpreted
-	# as a binary operation. I had to use two groups to capture what amounts to the same
-	# thin here because of limitations with lookbehind length variability
-	fmt = re.compile(r"(?:(?:^|[\[({,])([+-]?\b[a-zA-Z]\w*\b))|(~?\b[a-zA-Z]\w*\b)") # urk
-	current = ""
-	for tok in toks:
-		if len(tok) == 0: continue
-		elif tok[0] in quote: current += tok
-		else:
-			# Ok, we're in a non-quoted section. Look for identifiers
-			pos = 0
-			while m := fmt.search(tok, pos):
-				# Find which of the groups matched
-				mind = [i for i,g in enumerate(m.groups()) if g is not None][0]+1 # yuck
-				# pos:m.start() will be new, non-matching stuff
-				current += tok[pos:m.start(mind)]
-				# m.start():m.end() will be either a name or a keyword
-				fieldname = m[mind]
-				if fieldname.lower() in recognized_sql:
-					current += fieldname
-				else:
-					# Ok, we actually have a fieldname
-					if len(current) > 0:
-						yield current, False
-						current = ""
-					yield m[mind], True
-				pos = m.end(mind)
-			# Handle what's left of the token
-			current += tok[pos:]
-	# Yield left-over stuff if present
-	if len(current) > 0:
-		yield current, False
-
-# all is only used in select all, which is the default, and we
-# need it for other things
-recognized_sql = sqlite.keywords - set(["all"])
-
-def add_list(db, table, vals):
-	rows = [(val,ind) for ind, val in enumerate(vals)]
-	db.execute("create table %s (id text, ind integer)" % table)
-	db.executemany("insert into %s (id, ind) values (?,?)" % table, rows)
-	db.execute("commit")
-
-def load_obslist(fname):
-	idlist = []
-	# Read in the first column
-	with open(fname, "r") as ifile:
-		for line in ifile:
-			toks = line.split()
-			if len(toks) > 0: idlist.append(toks[0])
-	# Check first entry to see if these are obsids or not
-	ncolon = len(idlist[0].split(":"))-1 if len(idlist) > 0 else 0
-	if ncolon == 0:
-		# We have a plain obslist
-		obss    = idlist
-		subobss = None
-	else:
-		# A subobs list
-		subobss = idlist
-		obss    = np.array([subobs.split(":")[0] for subobs in subobss])
-		# Get rid of duplicates while preserving order
-		uobss, inds = np.unique(obss, return_index=True)
-		obss    = obss[np.sort(inds)]
-	return {"obs":obss, "subobs":subobss}
-
-
-# Python functions we will recognize
-_pyfuncs = ["hits","maxel","minel"]
-def contains_pyfuncs(s):
-	for pyfunc in _pyfuncs:
-		if pyfunc + "(" in s:
-			return True
-	return False
-
-def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
-	if output not in ["sqlite", "resultset", "sogma"]:
-		raise ValueError("Unrecognized output format '%s" % str(output))
-	if output == "sqlite":
-		# This format does not support pycode or slices
-		return res_db
-	info   = minisotodlib.ResultSet.from_cursor(res_db.execute("select * from obs"))
-	if output == "resultset" and not pycode:
-		# Skip obsinfo construction if we don't need pycode
-		for sel in slices: info = info[sel]
-		return info
-	# Estimate number of detectors. This will be an overestimate,
-	# since some detectors will be cut. This assumes optc and dark
-	# are the only possibilities, and uses hardcoded values.
-	ndet = np.where(info["det_type"] == "OPTC",
-		utils.dict_lookup(flavor_noptc_per_band, info["tube_flavor"]),
-		utils.dict_lookup(flavor_ndark_per_band, info["tube_flavor"]),
-	)
-	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("fhwp","d"),("r","d"),("sweep","d",(6,2))]
-	obsinfo = np.zeros(len(info), dtype).view(np.recarray)
-	obsinfo.id    = info["subobs_id"]
-	obsinfo.ndet  = ndet
-	obsinfo.nsamp = info["n_samples"]
-	obsinfo.ctime = info["start_time"]
-	obsinfo.dur   = info["stop_time"]-info["start_time"]
-	# Here come the parts that have to do with pointing.
-	# These arrays have a nasty habit of being object dtype
-	obsinfo.baz   = info["az_center"].astype(np.float64) * utils.degree
-	obsinfo.bel   = info["el_center"].astype(np.float64) * utils.degree
-	obsinfo.roll  = info["roll_center"].astype(np.float64) * utils.degree
-	obsinfo.waz   = info["az_throw" ].astype(np.float64)*2 * utils.degree
-	if "hwp_freq_mean" in info.keys: obsinfo.fhwp = info["hwp_freq_mean"]
-
-	wafer_centers, obsinfo.r = wafer_info_multi(info["tube_slot"], info["wafer_slots_list"])
-	if sweeps:
-		obsinfo.sweep = make_sweep(obsinfo.ctime, obsinfo.baz, obsinfo.waz, obsinfo.bel, wafer_centers)
-	# Evaluate pycode
-	good = eval_pycode(pycode, obsinfo)
-	# Apply slices
-	inds = np.where(good)[0]
-	for sel in slices: inds = inds[sel]
-	# And return in the requested format
-	if output == "resultset": return resultset_subset(info, inds)
-	else: return obsinfo[inds]
-
-def add_tags_column(idb):
-	resdb = sqlite.SQL()
-	with resdb.attach(idb):
-		# Copy over the tags table
-		resdb.execute("create table tags as select * from other.tags")
-		# Copy over obs table while adding a tags column
-		resdb.execute("create table obs as select *, grouped.tagcol as tags from other.obs left join (select obs_id, group_concat(tag,',') as tagcol from other.tags group by tags.obs_id) as grouped on obs.obs_id = grouped.obs_id")
-	return resdb
-
-# Hard-coded raw wafer detector counts per band. Independent of
-# telescope type, etc.
-flavor_noptc_per_band = {"lf":118, "mf": 864, "uhf": 864}
-flavor_ndark_per_band = {"lf":  4, "mf":  18, "uhf":  18}
-
-wafer_pos_sat = {
-	#      xi,      eta
-	"st0": [  0.0000,   0.0000],
-	"st1": [  0.0000, -12.6340],
-	"st2": [-10.9624,  -6.4636],
-	"st3": [-10.9624,   6.4636],
-	"st4": [  0.0000,  12.6340],
-	"st5": [ 10.9624,   6.4636],
-	"st6": [ 10.9624,  -6.4636],
-}
-
-wafer_pos_lat = {
-	"c1": { "ws0":[-0.3710,  0.0000], "ws1":[ 0.1815,  0.3211], "ws2": [ 0.1815, -0.3211] },
-	"i1": { "ws0":[-1.9112, -0.9052], "ws1":[-1.3584, -0.5704], "ws2": [-1.3587, -1.2133] },
-	"i2": { "ws0":[-0.3642, -1.7832], "ws1":[ 0.1888, -1.4631], "ws2": [ 0.1927, -2.1035] },
-	"i3": { "ws0":[ 1.1865, -0.8919], "ws1":[ 1.7326, -0.5705], "ws2": [ 1.7333, -1.2135] },
-	"i4": { "ws0":[ 1.1732,  0.9052], "ws1":[ 1.7332,  1.2135], "ws2": [ 1.7326,  0.5705] },
-	"i5": { "ws0":[-0.3655,  1.7833], "ws1":[ 0.1879,  2.1045], "ws2": [ 0.1867,  1.4620] },
-	"i6": { "ws0":[-1.9082,  0.8920], "ws1":[-1.3577,  1.2133], "ws2": [-1.3584,  0.5854] },
-	"o1": { "ws0":[-1.8959, -2.6746], "ws1":[-1.3455, -2.3530], "ws2": [-1.3392, -2.9954] },
-	"o2": { "ws0":[ 1.1876, -2.6747], "ws1":[ 1.7447, -2.3537], "ws2": [ 1.7505, -2.9965] },
-	"o3": { "ws0":[ 2.7302,  0.0000], "ws1":[ 3.2929,  0.3220], "ws2": [ 3.2929, -0.3219] },
-	"o4": { "ws0":[ 1.1876,  2.6747], "ws1":[ 1.7505,  2.9965], "ws2": [ 1.7447,  2.3537] },
-	"o5": { "ws0":[-1.8959,  2.6747], "ws1":[-1.3392,  2.9955], "ws2": [-1.3455,  2.3530] },
-	"o6": { "ws0":[-3.4369,  0.0000], "ws1":[-2.8869,  0.3218], "ws2": [-2.8869, -0.3218], "ws.": [-3.0702,  0.0000] },
-}
-
-# Lowest possible sensitivity per detector in µK√s. Used for sanity checks.
-# These are about half our forecast goal sensitivity
-sens_limits = {"f030":120, "f040":80, "f090":100, "f150":140, "f220":300, "f280":750}
-
-def wafer_info(tube_slot, wafer):
-	if wafer.startswith("st"):
-		pos, rad = wafer_pos_sat[wafer], 6.0
-	else:
-		pos, rad = wafer_pos_lat[tube_slot][wafer], 0.3
-	# Convert to radians
-	pos = [p*utils.degree for p in pos]
-	rad = rad*utils.degree
-	return pos, rad
-
-def wafer_info_multi(tubes, wafers, missing="warn"):
-	"""Vectorized version of wafer info. Given tubes[nobs], wafers[nobs],
-	returns poss[nobs,2], rads[nobs]"""
-	nobs  = len(tubes)
-	tag   = (tubes, wafers)
-	label = utils.label_multi(tag)
-	uvals, order, edges = utils.find_equal_groups_fast(label)
-	poss  = np.zeros((nobs,2))
-	rads  = np.zeros(nobs)
-	for gi, uval in enumerate(uvals):
-		inds = order[edges[gi]:edges[gi+1]]
-		try:
-			pos, rad = wafer_info(tubes[inds[0]], wafers[inds[0]])
-		except KeyError as e:
-			pos, rad = [0,0], 0
-			if   missing == "warn": warnings.warn(str(e))
-			elif missing == "ignore": pass
-			else: raise
-		poss[inds] = pos
-		rads[inds] = rad
-	return poss, rads
-
-def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=10000):
-	ap  = device.anypy(rms_uKrts)
-	# First reject detectors with unreasonably low noise
-	good     = rms_uKrts >= sens_lim
-	# Also reject far too noisy detectors
-	good    &= rms_uKrts <  sens_lim*max_lim
-	# Then reject outliers
-	if ap.sum(good) == 0: return good
-	ref      = ap.median(rms_uKrts[good])
-	good    &= rms_uKrts > ref*med_tol
-	good    &= rms_uKrts < ref/med_tol
-	return good
-
-_rms_der_norm = [1,2,6,20,70,252]
-def measure_rms_der(tod, dt=1, nder=3, bsize=32, nblock=10):
-	ap  = device.anypy(tod)
-	tod = tod[:,:tod.shape[1]//bsize*bsize]
-	tod = tod.reshape(tod.shape[0],-1,bsize)
-	bstep = max(1,tod.shape[1]//nblock)
-	tod = tod[:,::bstep,:][:,:nblock,:]
-	# Take the nder'th derivative, to effectively highpass filter.
-	# This will put our focus on only the highest freqs, which may not
-	# be representative of the practical white noise floor, but it will
-	# make us robust to any hwp
-	tod  = ap.diff(tod, n=nder, axis=-1)
-	rms  = ap.median(ap.std(tod,-1),-1)
-	rms /= _rms_der_norm[nder]**0.5
-	# to µK√s units
-	rms *= dt**0.5
-	return rms
-
-# This one is not robust to bright signals like planets.
-# Trying to map a planet would see the detectors that see it
-# disqualified for being too noisy. The good thing about
-# this version is that it's robust to the hwp
-def measure_rms_ft(ftod, dt=1, fmin=30, fmax=100):
-	fnyq = 0.5/dt
-	imin = utils.ceil (ftod.shape[-1] * fmin/fnyq)
-	imax = utils.floor(ftod.shape[-1] * fmax/fnyq)
-	fsub = ftod[:,imin:imax]
-	rms  = np.std(fsub,-1)*(dt/fsub.shape[-1])**0.5 * ftod.shape[-1]
-	return rms
-
-# This one is robust to planets, but fails in the
-# presence of a hwp, since all the blocks would be
-# impacted.
-def measure_rms(tod, dt=1, bsize=32, nblock=10):
-	ap  = device.anypy(tod)
-	tod = tod[:,:tod.shape[1]//bsize*bsize]
-	tod = tod.reshape(tod.shape[0],-1,bsize)
-	bstep = max(1,tod.shape[1]//nblock)
-	tod = tod[:,::bstep,:][:,:nblock,:]
-	rms = ap.median(ap.std(tod,-1),-1)
-	# to µK√s units
-	rms *= dt**0.5
-	return rms
-
-# This sweep isn't quite accurate. It's off by ~1°.
-# Is something going wrong with the offset? The math
-# looks good to me, and sign flips make things worse.
-# The error isn't consistently in the same direction
-# in horizontal coordinates. For now we'll just have to
-# operate with a margin of error
-# [this was before translation from so3g to coordsys, not tested after]
-def make_sweep(ctime, baz0, waz, bel0, off, npoint=6, nocross=True):
-	from pixell import coordsys
-	# given ctime,baz0,waz,bel [ntod], off[ntod,{xi,eta}], make
-	# make sweeps[ntod,npoint,{ra,dec}]
-	coff = coordsys.Coords(q=coordsys.euler(1, np.pi/2-bel0)*coordsys.rotation_xieta(off[:,0], off[:,1]))
-	az_off, el = coff.az, coff.el
-	az1 = baz0+az_off-waz/2
-	az2 = baz0+az_off+waz/2
-	if nocross: az1, az2 = truncate_az_crossing(az1, az2)
-	az  = az1[:,None] + (az2-az1)[:,None]*np.linspace(0,1,npoint)
-	el  = el   [:,None] + az*0
-	ts  = ctime[:,None] + az*0
-	cout = coordsys.transform("hor", "equ", coordsys.Coords(az=az.reshape(-1), el=el.reshape(-1)), ctime=ts.reshape(-1), site="so", weather="typical")
-	pos_equ = np.array([cout.ra, cout.dec]).T # [ntot,{ra,dec}]
-	sweep   = pos_equ.reshape(len(ctime),npoint,2)
-	# Move all the sweeps to a compatible winding of the sky,
-	# and avoid angle cuts inside each sweep
-	sweep[:,0,0]  = utils.rewind_compact(sweep[:,0,0])
-	sweep[:,1:,0] = utils.rewind(sweep[:,1:,0]-sweep[:,0,None,0])+sweep[:,0,None,0]
-	return sweep
-
-def truncate_az_crossing(az1, az2):
-	# Which side of the sky are we on?
-	amid = 0.5*(az1+az2)
-	# Legal bounds
-	leg1 = utils.floor(amid/np.pi)*np.pi
-	leg2 = utils.ceil (amid/np.pi)*np.pi
-	az1  = np.maximum(az1, leg1)
-	az2  = np.minimum(az2, leg2)
-	return az1, az2
-
-# How to check if point is hit by observation?
-# 1. Build interpol ra(dec) for sweep
-# 2. If point not within sweep dec range padded by array rad, we're not hit
-# 3. Evaluate sweep at dec of point, getting ra. Clip to valid dec range.
-# 4. The sky rotates by -15°/hour in ra, which means that our coverage
-#    rotates by +15°/hour in ra. So we're hit if ra_point inside
-#    [ra-r,ra+15°/hour*dur+r]
-def point_hit(point, sweep, dur, r, pad=1.0*utils.degree):
-	"""Check if the given points are hit by an observation with the given sweep, duration and
-	wafer radius. pad gives a safety margin, and is needed because sweep is a bit inaccurate
-	for some reason. 1 degree should be enough to make up for this."""
-	# point[nalt,:,{ra,dec}], point[:,{ra,dec}], or [{ra,dec}], sweep[:,npoint,{ra,dec}], dur[:], r[:]
-	point, _ = np.broadcast_arrays(point, sweep[:,0,:])
-	if point.ndim == 3:
-		# Handle 3D case, where we have multiple points and want to know if we hit
-		# any of them
-		return np.any([point_hit(p, sweep, dur, r, pad=pad) for p in point],0)
-	nobs, nsamp = sweep.shape[:2]
-	# Our output array
-	was_hit = np.zeros(nobs,bool)
-	# 1. Check dec range
-	dec1, dec2 = utils.minmax(sweep[:,:,1],-1)
-	# 2. Don't try if dec range is too short
-	good = dec2-dec1 > 0.1*utils.degree
-	ra   = poly_interpol(point[good,1], sweep[good,:,1], sweep[good,:,0])
-	# Check if we're in bounds for the valid obss
-	pra, pdec = point[good].T
-	eff_rad   = r[good]/np.cos(pdec)
-	speed     = 15*utils.degree/utils.hour
-	# Make sure the point is on the right wrap, using the middle of our
-	# coverage as reference
-	pra  = utils.rewind(pra, ref=ra+speed*dur[good]/2)
-	dec_hit   = (pdec>dec1[good]-r[good]-pad)&(pdec<dec2[good]+r[good]+pad)
-	ra_hit    = (pra>ra-eff_rad-pad)&(pra<ra+speed*dur[good]+eff_rad+pad)
-	was_hit[good] = ra_hit & dec_hit
-	return was_hit
-
-def gal_hit(sweep, dur, r, minlat=None, pad=1*utils.degree):
-	# sweep[:,npoint,{ra,dec}]
-	if minlat is None: minlat = 5
-	minlat = minlat*utils.degree
-	from pixell import coordinates
-	speed= 15*utils.degree/utils.hour
-	ras, decs = sweep.T # [npoint,ntod]
-	icoord = np.array([[ras,ras+dur*speed],[decs,decs]]) # [{ra,dec},2,npoint,ntod]
-	lats   = coordinates.transform("equ", "gal", icoord)[1]
-	# We hit the galaxy if lats either crosses zero, or if min(abs(lat))+r+pad < minlat
-	lat1,lat2 = utils.minmax(lats,(0,1))
-	hits = (lat1*lat2 < 0)|(np.min(np.abs(lats),(0,1))+r+pad < minlat)
-	return hits
-
-def poly_interpol(x, xp, yp):
-	nobs, nsamp = xp.shape
-	xmin, xmax = utils.minmax(xp,-1)
-	# Build polynomial interpol. Scipy spline not vectoriced enough
-	def normalize(x): return (2*(x.T-xmin.T)/(xmax.T-xmin.T)).T
-	xnorm= normalize(xp)
-	B    = np.array([xnorm**i for i in range(nsamp)]) # [order,nobj,nsamp]
-	rhs  = np.einsum("anp,np->na", B, yp)
-	div  = np.einsum("anp,bnp->nab", B, B)
-	amp  = np.einsum("nab,nb->na", np.linalg.inv(div), rhs)
-	# Evaluate at requested position
-	xnorm= normalize(x)
-	B    = np.array([xnorm**i for i in range(nsamp)]) # [order,nobj]
-	y    = np.einsum("na,an->n", amp, B)
-	return y
-
-########################################################
-# Functions handling python code evaluation in queries #
-########################################################
-
-def eval_pycode(pycode, obsinfo):
-	if not pycode: return np.ones(len(obsinfo), bool)
-	def pycode_hits(ra, dec=None, r=1):
-		if isinstance(ra, str):
-			# Special case: 'gal'. The optional second argument gives the min
-			# galactic latitude
-			if ra == "gal": return gal_hit(obsinfo.sweep, obsinfo.dur, obsinfo.r, minlat=dec, pad=r*utils.degree)
-			# For a planet name, we look up the planet position and continue on to the
-			# standard point hit
-			else: pos = planet_pos(ra, obsinfo)
-		else: pos = np.array([ra,dec])*utils.degree
-		return point_hit(pos, obsinfo.sweep, obsinfo.dur, obsinfo.r, pad=r*utils.degree)
-	def pycode_planet(name): return planet_pos(name, obsinfo)
-	def pycode_maxel(name, dec=None):
-		return np.max(hor_helper(name, obsinfo, dec=dec).el, (0,1))
-	def pycode_minel(name, dec=None):
-		return np.min(hor_helper(name, obsinfo, dec=dec).el, (0,1))
-	# Would be nice to be able to do just hor(planet(name))[1]>0 to get tods
-	# where some object is above the horizon, but they move too quickly
-	# in these coordinates. Will instead make the more specialized maxel and minel
-	globs = {}
-	# Make numpy available, both with and without np
-	globs.update(**vars(np))
-	globs["np"] = np
-	# Register our function
-	globs["hits"]   = pycode_hits
-	globs["planet"] = pycode_planet
-	globs["maxel"]  = pycode_maxel
-	globs["minel"]  = pycode_minel
-	return eval(pycode, globs)
-
-def planet_pos(name, obsinfo):
-	from pixell import ephem
-	name = name.lower()
-	if   name == "planet":   name = config.get("planet_list")
-	elif name == "asteroid": name = config.get("asteroid_list")
-	names = name.split(",")
-	poss = []
-	for name in names:
-		pos = ephem.eval(name, obsinfo.ctime)[0]
-		poss.append(pos)
-	return np.array(poss) # [nplanet,nobs,{ra,dec}]
-
-def hor_helper(name, obsinfo, dec=None):
-	from pixell import coordsys
-	if isinstance(name, str):
-		pos = planet_pos(name, obsinfo) # [nplanet,nobs,{ra,dec}]
-	else:
-		ra  = float(name)*utils.degree
-		dec = float(dec)*utils.degree
-		pos = np.array([ra,dec])[None,None]
-	pos  = coordsys.Coords(ra=pos[...,0], dec=pos[...,1])
-	times = np.array([obsinfo.ctime,obsinfo.ctime+obsinfo.dur])[:,None,:] # [2,*,nobs]
-	hpos = coordsys.transform("equ", "hor", pos, ctime=times)
-	return hpos # [2,*,nobs]
-
-# Result-set workaround
-def resultset_subset(resultset, inds):
-	return minisotodlib.ResultSet(resultset.keys, [resultset.rows[ind] for ind in inds])
-
-def is_slice(s):
-	return re.match(r"^[+-]?\d*:[+-]?\d*:?[+-]?\d*$", s) is not None
+def srange_chain(srange1, srange2):
+	"""If srange2 is a sub-srange to srange1, what absolute sample range does it actually cover?"""
+	res = srange1[...,0,None] + srange2
+	res[...,1] = np.minimum(res[...,1], srange1[...,1])
+	return res
 
 ########################
 # Contexts and configs #
@@ -953,225 +249,68 @@ def find_scanning(az, down=10, tol=0.01, pad=1):
 	i2   = min((moving[-1]+1+pad)*down+1, az.size)
 	return i1, i2
 
-# How to handle buffers with demodulation.
-# Standard case:
-#  Reading:
-#   rtod [nsub,nsamp] 1/6
-#   rft  [nsub,nsamp] 1/6
-#   tod  [ndet,nsamp]   1
-#  Running:
-#   tod  [ndet,nsamp]   1
-#   ft   [ndet,nsamp]   1
-#   point[3,ndet,nsamp] 3
-# Both cases are served with:
-#  tod   [ndet,nsamp]   1
-#  ft    [ndet,nsamp]   1
-#  point [3,ndet,nsamp] 3
-#  In load_multi(), point is abused as temporary storage when calling load()
+# Lowest possible sensitivity per detector in µK√s. Used for sanity checks.
+# These are about half our forecast goal sensitivity
+sens_limits = {"f030":120, "f040":80, "f090":100, "f150":140, "f220":300, "f280":750}
 
-# Demodulation:
-#  Reading:
-#   rtod [nsub,nsamp]   1/6
-#   rft  [nsub,nsamp]   1/6
-#   dtod [nsub,ndown]   1/150
-#   tod  [ndet,ndown]   1/25
-#  Running:
-#   tod  [ndet,ndown]   1/25
-#   ft   [ndet,ndown]   1/25
-#   point[3,ndet,ndown] 3/25
-# So unlike the standard case, our biggest buffers are actually the
-# temporary ones used during reading, not our final one
+def sensitivity_cut(rms_uKrts, sens_lim, med_tol=0.2, max_lim=10000):
+	ap  = device.anypy(rms_uKrts)
+	# First reject detectors with unreasonably low noise
+	good     = rms_uKrts >= sens_lim
+	# Also reject far too noisy detectors
+	good    &= rms_uKrts <  sens_lim*max_lim
+	# Then reject outliers
+	if ap.sum(good) == 0: return good
+	ref      = ap.median(rms_uKrts[good])
+	good    &= rms_uKrts > ref*med_tol
+	good    &= rms_uKrts < ref/med_tol
+	return good
 
-# Idea: Create pools with all these names, but make some of them aliases
-# of each other. That way the reading code can use the buffer that's natural
-# for it, and it's up to the setup function to make sure things work.
-# If the setup function is not called, then things will still work, but the buffers
-# will be separate, and hence some memory will be wasted
+_rms_der_norm = [1,2,6,20,70,252]
+def measure_rms_der(tod, dt=1, nder=3, bsize=32, nblock=10):
+	ap  = device.anypy(tod)
+	tod = tod[:,:tod.shape[1]//bsize*bsize]
+	tod = tod.reshape(tod.shape[0],-1,bsize)
+	bstep = max(1,tod.shape[1]//nblock)
+	tod = tod[:,::bstep,:][:,:nblock,:]
+	# Take the nder'th derivative, to effectively highpass filter.
+	# This will put our focus on only the highest freqs, which may not
+	# be representative of the practical white noise floor, but it will
+	# make us robust to any hwp
+	tod  = ap.diff(tod, n=nder, axis=-1)
+	rms  = ap.median(ap.std(tod,-1),-1)
+	rms /= _rms_der_norm[nder]**0.5
+	# to µK√s units
+	rms *= dt**0.5
+	return rms
 
-# The current setup_buffers, slightly simplified
-# def setup_buffers(dev, ntot, dtype=np.float32, ndet_guess=1000):
-# 	dev.pools["pointing"]   .empty((3, ntot), dtype=dtype)
-# 	dev.pools["tod"]        .empty(ntot, dtype=dtype)
-# 	dev.pools["ft" ]        .empty(ftot, dtype=ctype)
-# 	dev.pools["fft_scratch"].empty(ftot, dtype=ctype)
-#
-# Could instead become something like
-#
-# det setup_buffers_demod(dev, ndet, nsub, nsamp, ndown, dtype=np.float32):
-#   dev.pools["rtod"].empty((nsub,nsamp), dtype)
-#   dev.pools["rft"] .empty((nsub,nsamp), dtype)
-#   dev.pools["dtod"].empty((nsub,ndown), dtype)
-#   dev.pools["tod"] .empty((ndet,ndown), dtype)
-#   dev.pools["ft"] = dev.pools["rft"] # assumes ndet*ndown < nsub*nsamp
-#   dev.pools["pointing"].empty((3,ndet,ndown), dtype)
-#
-# det setup_buffers_plain(dev, ndet, nsub, nsamp, dtype=np.float32):
-#   dev.pools["tod"] .empty((ndet,nsamp), dtype)
-#   dev.pools["ft"]  .empty((ndet,nsamp), dtype)
-#   dev.pools["pointing"].empty((3,ndet,nsamp), dtype)
-#   dev.pools["rtod"] = dev.pools["tod"]
-#   dev.pools["rft"]  = dev.pools["ft"]
-#
-# First step would be to estimate useful values for ndet, nsub, nsamp and ndown
-# The simplest if, slightly wasteful, is to let ndet = max(ndets), nsamp = max(nsamps).
-# gutils.obs_group_size would also know the differenc between ndets and nsubs.
-# For ndown, we would need to know how much downsampling there will be.
-# That depends on the hwp speed. Is this available in obsdb?
+# This one is not robust to bright signals like planets.
+# Trying to map a planet would see the detectors that see it
+# disqualified for being too noisy. The good thing about
+# this version is that it's robust to the hwp
+def measure_rms_ft(ftod, dt=1, fmin=30, fmax=100):
+	fnyq = 0.5/dt
+	imin = utils.ceil (ftod.shape[-1] * fmin/fnyq)
+	imax = utils.floor(ftod.shape[-1] * fmax/fnyq)
+	fsub = ftod[:,imin:imax]
+	rms  = np.std(fsub,-1)*(dt/fsub.shape[-1])**0.5 * ftod.shape[-1]
+	return rms
 
-def get_full_ndet(ndet, post):
-	if post and post.demod: return ndet*len(post.comps)
-	else: return ndet
+# This one is robust to planets, but fails in the
+# presence of a hwp, since all the blocks would be
+# impacted.
+def measure_rms(tod, dt=1, bsize=32, nblock=10):
+	ap  = device.anypy(tod)
+	tod = tod[:,:tod.shape[1]//bsize*bsize]
+	tod = tod.reshape(tod.shape[0],-1,bsize)
+	bstep = max(1,tod.shape[1]//nblock)
+	tod = tod[:,::bstep,:][:,:nblock,:]
+	rms = ap.median(ap.std(tod,-1),-1)
+	# to µK√s units
+	rms *= dt**0.5
+	return rms
 
-def demodulate(data, frel=1, comps="TQU", mul=32, dev=None):
-	# Ok, if we get here, then we can demodulate
-	if dev is None: dev = device.get_device()
-	ncomp        = len(comps)
-	ndet, insamp = data.tod.shape
-	duration     = data.ctime[-1]-data.ctime[0]
-	srate        = (insamp-1)/duration
-	dtype        = data.tod.dtype
-	ctype        = utils.complex_dtype(dtype)
-	# Estimate hwp rotation speed. A bit inefficient, but we don't
-	# require it to be unwound. Should I guarantee that it's unwound
-	# after calibration? The disadvantage is that this reduces precision,
-	# since float32 has 7 digits of precision, and the integer part can
-	# take up 3-4 of those digits, leaving only 3-4 for the important
-	# fractional part. To avoid this, the hwp angle would need to be
-	# double precision.
-	diffs = dev.np.diff(data.hwp)
-	speed = dev.np.mean(diffs[dev.np.abs(diffs)<dev.np.pi])*srate
-	fhwp  = np.abs(speed/(2*np.pi))
-	# Find the last index where we complete a full revolution. We want
-	# a whole number of rotations to avoid fourier bleeding. The cost of truncating
-	# would be at most 0.5 s
-	intrunc = gutils.find_last_crossing(data.hwp, data.hwp[0])
-	# Find our output number of samples. This is ideally determined by
-	# ofmax, but we are also restricted by fourier and mapmaking
-	# considerations via mul
-	ofmax   = float(frel*fhwp)
-	ifmax   = srate/2
-	onsamp  = fft.fft_len(utils.nint(intrunc*ofmax/ifmax/mul), factors=dev.lib.fft_factors)*mul
-	# Prepare our resampling. For the tod we use fft-resampling. For the others, we use
-	# linear interpolation. Averaging would be better, but these are smooth functions so
-	# it should be good enough
-	linresamp = gutils.LinResamp(intrunc, onsamp)
-	# Prepare our output detectors. Our output data will have 2 or 3 times
-	# as many detectors as we started with, since demodulation lets us recover
-	# a T, Q and U-timestream from a single detector.
-	assert comps == "TQU" or comps == "QU"
-	detnames = []
-	detids   = []
-	modfuns  = []
-	if "T"  in comps:
-			detnames.append(np.char.add(data.dets,   "_0"))
-			detids  .append(np.char.add(data.detids, "_0"))
-			# 0.5 compensates for the multiplication by 2 later
-			modfuns .append(lambda x:dev.np.full_like(x, 0.5))
-	if "QU" in comps:
-			detnames.append(np.char.add(data.dets,   "_1"))
-			detnames.append(np.char.add(data.dets,   "_2"))
-			detids  .append(np.char.add(data.detids, "_1"))
-			detids  .append(np.char.add(data.detids, "_2"))
-			modfuns .append(dev.np.cos)
-			modfuns .append(dev.np.sin)
-	ndup    = len(modfuns)
-	odets   = np.concatenate(detnames)
-	odetids = np.concatenate(detids)
-	# Construct an output data with the given downsampling and detector duplication
-	odata = bunch.Bunch()
-	odata.dets   = odets
-	odata.detids = odetids
-	odata.ctime  = linresamp(data.ctime[:intrunc])
-	odata.hwp    = None # already handled
-	odata.point_offset = utils.repeat(data.point_offset, ndup, axis=0)
-	odata.bands     = utils.repeat(data.bands, ndup)
-	odata.polangle  = np.zeros(   len(odets) , dtype) # filled below
-	odata.response  = np.zeros((2,len(odets)), dtype) # filled below
-	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
-	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1,:intrunc])) # az
-	odata.boresight[0] = linresamp(data.boresight[0,:intrunc]) # el
-	odata.boresight[2] = linresamp(data.boresight[2,:intrunc]) # roll
-	# Resample cuts, and duplicate them across the virtual detectors
-	recuts      = data.cuts.to_sampcut()[:,:intrunc].to_simple().resample(onsamp).simplify()
-	odata.cuts  = socut.Simplecut.detcat([recuts]*len(modfuns))
-	odata.tod   = dev.pools["dtod"].zeros((len(odets),onsamp), dtype) # filled below
-	# Ok, here comes the actual demodulation part
-	hwp = dev.np.array(data.hwp[:intrunc].astype(dtype))
-	for i, fun in enumerate(modfuns):
-		carrier = fun(4*hwp)
-		work    = dev.pools["wtod"].array(data.tod[:,:intrunc])
-		# Modulate
-		work    *= carrier
-		gutils.deslope(work, dev=dev, inplace=True)
-		# Fourier-truncate. This step actually performs the filtering/downsampling
-		# Sadly the ft must be contiguous, so we need a work buffer. We use our
-		# tod work buffer for this, since its info has been transferred to fourier
-		# space by then
-		ftod    = dev.pools["ft"].empty((ndet, intrunc//2+1), ctype)
-		dev.lib.rfft(work, ftod)
-		ftod    = dev.pools["ft"].array(dev.pools["wtod"].array(ftod[:,:onsamp//2+1]))
-		ftod   *= 2/intrunc
-		# can finally transform back
-		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
-	odata.cuts.gapfill(odata.tod, dev=dev)
-	gutils.deslope(odata.tod, dev=dev, inplace=True, w=100)
-	# T-detectors have response [1,0,0]
-	if comps == "TQU": odata.response[0,:ndet] = 1
-	elif comps != "QU": raise ValueError("Only comps='TQU' and comps='QU' supported")
-	# cos-detectors have response [0,+detQ,-detU]
-	# Equivalent to -ang
-	odata.polangle[-2*ndet:-ndet] = -data.polangle
-	# sin-detectors have response [0,+detU,+detQ]
-	# Equivalent to (-(2*ang-pi/4)+pi/4)/2 = pi/4-ang
-	odata.polangle[-ndet:] = np.pi/4-data.polangle
-	odata.response[1,-2*ndet:] = 1
-	# Everything else will be simply copied over
-	for key in data:
-		if key not in odata:
-			odata[key] = data[key]
-	return odata
-
-def downsample(data, fsamp=None, down=None, mul=32, dev=None):
-	"""Downsample data either by the given down-factor, or to the given sample rate fsamp.
-	Uses fourier-resampling for the tod, and linear resampling for the rest. The actual
-	sample rate will be adjusted slightly to still be fourier- and gpu-friendly."""
-	# Ok, if we get here, then we can demodulate
-	if dev is None: dev = device.get_device()
-	ndet, insamp = data.tod.shape
-	duration     = data.ctime[-1]-data.ctime[0]
-	srate        = (insamp-1)/duration
-	dtype        = data.tod.dtype
-	ctype        = utils.complex_dtype(dtype)
-	# Get our target sample rate
-	if fsamp is None: fsamp = srate/down
-	# Find our output number of samples. This is ideally determined by
-	# fsamp, but we are also restricted by fourier and mapmaking
-	# considerations via mul
-	onsamp  = fft.fft_len(utils.nint(insamp*fsamp/srate/mul), factors=dev.lib.fft_factors)*mul
-	# Prepare our resampling. For the tod we use fft-resampling. For the others, we use
-	# linear interpolation. Averaging would be better, but these are smooth functions so
-	# it should be good enough
-	linresamp = gutils.LinResamp(insamp, onsamp)
-	# Construct an output data with the given downsampling and detector duplication
-	odata = bunch.Bunch()
-	odata.ctime  = linresamp(data.ctime)
-	odata.boresight = np.zeros((3,onsamp), data.boresight.dtype)
-	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1])) # az
-	odata.boresight[0] = linresamp(data.boresight[0]) # el
-	odata.boresight[2] = linresamp(data.boresight[2]) # roll
-	# Resample cuts, and duplicate them across the virtual detectors
-	odata.cuts  = data.cuts.to_sampcut().to_simple().resample(onsamp).simplify().to_simple()
-	# Resample the tod
-	work    = dev.pools["wtod"].array(data.tod)
-	ftod    = dev.pools["ft"].empty((ndet, data.tod.shape[-1]//2+1), ctype)
-	dev.lib.rfft(work, ftod)
-	ftod    = dev.pools["ft"].array(dev.pools["wtod"].array(ftod[:,:onsamp//2+1]))
-	ftod   *= 2/insamp
-	# can finally transform back
-	odata.tod = dev.pools["dtod"].zeros((ndet,onsamp), dtype)
-	dev.lib.irfft(ftod, odata.tod)
-	# Everything else will be simply copied over
-	for key in data:
-		if key not in odata:
-			odata[key] = data[key]
-	return odata
+def det_intersect(dets1, dets2):
+	if dets1 is None: return dets2
+	if dets2 is None: return dets1
+	return np.unique(np.concatenate([dets1,dets2]))

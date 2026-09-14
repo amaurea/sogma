@@ -18,47 +18,24 @@ from . import device
 # database, so having them as independent functions is wasteful. Let's make a
 # class that can be queried.
 
-# FIXME: SimpleLoader and SotodlibLoader are out of date.
-# Misisng new query system, load_multi and det-restriction
-
-def Loader(dbfile, type="auto", dev=None, mul=32):
+def get_loader(dbfile, type="auto", group="obs", split=None, tsplit=None, fast_fail=False, dev=None, dtype=np.float32):
+	plain = type.endswith("-")
+	if plain: type = type[:-1]
 	if type == "auto":
-		if dbfile.endswith(".txt"): type = "simple"
+		if dbfile.endswith("npy"): type = "simple"
 		else: type = "sofast"
 	if type == "simple":
 		from .loaders.simple import SimpleLoader
-		return SimpleLoader(dbfile, dev=dev, mul=mul)
+		loader = SimpleLoader(dbfile, dev=dev, dtype=dtype)
 	elif type == "sofast":
 		from .loaders.sofast import SoFastLoader
-		return SoFastLoader(dbfile, dev=dev, mul=mul)
+		loader = SoFastLoader(dbfile, dev=dev, dtype=dtype)
 	elif type == "soslow":
-		from .loaders.soslow import SotodlibLoader
-		return SotodlibLoader(dbfile, dev=dev, mul=mul)
-	else: raise ValueError("Unrecognized loader type '%s'" % str(type))
-
-def get_filelist(ifiles):
-	fnames = []
-	for gfile in ifiles:
-		for ifile in sorted(utils.glob(gfile)):
-			if ifile.startswith("@"):
-				with open(ifile[1:],"r") as f:
-					for line in f:
-						fnames.append(line.strip())
-			else:
-				fnames.append(ifile)
-	return fnames
-
-def check_data_requirements(data, dev=None):
-	# The fields that have strict type/contig requirements
-	if dev is None: dev = device.get_device()
-	fields = [
-		["tod", dev.np.ndarray, 2, np.float32],
-	]
-	for fname, typ, ndim, dtype in fields:
-		d = data[fname]
-		if not isinstance(d, typ):
-			raise ValueError("Field %s type %s is not a subtype of %s" % (fname, str(type(d)), str(typ)))
-		if d.ndim != ndim:
-			raise ValueError("Field %s ndim %d != %d" % (fname, d.ndim, ndim))
-		if d.dtype != dtype:
-			raise ValueError("Field %s dtype %s != %s" % (fname, str(d.dtype), str(dtype)))
+		raise NotImplementedError
+	else:
+		raise ValueError("Unrecognized loader type '%s'" % str(type))
+	# Wrap in post-loader unless plain
+	if not plain:
+		from .loaders.post import PostLoader
+		loader = PostLoader(loader, group=group, split=split, tsplit=tsplit, fast_fail=fast_fail, dev=dev)
+	return loader

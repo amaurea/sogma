@@ -36,6 +36,10 @@ class MMDeviceMinimal(device.DeviceCpu):
 			return fft.irfft(dat, tod=out, axes=axis, n=n, normalize=False)
 		self.lib.irfft = irfft
 		self.lib.fft_factors = [2,3,5,7]
+		self.lib.bsize = 1
+		# This should be inherited instead duplicated
+		def goodlen(self, n, direction="below"):
+			return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 		# BLAS. May need to find a way to make this more compact if we need
 		# more of these functions
 		def gemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
@@ -98,6 +102,10 @@ try:
 				return gpu_mm.cufft.irfft(dat, out=out, axis=axis, n=n, plan=plan, plan_cache=plan_cache)
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
+			self.lib.bsize = 32
+			# This should be inherited instead duplicated
+			def goodlen(self, n, direction="below"):
+				return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 			# Tiling
 			self.lib.DynamicMap     = gpu_mm.DynamicMap
 			self.lib.LocalMap       = gpu_mm.LocalMap
@@ -200,6 +208,10 @@ try:
 				return fft.irfft(dat, tod=out, axes=axis, n=n, normalize=False)
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
+			self.lib.bsize = 1
+			# This should be inherited instead duplicated
+			def goodlen(self, n, direction="below"):
+				return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 			# Tiling
 			self.lib.DynamicMap     = cpu_mm.DynamicMap
 			self.lib.LocalMap       = cpu_mm.LocalMap

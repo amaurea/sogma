@@ -75,7 +75,7 @@ def lat_cut(obs, latrange, id="?", sys="gal", dev=None):
 	return [cuts]
 
 config.default("sun_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/sun.fits", "Location of Sun sidelobe mask")
-config.default("moon_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/moon.fits", "Location of Sun sidelobe mask")
+config.default("moon_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/moon.fits", "Location of Moon sidelobe mask")
 sidelobe_cutters = {}
 def sidelobe_cut(obs, id="?", object_list=None, geo=None, dev=None):
 	if object_list is None: object_list = ["sun", "moon"]

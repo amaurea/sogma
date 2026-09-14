@@ -6,7 +6,7 @@ from .socommon import srange_chain, srange_expand
 
 config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
 config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")
-config.default("down", 0.0, "Downsampling factor. Set to 0 or 1 to disable downsampling")
+config.default("down", 1.0, "Downsampling factor. Set to 0 or 1 to disable downsampling")
 
 class PostLoader(socommon.Loader):
 	"""Uses the memory pools tod, ft, wtod, dtod. The last 3 only if demod/down. Pass pool_map
@@ -60,6 +60,9 @@ class PostLoader(socommon.Loader):
 		# We do this because the obsinfo we expose refers to the fully processed tods, not the underlying raw ones
 		obsinfo.nsamp = utils.nint(obsinfo.nsamp/post.downfact[ind_map])
 		obsinfo.ndet *= post.detfact
+		# Make our sub-loader aware of our samprange plans. Used only for
+		# preallocation
+		linfo.maxnsamp = np.max(sampranges[:,1]-sampranges[:,0])
 		# Build the final it→id map
 		imap = [joint.groups[ind] for ind in ind_map]
 		# sampranges refers to the raw subobs ranges we want. It has the same length as obsinfo,
@@ -169,20 +172,22 @@ class PostLoader(socommon.Loader):
 		obs.errors = list(zip(pinfo.eids, pinfo.exceptions))
 		return obs
 	def prealloc(self, linfo):
-		linfo.sublinfo.prealloc()
 		def s(ndet, nsamp): return utils.ceil(np.max(ndet*(nsamp+2))) # fourier-safe size
 		# Max size of our output tod
 		obsinfo = linfo.obsinfo
-		nout = s(obsinfo.ndet, obsinfo.nsamp)
+		nsamp = np.minimum(obsinfo.nsamp, linfo.maxnsamp)
+		nout = s(obsinfo.ndet, nsamp)
 		# max size of full processed subobs. Differs from nout by having fewer dets
-		nper = s(obsinfo.ndet/linfo.detfact, obsinfo.nsamp)
+		nper = s(obsinfo.ndet/linfo.detfact, nsamp)
 		# max size of raw output from subloader
-		nsub = s(obsinfo.ndet/linfo.detfact, obsinfo.nsamp*linfo.downfact)
+		nsub = s(obsinfo.ndet/linfo.detfact, nsamp*linfo.downfact)
 		self.pool("tod").empty(nout, dtype=self.dtype)
-		if linfo.demod or linfo.down:
+		if linfo.demod or linfo.down != 1:
 			self.pool("wtod").empty(nsub, dtype=self.dtype)
 			self.pool("dtod").empty(nper, dtype=self.dtype)
 			self.pool("ft")  .empty(nper, dtype=self.dtype)
+		# Let our sub-loader preallocate too
+		linfo.sublinfo.prealloc()
 
 class PostLoadInfo(socommon.LoadInfo):
 	"""Class representing a set of observations to load, and metadata needed to load it.

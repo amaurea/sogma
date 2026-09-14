@@ -47,6 +47,10 @@ class LoadInfo:
 		# Detector restriction
 		self.dets    = dets
 		self.detids  = detids
+		# Assume future samprange restrictions will cause no more than
+		# this many samples to be read in. Used in prealloc. This is
+		# inelegant...
+		self.maxnsamp = (1<<31)-1
 		if omap is None:
 			omap = {id:oi for oi,id in enumerate(obsinfo.id)}
 		self.omap    = omap

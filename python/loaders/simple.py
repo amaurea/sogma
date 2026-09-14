@@ -33,7 +33,8 @@ class SimpleLoader(socommon.Loader):
 		def s(ndet, nsamp): return utils.ceil(np.max(ndet+(nsamp+2))) # fourier-safe size
 		# Max size of our output tod
 		obsinfo = linfo.obsinfo
-		nout = s(obsinfo.ndet, obsinfo.nsamp)
+		nsamp = np.minimum(obsinfo.nsamp, linfo.maxnsamp)
+		nout = s(obsinfo.ndet, nsamp)
 		self.pool("tod").empty(nout, dtype=self.dtype)
 
 class SimpleLoadInfo(socommon.LoadInfo): pass

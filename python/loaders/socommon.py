@@ -7,19 +7,22 @@ from . import minisotodlib
 # Base loading classes
 
 class Loader:
-	def __init__(self, dev=None, pool_map={}, catch="expected", dtype=np.float32):
+	def __init__(self, dev=None, pool_map={}, dtype=np.float32):
 		self.dev      = dev or device.get_device()
 		self.pool_map = pool_map
-		self.catch    = catch
-		self.etypes   = catch_types[catch]
 		self.dtype    = dtype
 	def query(self, query=None):
 		raise NotImplementedError
-	def probe(self, linfo, id, dets=None, detids=None)
+	def probe(self, linfo, id, dets=None, detids=None):
 		raise NotImplementedError
 	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
 		raise NotImplementedError
-	def group_obs(self, obsinfo, mode="obs"):
+	# Grouping doesn't really belong here. What would make more sense would be
+	# something like classify_obs, which would return a list of tags per obs.
+	# Or maybe this should already be a part of what query handles. Instead of
+	# parsing obsids, would be nice to have these things simply available as tags.
+	# Oh well, leaving it for now.
+	def group_obs(self, linfo, mode="obs"):
 		raise NotImplementedError
 	def prealloc(self, linfo):
 		raise NotImplementedError
@@ -27,7 +30,10 @@ class Loader:
 		for typname, bufname in self.pool_map:
 			if bufname in names:
 				self.pool_map[typname] = bufname + '*'
-	def pool(self, name): return self.dev.pools[self.pool_map[name]]
+	def pool(self, name):
+		try: name = self.pool_map[name]
+		except KeyError: pass
+		return self.dev.pools[name]
 
 class LoadInfo:
 	"""Class representing a set of observations to load, and metadata needed to load it.
@@ -43,15 +49,16 @@ class LoadInfo:
 	def nobs(self): return len(self.obsinfo)
 	def probe(self, id, dets=None, detids=None):
 		return self.loader.probe(self, id, dets=dets, detids=detids)
-	def load(self, id, dets=None, detids=None, samprange=None):
-		return self.loader.load(self, id, dets=dets, detids=detids, samprange=samprange)
+	def load(self, id, dets=None, detids=None, samprange=None, pinfo=None):
+		return self.loader.load(self, id, dets=dets, detids=detids, samprange=samprange, pinfo=pinfo)
 	def prealloc(self):
 		return self.loader.prealloc(self)
 	def copy(self): return copy.copy(self)
-	def getitem(self, sel):
+	def __getitem__(self, sel):
 		# Generic slice that should work for most subclasses
 		res = self.copy()
 		res.obsinfo = self.obsinfo[sel]
+		res.omap    = {id:oi for oi,id in enumerate(res.obsinfo.id)}
 		return res
 
 class ProbeInfo:
@@ -65,7 +72,7 @@ class ProbeInfo:
 
 def srange_suffix(id, srange):
 	if srange is None: return id
-	else: return id + "," + "%d:%d" % list(srange)
+	else: return id + "," + "%d:%d" % tuple(srange)
 
 def srange_trunc(srange, dev):
 	srange = np.array(srange)

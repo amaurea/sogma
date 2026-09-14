@@ -10,6 +10,8 @@ class SignalOrderError(Exception): pass
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
 
+def parse_slice(string): return eval("np.s_[%s]" % string)
+
 def blockify(tod, bsize=10):
 	nblock = tod.shape[-1]//bsize
 	return tod[...,:nblock*bsize].reshape(tod.shape[:-1]+(nblock,bsize))

@@ -1,7 +1,7 @@
 import numpy as np, os, warnings
 import time, h5py
 from pixell import utils, bunch, enmap, colors, wcsutils, bench, config
-from . import nmat, pmat, tiling, gutils, device, socal
+from . import nmat, pmat, tiling, gutils, device, socal, errors
 from .logging import L
 
 # Prior handling
@@ -1496,6 +1496,17 @@ class TDumper:
 	def write(self, prefix, ctime, dettod):
 		np.savetxt(prefix + ".txt", np.concatenate([ctime[None], dettod],0).T, fmt="%20.12e")
 
+catch_map = {
+		"none":     (),
+		"load":     (errors.LoadError,),
+		"recover":  (errors.RecoverableError,),
+		"expected": (errors.ExpectedError,),
+		"all":      (Exception,),
+}
+
+def make_catch_list(ignore):
+	return sum([catch_map[tok] for tok in ignore.split(",")],())
+
 # Mapmaking function
 def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, signal_guess=None, restart=False):
 	if prefix is None: prefix = ""
@@ -1506,11 +1517,7 @@ def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], max
 	# Inds is a list of indices into obsinfo that this task will handle
 	if inds is None: inds = distribute_tasks(loadinfo.obsinfo, comm)
 	# Set up exception types we will ignore
-	if   ignore == "all":     etypes, load_catch = (Exception,), "all"
-	elif ignore == "missing": etypes, load_catch = (utils.DataMissing,), "expected"
-	elif ignore == "recover": etypes, load_catch = (utils.DataMissing, gutils.RecoverableError), "all"
-	elif ignore == "none":    etypes, load_catch = (), "none"
-	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
+	catch = make_catch_list(ignore)
 	# Accept either a list of integers or a single integer
 	try: dump = list(dump)
 	except TypeError: dump = [dump]
@@ -1525,12 +1532,12 @@ def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], max
 		id     = loadinfo.obsinfo.id[ind]
 		try:
 			data  = loadinfo.load(id, dets=dets, detids=detids)
-		except etypes as e:
-			L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
+		except catch as e:
+			L.print("Skipped %d %s: %s" % (ind, id, str(e)), level=2, color=colors.red)
 			continue
 		if len(data.errors) > 0:
 			# Partial skip
-			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
+			L.print("Skipped parts %s" % format_nested_errors(data.errors), level=2, color=colors.red)
 		# Do configurable autocuts that are indpendent of the loading method here.
 		# Might want to wrap it into some higher-level load function.
 		# Autocut and gapfill cost about the same as add_obs, so they definitely
@@ -1540,11 +1547,11 @@ def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], max
 		tdumper.write_data(ind, data.tod, "load")
 		# FIXME: Move at least some of the autocal stuff to the loader, including
 		# the sidelobe cut
-		socal.autocut(data, dev=dev, id=name)
+		socal.autocut(data, dev=dev, id=id)
 		data.fill.gapfill(data.tod, dev=dev)
 		tdumper.write_data(ind, data.tod, "socut")
 		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
-		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
+		socal.autocal(data, prefix=prefix + id.replace(":","_") + "_", dev=dev)
 		tdumper.write_data(ind, data.tod, "socal")
 		t3    = time.time()
 		try:
@@ -1641,7 +1648,7 @@ def make_maps_perobs(mapmaker, loadinfo, comm, comm_per, inds=None, prefix=None,
 	# Map indivdual tods
 	for ind in inds:
 		subpre  = prefix + obsinfo.id.replace(":","_") + "_"
-		L.print("Mapping %s" % name)
+		L.print("Mapping %s" % obsinfo.id)
 		make_map(mapmaker, loadinfo, comm_per, prefix=subpre, dump=dump, inds=[ind], npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids, restart=restart)
 
 config.default("depth1_maxdur", 24, "Max duration in hours for depth-1 maps. Lower values use less memory to store maps. Longer than 24 hours would no longer be depth-1")
@@ -1693,11 +1700,7 @@ def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 	if prefix is None: prefix = ""
 	if inds is None: inds = np.arange(comm.rank, loadinfo.nobs, comm.size)
 	# Set up exception types we will ignore
-	if   ignore == "all":     etypes = (Exception,)
-	elif ignore == "missing": etypes = (utils.DataMissing,)
-	elif ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
-	elif ignore == "none":    etypes = ()
-	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
+	catch = make_catch_list(ignore)
 	if dev is None: dev = device.get_device()
 	obsinfo = loadinfo.obsinfo
 	# Set up memory pools. Setting these up before-hand is
@@ -1711,12 +1714,12 @@ def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 		t1     = dev.time()
 		try:
 			data = loadinfo.load(id, dets=dets, detids=detids)
-		except etypes as e:
+		except catch as e:
 			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
 			continue
 		if len(data.errors) > 0:
 			# Partial skip
-			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
+			L.print("Skipped parts %s" % format_nested_errors(data.errors), level=2, color=colors.red)
 		t2 = dev.time()
 		# We usually want to downsample quite a lot to avoid the movies being uselessly slow
 		# TODO: Should move this into gutils or something
@@ -1772,7 +1775,7 @@ def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 		del data
 		tread = t2-t1
 		tdown = t3-t2
-		L.print("Processed %s in %6.3f. Read %6.3f down %6.3f proj %6.3f write %6.3f" % (name, t7-t1, tread, tdown, tproj, twrite), level=2)
+		L.print("Processed %s in %6.3f. Read %6.3f down %6.3f proj %6.3f write %6.3f" % (id, t7-t1, tread, tdown, tproj, twrite), level=2)
 
 class SimpleLoader:
 	def __init__(self, fname_fun=None, empty_fun=None):
@@ -1822,30 +1825,16 @@ class SimpleLoader:
 		# Benchmarking
 		bench.set_tfun(dev.time)
 		# Set up our data loader
-		loader  = loading.Loader(args.context, type=args.loader, dev=dev)
-		obsinfo = loader.query(args.query)
-		if len(obsinfo) == 0:
+		loader = loading.Loader(args.context, type=args.loader, dev=dev)
+		linfo  = loader.query(args.query)
+		linfo  = linfo[gutils.parse_slice(args.sel)]
+		if len(linfo.nobs) == 0:
 			L.print("No tods selected", level=0, id=0, color=colors.red)
-			raise utils.DataMissing("No data selected")
+			raise errors.NothingLeft("No data selected")
 		# Optional detector restriction
 		dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
 		detids = gutils.read_detnames(args.detids) if args.detids is not None else None
-		# joint gives subobs to map jointly. It has entries
-		# .names[ngroup]     Name of each group
-		# .groups[ngroup][:] Indices into obsinfo for ach group member
-		# .bands[nband]      List of bands involved
-		# .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
-		joint   = loader.group_obs(obsinfo, mode=args.joint)
-		ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-		post    = mapmaking.post_settings(ginfo)
-		joint   = gutils.time_split(joint, ginfo, post=post, maxsize=args.split*1e9, maxdur=args.tsplit)
-		#joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
-		# group selection. Sadly this can't be done with the query-level selection, as that
-		# happens before grouping.
-		jinds   = eval("list(range(%d))[%s]" % (len(joint.groups), args.sel))
-		joint   = gutils.select_groups(joint, jinds)
-		ngroup  = len(joint.groups)
-		L.print("Processing %d tods with %d mpi tasks" % (ngroup, self.comm.size), level=0, id=0, color=colors.lgreen)
+		L.print("Processing %d tods with %d mpi tasks" % (linfo.nobs, self.comm.size), level=0, id=0, color=colors.lgreen)
 		prefix = args.odir + "/"
 		if args.prefix: prefix += args.prefix + "_"
 		utils.mkdir(args.odir)
@@ -1856,122 +1845,63 @@ class SimpleLoader:
 		# Useful to have in log-files too
 		L.print(" ".join(sys.argv), level=0, id=0, color=colors.lgreen)
 		# Set up exception types we will ignore
-		if   args.ignore == "all":     etypes = (Exception,)
-		elif args.ignore == "missing": etypes = (utils.DataMissing,)
-		elif args.ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
-		elif args.ignore == "none":    etypes = ()
-		else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
+		catch = make_catch_list(args.ignore)
 		if dev is None: dev = device.get_device()
 		# Register interface
 		locs = locals()
-		for name in ["args", "dev", "loader", "L", "verbosity", "obsinfo", "joint", "post", "ginfo", "etypes", "dets", "detids", "prefix"]:
+		for name in ["args", "dev", "linfo", "L", "verbosity", "catch", "dets", "detids", "prefix"]:
 			setattr(self, name, locs[name])
-	def get_obs(self, ind):
-		name   = self.joint.names[ind]
-		subids = self.obsinfo.id[self.joint.groups[ind]]
-		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, post=self.demod)
+	def get_obs(self, ind=0, id=None):
+		if id is None: id = self.linfo.obsinfo.id[ind]
+		return self.lilnfo.load(id, dets=self.dets, detids=self.detids)
 	def obs_iter(self, inds=None, fname_fun=None, empty_fun=None):
 		from . import tiling
 		if fname_fun is None: fname_fun = self.fname_fun
 		if empty_fun is None: empty_fun = self.empty_fun
-		if empty_fun is None: empty_fun = lambda self,name: fname_fun(self,name).replace(".txt", ".empty")
-		if inds is None:
-			# Use the first entry in groups as representative
-			gfirst = np.array([g[0] for g in self.joint.groups])
-			dist = tiling.distribute_tods_simple(self.obsinfo[gfirst], self.comm.size)
-			inds = np.where(dist.owner == self.comm.rank)[0]
+		if empty_fun is None: empty_fun = lambda self,id: fname_fun(self,id).replace(".txt", ".empty")
 		for ind in inds:
-			name   = self.joint.names[ind]
-			subpre = self.prefix + name.replace(":","_") + "_"
-			if self.args.cont and fname_fun and (os.path.isfile(fname_fun(self, name)) or os.path.isfile(empty_fun(self, name))):
-				L.print("Skipped %s: done" % (name), level=2, color=colors.gray)
+			id = self.linfo.obsinfo.id[ind]
+			subpre = self.prefix + id.replace(":","_") + "_"
+			if self.args.cont and fname_fun and (os.path.isfile(fname_fun(self, id)) or os.path.isfile(empty_fun(self, id))):
+				L.print("Skipped %s: done" % (id), level=2, color=colors.gray)
 				continue
 			try:
 				obs = self.get_obs(ind)
-				yield bunch.Bunch(obs=obs, ind=ind, name=name, subpre=subpre)
+				yield bunch.Bunch(obs=obs, ind=ind, id=id, subpre=subpre)
 				del obs
-			except self.etypes as e:
-				if empty_fun: utils.touch(empty_fun(self, name))
-				L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
+			except self.catch as e:
+				if empty_fun: utils.touch(empty_fun(self, id))
+				L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
 
 config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
-def distribute_tasks(obsinfo, joint, comm, taskdist=None):
+def distribute_tasks(obsinfo, comm, taskdist=None):
 	# FIXME: This doesn't know about the coordinate system we're using!
 	# It assumes equatorial coordinates.
 	taskdist = config.get("taskdist", taskdist)
-	gfirst   = np.array([g[0] for g in joint.groups])
-	weight   = tiling.get_weight_detsamps(obsinfo, joint=joint)
+	weight   = obsinfo.ndet.astype(int)*obsinfo.nsamp
 	if taskdist == "simple":
-		dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
+		dist = tiling.distribute_tods_simple(obsinfo, comm.size)
 	elif taskdist == "ra0":
-		dist = tiling.distribute_tods_ra_plain(obsinfo[gfirst], comm.size)
+		dist = tiling.distribute_tods_ra_plain(obsinfo, comm.size)
 	elif taskdist == "ra":
-		dist = tiling.distribute_tods_ra(obsinfo[gfirst], comm.size, weight)
+		dist = tiling.distribute_tods_ra(obsinfo, comm.size, weight)
 	elif taskdist == "semibrute":
-		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size, weight)
+		dist = tiling.distribute_tods_semibrute(obsinfo, comm.size, weight)
 	else:
 		raise ValueError("Unrecognized task distribution method '%s'" % str(taskdist))
 	inds = np.where(dist.owner == comm.rank)[0]
 	return inds
 
-def setup_buffers(dev, ginfo, post=None, dtype=np.float32, nopoint=False):
-	# Need to know if we're demodulating, since if affects buffer sizes
-	post = post_settings(ginfo, post)
-	ctype = utils.complex_dtype(dtype)
-	# ndown is the post-demodulation sample count
-	if post.demod:
-		dmul   = len(post.comps)
-		ndown  = utils.ceil(ginfo.nsamp*np.abs(ginfo.fhwp)/ginfo.fsamp)
-	else:
-		dmul  = 1
-		ndown = ginfo.nsamp
-	if post.down:
-		ndown = utils.ceil(ndown/post.down)
-	ndet   = ginfo.ndet*dmul
-	nf     = ginfo.nsamp//2+1
-	nfdown = ndown//2+1
-	ndet_ndown = np.max(ndet*ndown)
-	nsub_nsamp = np.max(ginfo.nsub*ginfo.nsamp)
-	nsub_ndown = np.max(ginfo.nsub*ndown)
-	ndet_nfdown= np.max(ndet*nfdown)
-	nsub_nf    = np.max(ginfo.nsub*nf)
-	# Pools for main analysis. These are not used for scratch during loading,
-	# except for the final load_multi
-	dev.pools["tod"].empty(ndet_ndown,  dtype=dtype)
-	if not nopoint: dev.pools["pointing"].empty((3, ndet_ndown), dtype=dtype)
-	# Pools used when reading in data
-	dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
-	if post.demod:
-		#dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
-		dev.pools["wtod"].empty(nsub_nsamp,      dtype=dtype)
-		dev.pools["dtod"].empty(nsub_ndown*dmul, dtype=dtype)
-	else:
-		# HACK: overlay the itod on pointing. This will work fine as long
-		# as they aren't used at the same time, which is currently the case,
-		# and as long as swap isn't used with them
-		#dev.pools.pools["itod"] = dev.pools.pools["pointing"].proxy("itod")
-		pass
-	# Pools for fourier transforms. ft will be used both for the full-res per-subid data
-	# and the potentiallyd emodulated full data
-	dev.pools["ft"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
-	dev.pools["fft_scratch"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
-
-def trivial_joint(obsinfo):
-	"""Make a group-info corresponding to a no grouping"""
-	groups=[[i] for i in range(len(obsinfo))]
-	return bunch.Bunch(groups=groups, names=obsinfo.id, sampranges=[None for i in range(len(obsinfo))])
-
-config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
-config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")
-config.default("down", 0.0, "Downsampling factor. Set to 0 to disable downsampling")
-
-def post_settings(ginfo, demod=None, comps=None, down=None):
-	fhwp  = np.mean(np.abs(ginfo.fhwp))
-	return bunch.Bunch(
-		demod = gutils.check_demod(config.get("demod", demod), has_hwp=fhwp>0),
-		comps = config.get("comps", comps),
-		down  = config.get("down", down) or None,
-	)
+# This should be moved into mapmaker.prealloc and signal.prealloc at some point,
+# similarly to how the loaders do it
+def setup_buffers(dev, obsinfo, dtype=np.float32, nopoint=False):
+	# +2 to also fit fft version
+	nflat = np.max(obsinfo.ndet*(obsinfo.nsamp+2))
+	dev.pools["tod"]        .empty(nflat,     dtype=dtype)
+	dev.pools["ft"]         .empty(nflat,     dtype=dtype)
+	dev.pools["fft_scratch"].empty(nflat,     dtype=dtype)
+	if not nopoint:
+		dev.pools["pointing"] .empty((3,nflat), dtype=dtype)
 
 # Zippers
 # These package our degrees of freedomf or the CG solver

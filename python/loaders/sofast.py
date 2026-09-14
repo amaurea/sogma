@@ -1,20 +1,20 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
 from pixell import utils, bunch, bench, sqlite, coordsys, config
-from .. import device, gutils, socut
+from .. import device, gutils, socut, errors
 from . import socommon, soquery, minisotodlib
 from .socommon import cmeta_lookup
 
-class SoFastLoader(Loader):
+class SoFastLoader(socommon.Loader):
 	"""Uses memory pools tod and ft"""
-	def __init__(self, context_or_config_or_name, dev=None, dtype=np.float32, catch="expected", pool_map={}):
-		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype, catch_catch)
+	def __init__(self, context_or_config_or_name, dev=None, dtype=np.float32, pool_map={}):
+		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype)
 		self.context   = socommon.get_expanded_context(context_or_config_or_name)
 		self.obsdb     = sqlite.open(self.context["obsdb"])
 		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
 		self.fast_meta = FastMeta(self.context)
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
-		self.tags      = socommon.get_tags(self.obsdb.conn)
+		self.tags      = soquery.get_tags(self.obsdb.conn)
 	def query(self, query=None):
 		res_db, pycode, slices = soquery.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
 		obsinfo = soquery.finish_query(res_db, pycode, slices)
@@ -25,10 +25,11 @@ class SoFastLoader(Loader):
 			meta = self.fast_meta.read(id, dets=dets, detids=detids)
 			if meta.aman.dets.count == 0:
 				raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
+		ind   = linfo.omap[id]
+		row   = linfo.obsinfo[ind]
 		# Find which time-range we cover. Natively sample 0:obsinfo.nsamp cover
 		# time obsinfo.ctime:obsinfo.ctime+obsinfo.dur, but we only use the range
 		# aman.samps.offset:aman.samps.offset+aman.samps.nsamp of this
-		row   = linfo.obsinfo[ind]
 		srate = (row.nsamp-1)/row.dur
 		t1    = row.ctime + meta.aman.samps.offset/srate
 		nsamp = meta.aman.samps.count
@@ -58,6 +59,8 @@ class SoFastLoader(Loader):
 		nout = s(obsinfo.ndet, obsinfo.nsamp)
 		self.pool("tod").empty(nout, dtype=self.dtype)
 		self.pool("ft") .empty(nout, dtype=self.dtype)
+	def group_obs(self, linfo, mode="obs"):
+		return socommon.group_obs(linfo.obsinfo, mode=mode)
 
 class SoFastLoadInfo(socommon.LoadInfo): pass
 
@@ -100,11 +103,9 @@ class FastMeta:
 	def read(self, subid, dets=None, detids=None):
 		obsid, wslot, band, det_type = split_subid(subid)
 		# Find which hdf files are relevant for this observation
-		try:
-			with bench.mark("fm_prepfile"):
-				prepfile,  prepgroup  = get_prepfile (self.prep_index,  subid)
-				dcalfile,  dcalgroup  = get_dcalfile (self.dcal_index,  subid)
-		except KeyError as e: raise utils.DataMissing(str(e))
+		with bench.mark("fm_prepfile"):
+			prepfile,  prepgroup  = get_prepfile (self.prep_index,  subid)
+			dcalfile,  dcalgroup  = get_dcalfile (self.dcal_index,  subid)
 		# 1. Get our starting set of detectors
 		with bench.mark("fm_dets"):
 			try: detinfo = self.det_cache.get_dets(subid)
@@ -184,15 +185,10 @@ class FastMeta:
 				paman.wrap("jumps_2pi",   read_cuts(pl, "jumps_2pi/jump_flag",  optional=optional), [(0,"dets"),(1,"samps")])
 				paman.wrap("jumps_slow",  read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
 				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional=optional), [(0,"dets"),(1,"samps")])
-
-			# TODO: Remove the noise_mapmaking part once the transition is complete
 			try:
 				good = np.diff(np.concatenate([[0],pl.read("valid_data/ends")])) > 0
 			except KeyError:
-				try:
-					good = np.diff(np.concatenate([[0],pl.read("valid_data/valid_data/ends")])) > 0
-				except KeyError:
-					good = np.diff(np.concatenate([[0],pl.read("noise_mapmaking/valid/ends")])) > 0
+				good = np.diff(np.concatenate([[0],pl.read("valid_data/valid_data/ends")])) > 0
 			paman.restrict("dets", paman.dets.vals[good])
 
 		# Eventually we will need to be able to read in sample-ranges.
@@ -764,7 +760,7 @@ class PointingModelCache:
 			# Look up row in table, and reformat it as bunch
 			#print("%s in pointing: %d" % (str(subid), str(subid) in match[1]))
 			try: row = match[2][match[1][str(subid)]]
-			except KeyError: raise ValueError("Missing pointing correction")
+			except KeyError: raise errors.DataMissing("Missing pointing correction")
 			return pointing_row_to_params(row)
 		else:
 			raise ValueError("Unrecognized PointingModelCache entry '%s'" % str(match[0]))
@@ -837,7 +833,7 @@ class AcalCache:
 		try: return self.cache[(fname, group, wafer, band)]
 		except KeyError: pass
 		# Couldn't find it!
-		raise ValueError("Couldn't find abscal for %.0f %s %s %s" % (t, stream_id, wafer, band))
+		raise errors.DataMissing("Couldn't find abscal for %.0f %s %s %s" % (t, stream_id, wafer, band))
 	def get_by_subid(self, subid, stream_id):
 		toks  = split_subid(subid)
 		ctime = float(toks.obsid.split("_")[1])
@@ -859,14 +855,14 @@ class AcalCache:
 #			bind[i] = bi
 
 def read_cuts(pl, path, optional=False):
-	catch = KeyError if optional else ()
 	try:
 		shape     = pl.read(path + "/shape")
 		edges     = pl.read(path + "/ends")
 		intervals = pl.read(path + "/intervals")
 		return expand_cuts_sampcut(shape, edges, intervals, inds = pl.inds)
-	except catch:
-		return socut.Sampcut.empty(pl.ndet, pl.nsamp)
+	except KeyError as e:
+		if optional: return socut.Sampcut.empty(pl.ndet, pl.nsamp)
+		else: raise errors.DataMissing("Missing cuts %s" % str(path))
 
 def expand_cuts_sampcut(shape, ends, intervals, inds=None):
 	if len(shape) != 2:
@@ -929,32 +925,32 @@ def get_prepfile(indexdb, subid):
 	else:
 		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' LIMIT 1;" % (toks.obsid, toks.wslot)
 	try: fname, gname = next(indexdb.execute(query))[:2]
-	except StopIteration: raise KeyError("%s not found in preprocess index" % subid)
+	except StopIteration: raise errors.DataMissing("%s not found in preprocess index" % subid)
 	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_dcalfile(indexdb, subid):
 	toks = split_subid(subid)
 	query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' LIMIT 1;" % (toks.obsid)
 	try: fname, gname = next(indexdb.execute(query))[:2]
-	except StopIteration: raise KeyError("%s not found in det_cal index" % subid)
+	except StopIteration: raise errors.DataMissing("%s not found in det_cal index" % subid)
 	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_matchfile(indexdb, detset):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:detset] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:detset] = '%s' LIMIT 1;" % (detset)
 	try: fname, gname = next(indexdb.execute(query))[:2]
-	except StopIteration: raise KeyError("%s not found in det match index" % detset)
+	except StopIteration: raise errors.DataMissing("%s not found in det match index" % detset)
 	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_smurffile(indexdb, detset):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:detset] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:detset] = '%s' LIMIT 1;" % (detset)
 	try: fname, gname = next(indexdb.execute(query))[:2]
-	except StopIteration: raise KeyError("%s not found in smurf index" % subid)
+	except StopIteration: raise errors.DataMissing("%s not found in smurf index" % subid)
 	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_wafer_file(waferdb, wafer_name):
 	query  = "SELECT files.name, dataset, file_id, files.id, [dets:stream_id] FROM map INNER JOIN files ON file_id = files.id WHERE [dets:stream_id] = '%s' LIMIT 1;" % (wafer_name)
 	try: fname, gname = next(waferdb.execute(query))[:2]
-	except StopIteration: raise KeyError("%s not found in wafer index" % wafer_name)
+	except StopIteration: raise errors.DataMissing("%s not found in wafer index" % wafer_name)
 	return os.path.join(os.path.dirname(waferdb.fname),fname), gname
 
 def get_acalfile(indexdb):
@@ -1166,15 +1162,6 @@ def fix_overpole(az, el, roll, inline=False):
 	az   += np.pi
 	roll += np.pi
 	return az, el, roll
-
-def format_multi_exception(exceptions, subids):
-	msgs   = np.array([str(ex) for ex in exceptions])
-	uvals, order, inds = utils.find_equal_groups_fast(msgs)
-	omsgs  = []
-	for ui, uval in enumerate(uvals):
-		mysubs = [subids[o] for o in order[inds[ui]:inds[ui+1]]]
-		omsgs.append(",".join(mysubs) + ": " + uval)
-	return ", ".join(omsgs)
 
 def detname2band(detnames):
 	return np.char.partition(np.char.partition(detnames, "_")[:,2],"_")[:,0]

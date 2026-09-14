@@ -126,7 +126,7 @@ class TileDistribution:
 		# latter could be part of
 		self.work  = bunch.Bunch(lp=lp)
 		self.work.cell_inds = lp.cell_offsets_cpu//self.tsize
-		self.work.ntile     = np.sum(self.work.cell_inds>=0)
+		self.work.ntile     = int(np.sum(self.work.cell_inds>=0))
 		self.work.shape     = (self.work.ntile,self.ncomp)+self.tshape
 		# Set up the distributed tile tiling
 		downer    = distribute_global_tiles_exposed_simple(self.work.cell_inds, comm)
@@ -443,23 +443,13 @@ def distribute_global_tiles_exposed_simple(loc_cells, comm):
 	owner[mask] = np.arange(nhit)*comm.size//nhit
 	return owner
 
-def get_weight_detsamps(obsinfo, joint=None):
-	if joint is None: return obsinfo.ndet.astype(int)*obsinfo.nsamp
-	ntot = []
-	for g in joint.groups:
-		ndet  = np.sum(obsinfo.ndet [g])
-		nsamp = np.sum(obsinfo.nsamp[g])
-		# int to get 8-byte, to avoid overflow
-		ntot.append(int(ndet)*nsamp)
-	return np.array(ntot)
-
-def distribute_tods_simple(obsinfo, nsplit, joint=None):
+def distribute_tods_simple(obsinfo, nsplit):
 	return bunch.Bunch(
 		owner   = np.arange(len(obsinfo))%nsplit,
 		weights = np.ones(nsplit),
 	)
 
-def distribute_tods_ra_plain(obsinfo, nsplit, joint=None, verbose=False):
+def distribute_tods_ra_plain(obsinfo, nsplit, verbose=False):
 	"""Split tods by the typical ra value without weighting."""
 	ra     = np.mean(obsinfo.sweep[:,:,0],-1)
 	order  = np.argsort(ra)

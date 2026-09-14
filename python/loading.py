@@ -18,7 +18,7 @@ from . import device
 # database, so having them as independent functions is wasteful. Let's make a
 # class that can be queried.
 
-def get_loader(dbfile, type="auto", group="obs", split=None, tsplit=None, dev=None, dtype=np.float32):
+def get_loader(dbfile, type="auto", group="obs", split=None, tsplit=None, fast_fail=False, dev=None, dtype=np.float32):
 	plain = type.endswith("-")
 	if plain: type = type[:-1]
 	if type == "auto":
@@ -30,12 +30,12 @@ def get_loader(dbfile, type="auto", group="obs", split=None, tsplit=None, dev=No
 	elif type == "sofast":
 		from .loaders.sofast import SoFastLoader
 		loader = SoFastLoader(dbfile, dev=dev, dtype=dtype)
-	elif type = "soslow":
+	elif type == "soslow":
 		raise NotImplementedError
 	else:
 		raise ValueError("Unrecognized loader type '%s'" % str(type))
 	# Wrap in post-loader unless plain
 	if not plain:
 		from .loaders.post import PostLoader
-		loader = PostLoader(loader, group=group, split=split, tsplit=tsplit, dev=dev)
+		loader = PostLoader(loader, group=group, split=split, tsplit=tsplit, fast_fail=fast_fail, dev=dev)
 	return loader

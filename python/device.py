@@ -24,11 +24,6 @@ def get_device(type="auto", align=None, alloc_factory=None, priority=["gpu","cpu
 
 def pool_logger(msg): return L.print(msg, level=3)
 
-# This feels a bit hacky. Would ideally be inherited, but would have to move a bunch of stuff
-# out of lib and introduce extra classes in between for that. Leave it like this for now
-def goodlen(self, n, direction="below"):
-	return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
-
 class MMDeviceMinimal(device.DeviceCpu):
 	def __init__(self, align=None, alloc_factory=None, logger=None):
 		super().__init__(align=align, alloc_factory=alloc_factory, logger=logger)
@@ -42,7 +37,9 @@ class MMDeviceMinimal(device.DeviceCpu):
 		self.lib.irfft = irfft
 		self.lib.fft_factors = [2,3,5,7]
 		self.lib.bsize = 1
-		goodlen = goodlen
+		# This should be inherited instead duplicated
+		def goodlen(self, n, direction="below"):
+			return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 		# BLAS. May need to find a way to make this more compact if we need
 		# more of these functions
 		def gemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
@@ -106,7 +103,9 @@ try:
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
 			self.lib.bsize = 32
-			goodlen = goodlen
+			# This should be inherited instead duplicated
+			def goodlen(self, n, direction="below"):
+				return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 			# Tiling
 			self.lib.DynamicMap     = gpu_mm.DynamicMap
 			self.lib.LocalMap       = gpu_mm.LocalMap
@@ -210,7 +209,9 @@ try:
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
 			self.lib.bsize = 1
-			goodlen = goodlen
+			# This should be inherited instead duplicated
+			def goodlen(self, n, direction="below"):
+				return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 			# Tiling
 			self.lib.DynamicMap     = cpu_mm.DynamicMap
 			self.lib.LocalMap       = cpu_mm.LocalMap

@@ -4,13 +4,13 @@ from pixell import utils, fft, bunch
 from . import socommon
 from .. import device
 
-class SimpleLoader(Loader):
-	def __init__(self, infofile, dev=None, dtype=np.float32, catch="expected", pool_map={}):
+class SimpleLoader(socommon.Loader):
+	def __init__(self, infofile, dev=None, dtype=np.float32, pool_map={}):
 		"""context is really just a list of tods and meta here"""
-		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype, catch_catch)
+		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype)
 		self.obsinfo = read_obsinfo(infofile)
 		self.omap    = {id:i for i,id in enumerate(self.obsinfo.id)}
-	def query(self, query=None, sweeps=False):
+	def query(self, query=None):
 		# No actual querying supported for now
 		return SimpleLoadInfo(self, self.obsinfo, omap=self.omap)
 	def probe(self, linfo, id, dets=None, detids=None):
@@ -18,13 +18,14 @@ class SimpleLoader(Loader):
 		ind = linfo.omap[id]
 		row = linfo.obsinfo[ind]
 		return ProbeInfo(row.ndet, row.nsamp, row.ctime, (row.nsamp-1)/row.dur, ind=ind)
-	def load(self, linfo, id, dets=None, detids=None, samprange=None):
+	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
 		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
 		with bench.mark("SimpleLoader read"):
 			obs = read_tod(self.obsinfo[ind].path, mul=self.dev.lib.bsize)
 		with bench.mark("SimpleLoader tod2dev"):
 			obs.tod = self.pool("tod").array(obs.tod)
 		obs.subids = [srange_suffix(id, samprange)]
+		obs.errors = []
 		return obs
 	def prealloc(self, linfo):
 		def s(ndet, nsamp): return utils.ceil(np.max(ndet+(nsamp+2))) # fourier-safe size

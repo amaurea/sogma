@@ -1,6 +1,6 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
 from pixell import utils, bunch, bench, sqlite, coordsys, config
-from .. import device, gutils, socut, errors
+from .. import device, gutils, socut, errors, socal
 from . import socommon, soquery, minisotodlib
 from .socommon import cmeta_lookup
 
@@ -54,6 +54,10 @@ class SoFastLoader(socommon.Loader):
 		with bench.mark("SoFastLoader calibrate"):
 			obs = calibrate(data, meta, mul=self.dev.lib.bsize, dev=self.dev, dtype=self.dtype,
 				pool_map=self.pool_map)
+		with bench.mark("SoFastLoader autocut"):
+			# Autocuts include planet, asteroid and sidelobe cuts, depending on config
+			socal.autocut(obs, dev=self.dev, id=id)
+			obs.fill.gapfill(obs.tod, dev=self.dev)
 		obs.errors = []
 		# Record what data we covered in the obs. Useful for logging
 		obs.subids = [socommon.srange_suffix(id, samprange)]

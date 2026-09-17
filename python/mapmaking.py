@@ -1547,12 +1547,9 @@ def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], max
 		t2    = time.time()
 		tdumper.register(i, ind, data.ctime)
 		tdumper.write_data(ind, data.tod, "load")
-		# FIXME: Move at least some of the autocal stuff to the loader, including
-		# the sidelobe cut
-		socal.autocut(data, dev=dev, id=id)
-		data.fill.gapfill(data.tod, dev=dev)
-		tdumper.write_data(ind, data.tod, "socut")
-		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
+		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal.
+		# Can't be moved into loader as is, because it needs prefix for the optional
+		# write. autocal is not in use anyway...
 		socal.autocal(data, prefix=prefix + id.replace(":","_") + "_", dev=dev)
 		tdumper.write_data(ind, data.tod, "socal")
 		t3    = time.time()

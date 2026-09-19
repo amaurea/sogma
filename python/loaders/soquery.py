@@ -589,6 +589,7 @@ def wafer_info_multi(tubes, wafers, missing="warn"):
 # [this was before translation from so3g to coordsys, not tested after]
 def make_sweep(ctime, baz0, waz, bel0, off, npoint=6, nocross=True):
 	from pixell import coordsys
+	if ctime.size == 0: return np.zeros((0,npoint,2))
 	# given ctime,baz0,waz,bel [ntod], off[ntod,{xi,eta}], make
 	# make sweeps[ntod,npoint,{ra,dec}]
 	coff = coordsys.Coords(q=coordsys.euler(1, np.pi/2-bel0)*coordsys.rotation_xieta(off[:,0], off[:,1]))

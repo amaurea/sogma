@@ -29,7 +29,7 @@ class SoFastLoader(socommon.Loader):
 		with bench.mark("SoFastLoader load_meta"):
 			meta = self.fast_meta.read(id, dets=dets, detids=detids)
 			if meta.aman.dets.count == 0:
-				raise utils.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
+				raise errors.DataMissing("no detectors left after meta: raw %d meta 0" % meta.ndet_full)
 		ind   = linfo.omap[id]
 		row   = linfo.obsinfo[ind]
 		# Find which time-range we cover. Natively sample 0:obsinfo.nsamp cover
@@ -56,7 +56,7 @@ class SoFastLoader(socommon.Loader):
 				pool_map=self.pool_map)
 		with bench.mark("SoFastLoader autocut"):
 			# Autocuts include planet, asteroid and sidelobe cuts, depending on config
-			socal.autocut(obs, dev=self.dev, id=id)
+			socal.autocut(obs, dev=self.dev, id=id, meta=meta)
 			obs.fill.gapfill(obs.tod, dev=self.dev)
 		obs.errors = []
 		# Record what data we covered in the obs. Useful for logging
@@ -111,8 +111,14 @@ class FastMeta:
 			"AMCc.SmurfProcessor.Filter.Disable",
 			"AMCc.FpgaTopLevel.AppTop.AppCore.RtmCryoDet.RampMaxCnt",
 		])
+		# 7. Optional sidelobe masks
+		sidelobe_file = cmeta_lookup(context, "sidelobes")
+		self.sidelobe_loader = SidelobeInfoLoader(sidelobe_file) if sidelobe_file else None
 	def read(self, subid, dets=None, detids=None):
-		obsid, wslot, band, det_type = split_subid(subid)
+		# TODO: Should probably get some of this from obsdb instead of relying
+		# parsing the subid
+		subinfo = parse_subid(subid)
+		obsid, wslot, band, det_type, tele, tube, ctime = [getattr(subinfo,key) for key in ["obsid", "wslot", "band", "type", "tele", "tube", "ctime"]]
 		# Find which hdf files are relevant for this observation
 		with bench.mark("fm_prepfile"):
 			prepfile,  prepgroup  = get_prepfile (self.prep_index,  subid)
@@ -238,13 +244,17 @@ class FastMeta:
 			pointing_model = self.pointing_model_cache.get_by_subid(subid)
 		# Get our sensitivity limits
 		sens_lim = socommon.sens_limits[band]
+
+		# Sidelobe info, if any
+		sidelobes = self.sidelobe_loader.get(tube, ctime) if self.sidelobe_loader else None
 		# Return our results. We don't put everything in an axismanager
 		# because that has significant overhead, and we don't need an
 		# axismanager for things that don't have any axes
 		return bunch.Bunch(aman=aman, iir_params=iir_params, finfos=finfos,
 			dac_to_phase = np.pi/2**15, timestamp_to_ctime=1e-8,
 			abscal_cmb = abscal_cmb, pointing_model=pointing_model,
-			sens_lim=sens_lim, ndet_full=ndet_full)
+			sens_lim=sens_lim, ndet_full=ndet_full,
+			sidelobes=sidelobes)
 
 # This doesn't really belong here, unless we rename the module
 def fast_data(finfos, detax, sampax, alloc=None, fields=[
@@ -268,24 +278,27 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 	nsamps = [finfo[2]-finfo[1] for finfo in finfos]
 	samps  = (sampax.offset, sampax.offset+sampax.count)
 	i      = 0
-	with fast_g3.open_multi(fnames, samps=samps, file_nsamps=nsamps) as ifile:
-		fdets = ifile.fields["signal/data"].names
-		rows  = utils.find(fdets, aman.dets.vals)
-		active_fields = [f for f in fields if f[2]=="!" or f[1] in ifile.fields]
-		for oname, iname, _ in active_fields:
-			ifile.queue(iname, rows=rows)
-		for fi, data in enumerate(ifile.read()):
+	try:
+		with fast_g3.open_multi(fnames, samps=samps, file_nsamps=nsamps) as ifile:
+			fdets = ifile.fields["signal/data"].names
+			rows  = utils.find(fdets, aman.dets.vals)
+			active_fields = [f for f in fields if f[2]=="!" or f[1] in ifile.fields]
 			for oname, iname, _ in active_fields:
-				chunk = data[iname]
-				# Set up output if necessary
-				if fi == 0:
-					arr = alloc.zeros((chunk.shape[:-1]+(aman.samps.count,)),dtype=chunk.dtype)
-					if arr.ndim == 1: aman.wrap(oname, arr, [(0,"samps")])
-					else:             aman.wrap(oname, arr, [(0,"dets"),(1,"samps")])
-				# Copy into output arrays
-				aman[oname][...,i:i+chunk.shape[-1]] = chunk
-			i += chunk.shape[-1]
-	return aman
+				ifile.queue(iname, rows=rows)
+			for fi, data in enumerate(ifile.read()):
+				for oname, iname, _ in active_fields:
+					chunk = data[iname]
+					# Set up output if necessary
+					if fi == 0:
+						arr = alloc.zeros((chunk.shape[:-1]+(aman.samps.count,)),dtype=chunk.dtype)
+						if arr.ndim == 1: aman.wrap(oname, arr, [(0,"samps")])
+						else:             aman.wrap(oname, arr, [(0,"dets"),(1,"samps")])
+					# Copy into output arrays
+					aman[oname][...,i:i+chunk.shape[-1]] = chunk
+				i += chunk.shape[-1]
+		return aman
+	except OSError:
+		raise errors.LoadError("Error reading g3 files " + ",".join(fnames))
 
 debug_det = None # "Mv21_f090_Ar00c02A"
 
@@ -303,7 +316,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 		jumps     = socut.Sampcut.merge([meta.aman[name] for name in jump_names])
 		# These are what will be passed to the mapmaker in the end
 		cuts   = socut.Sampcut.merge([raw_cuts, jumps])
-		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left")
+		if len(cuts.bins) == 0: raise errors.DataMissing("no detectors left")
 	# Find when we're actually scanning
 	i1, i2 = socommon.find_scanning(data.az)
 	# Adjust to fourier-friendly length
@@ -338,7 +351,6 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 		with bench.mark("pointing correction"):
 			fp = meta.aman.focal_plane
 			az, el, roll, fp[:] = apply_pointing_model(az, el, roll, fp, meta.pointing_model)
-
 	# Do we need to deslope at float64 before it is safe to drop to float32?
 	with bench.mark("signal → gpu", tfun=dev.time):
 		signal_ = pool_ft.array(signal)
@@ -442,7 +454,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 		signal  = pool_tod.array(signal)
 		good   = dev.get(good) # cuts, dets, fplane etc. need this on the cpu
 		cuts   = cuts  [good]
-		if len(cuts.bins) == 0: raise utils.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))
+		if len(cuts.bins) == 0: raise errors.DataMissing("no detectors left after sanity cuts: raw %d meta %d rms %d cutdens %d overcut %d" % (meta.ndet_full, meta.aman.dets.count, nrms, ndens, nfinal))
 
 	# Sogma uses the cut format [{dets,starts,lens},:]. Translate to this
 	with bench.mark("cuts reformat"):
@@ -589,7 +601,7 @@ class DetCache:
 		self.detset_cache = {}
 		self.done      = set()
 	def get_dets(self, subid):
-		toks = split_subid(subid)
+		toks = parse_subid(subid)
 		self._prepare(toks.obsid)
 		return self.det_cache[toks.subid]
 	def get_detsets(self, obsid):
@@ -600,7 +612,7 @@ class DetCache:
 		if obsid in self.done and not force: return
 		detsets = self.obsfiledb.get_detsets(obsid)
 		if len(detsets) == 0:
-			raise utils.DataMissing("No detsets for %s in obsfiledb" % obsid)
+			raise errors.DataMissing("No detsets for %s in obsfiledb" % obsid)
 		self.detset_cache[obsid] = {}
 		for dset in detsets:
 			wafer_name = detset2wafer_name(dset)
@@ -645,7 +657,7 @@ class Subid:
 	def __init__(self, obsid, wslot, band, type="OPTC"):
 		self.obsid, self.wslot, self.band, self.type = obsid, wslot, band, type
 		self.subid = ":".join(self)
-		self.ctime = obsid2ctime(self.obsid)
+		self.tele, self.tube, self.ctime, self.flags = parse_obsid(obsid)
 	def __len__(self): return 4
 	def __iter__(self):
 		yield self.obsid
@@ -653,8 +665,19 @@ class Subid:
 		yield self.band
 		yield self.type
 
-def split_subid(subid): return Subid(*subid.split(":"))
+def parse_subid(subid): return Subid(*subid.split(":"))
 def obsid2ctime(obsid): return float(obsid.split("_")[1])
+def parse_obsid(obsid):
+	toks = obsid.split("_")
+	ctime= float(toks[1])
+	if toks[2].startswith("lat"):
+		tele = "lat"
+		tube = toks[2][3:]
+	else:
+		tele = toks[2]
+		tube = "st1"
+	flags = toks[3]
+	return tele, tube, ctime, flags
 
 def detset2wafer_name(detset): return "_".join(detset.split("_")[:2])
 
@@ -701,7 +724,7 @@ class FplaneCache:
 		return self.fp_cache[key]
 	def get_by_subid(self, subid, det_cache):
 		"""returns array with [('dets:det_id', 'S18'), ('xi', '<f4'), ('eta', '<f4'), ('gamma', '<f4')]"""
-		toks = split_subid(subid)
+		toks = parse_subid(subid)
 		ctime      = float(toks.obsid.split("_")[1])
 		wafer_name = detset2wafer_name(det_cache.get_detsets(toks.obsid)[toks.wslot])
 		return self.get_by_wafer(wafer_name, ctime)
@@ -763,7 +786,7 @@ class PointingModelCache:
 				else: raise ValueError("%s/%s is neither a group or dataset" % (fname, gname))
 		return self.cache[key]
 	def get_by_subid(self, subid):
-		toks  = split_subid(subid)
+		toks  = parse_subid(subid)
 		ctime = float(toks.obsid.split("_")[1])
 		# Take into account the two formats
 		match = self.get_by_time(ctime)
@@ -786,6 +809,20 @@ def pointing_row_to_params(row):
 		params[name] = val
 	return params
 
+class SidelobeInfoLoader:
+	def __init__(self, fname):
+		self.fname = fname
+		self.db    = sqlite.open(fname).tomem()
+	def get(self, tube, ctime):
+		"""Pure db lookup that should not need any python-side caching. Takes 85 µs"""
+		try:
+			fname, fields = next(self.db.execute("select files.name, map.fields from map join files on files.id = map.file_id where [obs:timestamp__lo] <= %f and [obs:timestamp__hi] > %f and [obs:tube_slot] = '%s'" % (ctime, ctime, tube)))
+			fname  = os.path.join(os.path.dirname(self.fname), fname)
+			fields = fields.split(",")
+			return bunch.Bunch(fname=fname, fields=fields)
+		except StopIteration as e:
+			raise errors.DataMissing("No sidelobe info found for tube %s ctime %f" % (tube, ctime))
+
 class EpochDb:
 	def __init__(self, fname):
 		self.fname = fname
@@ -807,7 +844,7 @@ class RelcalCache:
 		self.cache  = {}
 	def get(self, subid):
 		# Infer the time from the subid
-		info  = split_subid(subid)
+		info  = parse_subid(subid)
 		fname, group = self.epochs.lookup(info.ctime)
 		key = (fname, group)
 		if key not in self.cache:
@@ -847,7 +884,7 @@ class AcalCache:
 		# Couldn't find it!
 		raise errors.DataMissing("Couldn't find abscal for %.0f %s %s %s" % (t, stream_id, wafer, band))
 	def get_by_subid(self, subid, stream_id):
-		toks  = split_subid(subid)
+		toks  = parse_subid(subid)
 		ctime = float(toks.obsid.split("_")[1])
 		return self.get(ctime, stream_id, toks.wslot, toks.band)
 
@@ -930,7 +967,7 @@ class PrepLoader:
 		return res
 
 def get_prepfile(indexdb, subid):
-	toks = split_subid(subid)
+	toks = parse_subid(subid)
 	# Inconsistent format here too
 	if "dets:wafer.bandpass" in indexdb.columns("map"):
 		query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id], [dets:wafer_slot], [dets:wafer.bandpass] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' AND [dets:wafer_slot] = '%s' AND [dets:wafer.bandpass] = '%s' LIMIT 1;" % (toks.obsid, toks.wslot, toks.band)
@@ -941,7 +978,7 @@ def get_prepfile(indexdb, subid):
 	return os.path.join(os.path.dirname(indexdb.fname),fname), gname
 
 def get_dcalfile(indexdb, subid):
-	toks = split_subid(subid)
+	toks = parse_subid(subid)
 	query  = "SELECT files.name, dataset, file_id, files.id, [obs:obs_id] FROM map INNER JOIN files ON file_id = files.id WHERE [obs:obs_id] = '%s' LIMIT 1;" % (toks.obsid)
 	try: fname, gname = next(indexdb.execute(query))[:2]
 	except StopIteration: raise errors.DataMissing("%s not found in det_cal index" % subid)

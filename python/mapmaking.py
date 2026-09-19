@@ -1663,25 +1663,25 @@ def make_maps_depth1(mapmaker, loadinfo, comm, comm_per, prefix=None, dump=[], n
 	obsinfo = loadinfo.obsinfo
 	maxdur  = config.get("depth1_maxdur")*utils.hour
 	periods = gutils.find_scan_periods(fullinfo.obsinfo, maxdur=maxdur)
-	# Which period each obs belongs to
+	# Which period each obs belongs to. pid = period-id, with a unique integer
+	# for each period (or negative for no-match)
 	pids    = utils.find_range(periods, obsinfo.ctime+obsinfo.dur/2)
 	# Get rid of groups that don't belong to a period. This shouldn't happen
 	bad = pids<0
 	if np.any(bad):
 		L.print("Warning: %d obs with no period! %s" % (np.sum(bad), ", ".join(obsinfo.id[bad])), color=colors.red, id=0)
-	# Indices of the groups we will map
+	# inds = obs-indices
 	inds  = np.where(~bad)[0]
 	pids  = pids[inds]
-	# Group by period
+	# Group by period. pinds = period-indices. These are indices into pids
 	upids, order, edges = utils.find_equal_groups_fast(pids)
 	my_pinds = list(range(comm.rank, len(upids), comm.size))
 	# Group nr. pind = my_pinds[i] consists of obs inds=order[edges[pind]:edges[pind+1]]
 	if prealloc:
 		loadinfo.prealloc()
 		setup_buffers(mapmaker.dev, obsinfo, dtype=mapmaker.dtype)
-	# Now loop over and map each of our group-groups
 	for pind in my_pinds:
-		pid     = pids[pind]
+		pid     = upids[pind]
 		my_inds = inds[order[edges[pind]:edges[pind+1]]]
 		# Name after period
 		name    = "%10.0f" % periods[pid][0]

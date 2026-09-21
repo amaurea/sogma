@@ -302,6 +302,9 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 
 debug_det = None # "Mv21_f090_Ar00c02A"
 
+config.default("fftlen", "crop", "How to adjust tod len to be fft-friendly. crop or pad. Any padding will happen beyond the deslope region, and will be marked as fully cut.")
+config.default("pad",    10.0,   "When sing fftlen=crop, pad by at least this many seconds. Intended to reduce fft wrapping artifacts.")
+
 # This config moved to loading.py because sofast is only imported conditionally
 def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, pool_map={}):
 	from pixell import fft
@@ -320,10 +323,27 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 	# Find when we're actually scanning
 	i1, i2 = socommon.find_scanning(data.az)
 	# Adjust to fourier-friendly length
-	nsamp = fft.fft_len((i2-i1)//mul, factors=dev.lib.fft_factors)*mul
-	i2    = i1+nsamp
-	timestamps, signal, cuts, raw_cuts, jumps, az, el = [a[...,i1:i2] for a in [data.timestamps,data.signal,cuts,raw_cuts,jumps,data.az,data.el]]
-	hwp_angle = meta.aman.hwp_angle[i1:i2] if "hwp_angle" in meta.aman else None
+	fftlen_mode = config.get("fftlen")
+	fftpad      = config.get("pad")
+	# Convert fftpad to samples
+	dur         = (data.timestamps[-1]-data.timestamps[0])*meta.timestamp_to_ctime
+	srate       = (len(data.timestamps)-1)/dur
+	fftpad      = utils.nint(fftpad*srate)
+	if fftlen_mode == "crop":
+		nsamp = fft.fft_len((i2-i1)//mul, factors=dev.lib.fft_factors)*mul
+	elif fftlen_mode == "pad":
+		nsamp = fft.fft_len((i2-i1+fftpad+mul-1)//mul, factors=dev.lib.fft_factors, direction="above")*mul
+	else:
+		raise ValueError("Invalid fftlen mode '%s'" % fftlen_mode)
+	i2    = min(i1+nsamp,i2)
+	npad  = nsamp-(i2-i1)
+	# Will crop to i1:i2, then pad by npad. The padding is free if npad = 0
+	signal     = gutils.pad(data.signal[...,i1:i2], npad, mode="zero")
+	timestamps = gutils.pad(data.timestamps[i1:i2], npad, mode="trend")
+	az         = gutils.pad(data.az[i1:i2], npad, mode="constant")
+	el         = gutils.pad(data.el[i1:i2], npad, mode="constant")
+	hwp_angle  = gutils.pad(meta.aman.hwp_angle[i1:i2], mode="zero") if "hwp_angle" in meta.aman else None
+	cuts, raw_cuts, jumps = [a[...,i1:i2].pad(npad) for a in [cuts,raw_cuts,jumps]]
 	ninit = data.dets.count
 
 	# prev_obs lets us pass in the result of calibrate run on
@@ -343,10 +363,10 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 			el      = el   * utils.degree
 			if "brot" in data:
 				# SAT: boresight angle → roll
-				roll = -data.brot [i1:i2]*utils.degree
+				roll = gutils.pad(-data.brot [i1:i2]*utils.degree, npad, mode="constant")
 			else:
 				# LAT: corotator angle → roll
-				roll = -data.corot[i1:i2]*utils.degree + el - 60*utils.degree
+				roll = gutils.pad(-data.corot[i1:i2]*utils.degree, npad, mode="constant") + el - 60*utils.degree
 		bore_ref = np.array([el[0], az[0], roll[0]])
 		with bench.mark("pointing correction"):
 			fp = meta.aman.focal_plane
@@ -395,7 +415,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 
 	with bench.mark("deslope", tfun=dev.time):
 		with pool_ft.as_allocator():
-			gutils.deslope(signal, w=w, dev=dev, inplace=True)
+			gutils.deslope(signal, w=w, dev=dev, npad=npad, inplace=True)
 
 	if debug_det: bunch.write("test_deslope1.hdf", bunch.Bunch(tod=dev.get(signal[i])))
 
@@ -435,13 +455,13 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 
 	# Sanity checks
 	with bench.mark("measure noise", tfun=dev.time):
-		rms = socommon.measure_rms_der(signal, dt=dt)
+		rms = socommon.measure_rms_der(signal[:,:nsamp-npad], dt=dt)
 	with bench.mark("final detector prune", tfun=dev.time):
 		good    = socommon.sensitivity_cut(rms, meta.sens_lim)
 		nrms    = dev.np.sum(good)
 		# Cut detectors with too big a fraction of samples cut,
 		# or cuts occuring too often.
-		cutfrac = cuts.sum()/cuts.nsamp
+		cutfrac = (cuts.sum()-npad)/(cuts.nsamp-npad)
 		cutdens = (cuts.bins[:,1]-cuts.bins[:,0])/cuts.nsamp
 		good   &= dev.np.array((cutfrac < 0.1)&(cutdens < 1e-3))
 		ndens   = dev.np.sum(good)
@@ -460,9 +480,10 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 	with bench.mark("cuts reformat"):
 		ocuts = cuts.to_simple()
 
+	if debug_det: 1/0
+
 	# Our goal is to output what sogma needs. Sogma works on these fields:
 	res  = bunch.Bunch()
-	res.sampoff      = i1
 	res.dets         = meta.aman.dets.vals[good]
 	res.detids       = meta.aman.det_ids[good]
 	res.detpix       = meta.aman.det_pix[good]
@@ -475,6 +496,7 @@ def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, poo
 	res.tod          = signal
 	res.cuts         = ocuts
 	res.fill         = ocuts
+	res.npad         = npad
 	res.site         = "so"
 	res.response     = None
 	# original value of the first sample of boresight, before the pointing model

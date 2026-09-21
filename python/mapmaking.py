@@ -150,7 +150,7 @@ class MLMapmaker:
 			obs.fill.gapfill(gtod, dev=self.dev)
 		if deslope:
 			# Deslope must happen here, since it's the noise that must be periodic, not the signal
-			gutils.deslope(gtod, w=5, inplace=True)
+			gutils.deslope(gtod, w=5, npad=obs.npad, inplace=True)
 		t3 = self.dev.time()
 		# Apply any filter. There usually won't be one, since we do maximum-likelihood
 		# mapmaking most of the time, but this is used by the planet mapmaker
@@ -1555,7 +1555,7 @@ def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], max
 		t3    = time.time()
 		try:
 			mapmaker.add_obs(id, data, deslope=False, signal_guess=signal_guess)
-		except etypes as e:
+		except catch as e:
 			L.print("Skipped %d %s: %s" % (ind, id, str(e)), level=2, color=colors.red)
 			continue
 		dev.garbage_collect()

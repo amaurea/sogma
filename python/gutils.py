@@ -97,6 +97,21 @@ def mask2range(mask):
 	stop   = ap.where(diffs<0)[0]
 	return np.array([start,stop]).T
 
+def pad(arr, n, mode="zero"):
+	if n == 0: return arr
+	N = arr.shape[-1]
+	# Not on gpu, not memory-optimized
+	oarr = np.pad(arr, [(0,0)]*(arr.ndim-1)+[(0,n)])
+	if   mode == "zero": pass
+	elif mode == "trend":
+		slope = (arr[...,-1]-arr[...,0])/(arr.shape[-1]-1)
+		oarr[...,N:] = arr[...,-1,None] + np.arange(1,1+n)*slope[...,None]
+	elif mode == "constant":
+		oarr[...,N:] = arr[...,-1,None]
+	else:
+		raise ValeError("Unknown pad mode '%s'" % str(mode))
+	return oarr
+
 @contextlib.contextmanager
 def leakcheck(dev, msg):
 	try:
@@ -393,9 +408,10 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 		dev.lib.gemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
 	return tod, coeffs[0], coeffs[1]
 
-def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, dev=None, external_v=False, return_edges=False):
+def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, npad=None, dev=None, external_v=False, return_edges=False):
 	if dev  is None: dev  = device.get_device()
-	if n    is None: n    = signal.shape[-1]
+	if npad is None: npad = 0
+	if n    is None: n    = signal.shape[-1]-npad
 	if not inplace: signal = signal.copy()
 	# Allow us to work on other arrays than 2d.
 	pre, nsamp = signal.shape[:-1], signal.shape[-1]
@@ -409,6 +425,7 @@ def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, dev=None, ext
 	one = dev.np.full(nsamp, 1, dtype=signal.dtype)
 	one[n:] = 0
 	otod = detwise_axb(signal, x, v2-v1, v1, one=one, tod_mul=1, abmul=-1, dev=dev, inplace=True)[0]
+	otod[:,n:] = 0
 	# Restore to original shape
 	otod = otod.reshape(pre+(nsamp,))
 	v1   = v1.reshape(pre)

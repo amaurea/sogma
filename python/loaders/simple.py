@@ -59,4 +59,5 @@ def read_data(fname, dev=None):
 	for key in ["cuts", "fill"]:
 		dets, starts, lens = data[key].T
 		data[key] = socut.Simplecut(dets=dets, starts=starts, lens=lens, ndet=data.tod.shape[0], nsamp=data.tod.shape[1])
+	if "npad" not in data: data.npad = 0
 	return data

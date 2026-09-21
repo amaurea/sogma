@@ -146,7 +146,7 @@ class PostLoader(socommon.Loader):
 				obs.hwp       = subobs.hwp
 				obs.site      = subobs.site
 				obs.bore_ref  = subobs.bore_ref
-				obs.sampoff   = subobs.sampoff
+				obs.npad      = subobs.npad
 				obs.tod       = self.pool("tod").zeros((pinfo.ndet,len(subobs.ctime)), subobs.tod.dtype)
 			# Handle the simple append cases
 			for field, axis in append_fields:
@@ -205,9 +205,10 @@ class PostLoadInfo(socommon.LoadInfo):
 		res.downfact   = self.downfact[sel]
 		return res
 
-def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pool_map={}):
+def demodulate(data, frel=1, comps="TQU", mul=None, dev=None, pool_map={}):
 	# Ok, if we get here, then we can demodulate
 	if dev   is None: dev = device.get_device()
+	if mul   is None: mul = dev.lib.bsize
 	pool_ft, pool_dtod, pool_wtod = [dev.pools[name] for name in utils.vmap(pool_map, ["ft","dtod","wtod"])]
 	ncomp        = len(comps)
 	ndet, insamp = data.tod.shape
@@ -229,6 +230,7 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pool_map={}):
 	# a whole number of rotations to avoid fourier bleeding. The cost of truncating
 	# would be at most 0.5 s
 	intrunc = gutils.find_last_crossing(data.hwp, data.hwp[0])
+	nraw    = min(insamp-data.npad, intrunc)
 	# Find our output number of samples. This is ideally determined by
 	# ofmax, but we are also restricted by fourier and mapmaking
 	# considerations via mul
@@ -266,6 +268,8 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pool_map={}):
 	odata.dets   = odets
 	odata.detids = odetids
 	odata.ctime  = linresamp(data.ctime[:intrunc])
+	# How much of any padding do we have left?
+	odata.npad   = onsamp-utils.nint(nraw*onsamp/intrunc)
 	odata.hwp    = None # already handled
 	odata.point_offset = utils.repeat(data.point_offset, ndup, axis=0)
 	odata.bands     = utils.repeat(data.bands, ndup)
@@ -286,7 +290,7 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pool_map={}):
 		work    = pool_wtod.array(data.tod[:,:intrunc])
 		# Modulate
 		work    *= carrier
-		gutils.deslope(work, dev=dev, inplace=True)
+		gutils.deslope(work, dev=dev, n=nraw, inplace=True)
 		# Fourier-truncate. This step actually performs the filtering/downsampling
 		# Sadly the ft must be contiguous, so we need a work buffer. We use our
 		# tod work buffer for this, since its info has been transferred to fourier
@@ -298,7 +302,7 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pool_map={}):
 		# can finally transform back
 		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
 	odata.cuts.gapfill(odata.tod, dev=dev)
-	gutils.deslope(odata.tod, dev=dev, inplace=True, w=100)
+	gutils.deslope(odata.tod, dev=dev, inplace=True, npad=odata.npad, w=100)
 	# T-detectors have response [1,0,0]
 	if comps == "TQU": odata.response[0,:ndet] = 1
 	elif comps != "QU": raise ValueError("Only comps='TQU' and comps='QU' supported")
@@ -315,12 +319,13 @@ def demodulate(data, frel=1, comps="TQU", mul=32, dev=None, pool_map={}):
 			odata[key] = data[key]
 	return odata
 
-def downsample(data, fsamp=None, down=None, mul=32, dev=None, pool_map=None):
+def downsample(data, fsamp=None, down=None, mul=None, dev=None, pool_map=None):
 	"""Downsample data either by the given down-factor, or to the given sample rate fsamp.
 	Uses fourier-resampling for the tod, and linear resampling for the rest. The actual
 	sample rate will be adjusted slightly to still be fourier- and gpu-friendly."""
 	# Ok, if we get here, then we can demodulate
 	if dev   is None: dev = device.get_device()
+	if mul   is None: mul = dev.lib.bsize
 	pool_ft, pool_dtod, pool_wtod = [dev.pools[name] for name in utils.vmap(pool_map, ["ft","dtod","wtod"])]
 	ndet, insamp = data.tod.shape
 	duration     = data.ctime[-1]-data.ctime[0]
@@ -344,6 +349,7 @@ def downsample(data, fsamp=None, down=None, mul=32, dev=None, pool_map=None):
 	odata.boresight[1] = linresamp(utils.unwind(data.boresight[1])) # az
 	odata.boresight[0] = linresamp(data.boresight[0]) # el
 	odata.boresight[2] = linresamp(data.boresight[2]) # roll
+	odata.npad  = utils.nint(data.npad*onsamp/insamp)
 	# Resample cuts, and duplicate them across the virtual detectors
 	odata.cuts  = data.cuts.to_sampcut().to_simple().resample(onsamp).simplify().to_simple()
 	# Resample the tod

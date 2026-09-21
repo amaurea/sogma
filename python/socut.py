@@ -30,6 +30,8 @@ class Simplecut:
 		self.lens   = np.asarray(lens,   np.int32)
 		self.nsamp  = nsamp # not *really* necessary, but nice to have
 		self.ndet   = ndet if ndet is not None else np.max(self.dets)+1
+	@staticmethod
+	def empty(ndet, nsamp): return Simplecut(ndet=ndet, nsamp=nsamp)
 	@property
 	def shape(self): return (self.ndet, self.nsamp)
 	@property
@@ -62,6 +64,7 @@ class Simplecut:
 		# Currently implemented via Sampcut
 		return Sampcut.merge([cut.to_sampcut() for cut in cuts]).simplify().to_simple()
 	def simplify(self): return self.to_sampcut().simplify().to_simple()
+	def pad(self, n): return self.to_sampcut().pad(n).to_simple()
 	@staticmethod
 	def detcat(cuts):
 		"""Concatenate list of cuts in detector direction."""
@@ -183,6 +186,17 @@ class Sampcut:
 	def simplify(self):
 		bins, ranges = _simplify_cuts(self.bins, self.ranges)
 		return Sampcut(bins, ranges, nsamp=self.nsamp)
+	def pad(self, n):
+		"""Return a version of this Sampcut padded with n extra cut samples"""
+		current = Sampcut(bins=self.bins, ranges=self.ranges, nsamp=self.nsamp+n)
+		bins    = np.zeros((self.ndet,2),np.int32)
+		bins[:,0] = np.arange(self.ndet)
+		bins[:,1] = bins[:,0]+1
+		ranges  = np.zeros((self.ndet,2),np.int32)
+		ranges[:,0] = self.nsamp
+		ranges[:,1] = self.nsamp+n
+		extra   = Sampcut(bins=bins, ranges=ranges, nsamp=self.nsamp+n)
+		return merge_sampcuts([current,extra])
 	def range_dets(self):
 		bind  = np.full(len(self.ranges),-1,np.int32)
 		for bi, bin in enumerate(self.bins):

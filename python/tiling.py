@@ -201,6 +201,7 @@ class TileDistribution:
 				submap[sub.rinds[0],sub.rinds[1]] = rbuf
 				# We have [nty,ntx,...,y,x] and want [...,nty,y,ntx,x]
 				submap = np.moveaxis(submap, (0,1), (-4,-2))
+				# Go to [...,nty*y,ntx*x]
 				submap = submap.reshape(submap.shape[:-4]+(submap.shape[-4]*submap.shape[-3],submap.shape[-2]*submap.shape[-1]))
 				# sub.obox will not have negative values or wrapping issues the way we have
 				# constructed things here
@@ -210,6 +211,30 @@ class TileDistribution:
 				omap[...,oy1:oy2,ox1:ox2] += submap[...,iy1:iy2,ix1:ix2]
 		if self.ompi.comm.rank == 0:
 			return omap
+	def omap2dmap(self, map, dmap=None, root=0):
+		"""Transfer from enmap map to a distributed map dmap"""
+		# To make the correspondence with dmap2omap clearer, I keep the i/o r/s
+		# prefixes the same here instead of flipping them.
+		if dmap is None: dmap = self.dmap(dtype=map.dtype, ncomp=map.shape[-3])
+		tsize = np.prod(dmap.shape[1:])
+		for i, sub in enumerate(self.ompi.subs):
+			if self.ompi.comm.rank == 0:
+				(iy1,ix1),(iy2,ix2) = sub.ibox
+				(oy1,ox1),(oy2,ox2) = sub.obox
+				submap = np.zeros(map.shape[:-2]+(sub.onty*self.tshape[0],sub.ontx*self.tshape[1]), map.dtype)
+				submap[...,iy1:iy2,ix1:ix2] = map[...,oy1:oy2,ox1:ox2]
+				# [...,nty*y,ntx*nx] → [...,nty,y,ntx,x]
+				submap = submap.reshape(submap.shape[:-2]+(sub.onty,self.tshape[0],sub.ontx,self.tshape[1]))
+				# [...,nty,y,ntx,x] → [nty,ntx,...,y,x]
+				submap = np.moveaxis(submap, (-4,-2), (0,1))
+				rbuf = submap[sub.rinds[0],sub.rinds[1]]
+			else:
+				rbuf = None
+			sbuf = np.zeros(sub.rtot*tsize, map.dtype)
+			rinfo= (sub.rcount*tsize, sub.roffs*tsize)
+			sub.comm.Scatterv((rbuf, rinfo), sbuf, root=root)
+			dmap[sub.sinds] += sbuf.reshape((len(sub.sinds),)+dmap.shape[1:])
+		return dmap
 	@property
 	def oshape(self): return (self.work.ntile,self.ncomp,self.tshape[0],self.tshape[1])
 	@property

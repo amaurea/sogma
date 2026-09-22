@@ -36,27 +36,46 @@ def autocut(obs, id="?", which=None, geo=None, dev=None, meta=None):
 	obs.fill = fill
 	return obs
 
-# TODO: This function takes around 1 sec, dominated by ephem_map+lmap+pmap
-# Could potentially speed up by using pmap.backward to figure out which tiles
-# are hit, instead of building a fullsky map.
 config.default("object_cut",    "planets:10,asteroids:5")
-def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*utils.arcmin,
+def object_cut(obs, id="?", object_list=None, geo=None, sysdown=8, base_res=0.5*utils.arcmin,
 		dt=100, dr=1*utils.arcsec, dev=None, meta=None):
+	from pixell import mpi
 	if dev is None: dev = device.get_device()
 	object_list = get_object_list(object_list)
-	# Set up a low-resolution geometry, either by downgrading a given geometry
-	# of by downgrading a fullsky geometry with the base_res resolution.
-	# The advantage of passing an existing geometry is that one avoids partially
-	# cut pixels, which can have very high noise.
-	shape, wcs = geo if geo is not None else enmap.fullsky_geometry2(res=base_res)
-	shape, wcs = enmap.downgrade_geometry(shape, wcs, down)
-	# Get our time range
+	dtype       = obs.tod.dtype
+	# These pools are free
+	tod_pool    = dev.pools["ft"]
+	work_pool   = dev.pools["pointing"]
+	# 1. Initial geometry. Only really used for pixel alignment, so could be skipped
+	shape0, wcs0 = geo if geo is not None else enmap.fullsky_geometry2(res=base_res)
+	# 2. Build a dynamic map, which we will use to probe which tiles are exposed
+	fshape, fwcs, _ = tiling.infer_fullsky_geometry(shape0, wcs0)
+	dynmap = dev.lib.DynamicMap(*fshape, dtype)
+	# 3. Build a pointing matrix and use it, resulting in an lmap, which knows which
+	#    tiles were hit
+	pmap = pmat.PmatMap(fshape, fwcs, obs.ctime, obs.boresight,
+		obs.point_offset, obs.polangle, sys="equ", site=obs.site, dev=dev, dtype=dtype)
+	wtod = tod_pool.zeros(obs.tod.shape, obs.tod.dtype)
+	pmap.backward(wtod, dynmap)
+	lmap = dynmap.finalize()
+	del dynmap
+	# 4. Build a tiledist (a bit overkill, but provides the functions we need)
+	#    Use pixbox="auto" (or call get_pixbound manually) to get the relevant
+	#    bounding box
+	tiledist = tiling.TileDistribution(fshape, fwcs, lmap.pixelization,
+		comm = mpi.COMM_SELF, pixbox="auto", dev=dev)
+	# 5. Construct the canvas we will paint on
+	shape, wcs = enmap.crop_geometry(fshape, fwcs, pixbox=tiledist.pixbox)
+	# 6. Do the painting
 	t1, t2 = utils.minmax(obs.ctime)
 	map  = ephem_map(shape, wcs, object_list, [t1,t2], dt=dt, dr=dr, dtype=obs.tod.dtype)
-	cuts = mask2cut_map(obs, map, dev=dev, tod_pool=dev.pools["ft"], work_pool=dev.pools["pointing"])
-	# return result as length-1 list of cuts
-	# It's a list of cuts because other cut types can return multiple cuts
-	# User must merge with other cuts and gapfill as necessary
+	# 7. Transfer to a tiled map on the gpu
+	dmap = tiledist.omap2dmap(map)
+	gwmap= tiledist.dmap2gwmap(dmap)
+	wtod[:] = 0
+	pmap.forward(wtod, gwmap)
+	# 8. can finally call mask2cut_tod
+	cuts = mask2cut_tod(wtod, dev=dev, pool=work_pool)
 	return [cuts]
 
 config.default("galcut_rad", 2.0, "Degrees of avoidance around the galaxy when the galaxy cut is enabled")

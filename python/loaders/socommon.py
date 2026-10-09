@@ -107,7 +107,13 @@ def srange_chain(srange1, srange2):
 # Contexts and configs #
 ########################
 
-def find_so(): return os.environ["SOPATH"]
+def find_site():
+	return os.environ["SOTODLIB_SITECONFIG"]
+def find_so():
+	if "SOPATH" not in os.environ:
+		data = read_yaml(find_site())
+		os.environ["SOPATH"] = data["tags"]["so_root"]
+	return os.environ["SOPATH"]
 #def find_cdir(telescope): return find_so() + "/metadata/%s/contexts" % telescope
 # Temporarily switch to my own context directory, since the official one isn't being
 # kept up to date
@@ -124,9 +130,16 @@ def find_context(path_or_name, type="preprocess"):
 			if os.path.exists(path): return path
 		raise FileNotFoundError
 
-def expand_context(context):
-	tags = context["tags"]
+def expand_context(context, tags=None):
+	tags = tags or context["tags"]
+	tags = expand_tags(tags)
 	return _expand_context_helper(context, tags)
+
+def expand_tags(tags):
+	otags = tags.copy()
+	for key in otags:
+		otags[key] = otags[key].format(**tags)
+	return otags
 
 def _expand_context_helper(obj, tags):
 	if isinstance(obj, dict):
@@ -154,6 +167,9 @@ def get_expanded_context(context_or_config_or_name):
 	"""Given either a config, a context or a telescope name, returns
 	the info sofast actually needs, which is a context object with
 	a preprocess archive entry, and {} tags expanded"""
+	# Get tags from site
+	try: tags = read_yaml(find_site())["tags"]
+	except FileNotFoundError: tags = {}
 	if re.match(r"^\w+$", context_or_config_or_name):
 		# A plain word. Treat as telescope name
 		cpath = find_context(context_or_config_or_name)
@@ -167,10 +183,13 @@ def get_expanded_context(context_or_config_or_name):
 		ppath = os.path.join(os.path.dirname(cpath), context["archive"]["index"])
 		context = read_yaml(cpath)
 	else: ppath = None
+	# Set up our tags, which we will use to expand things
+	tags.update(context["tags"])
 	# Add cdir to tags, so we can have context-dir relative paths
-	context["tags"]["cdir"] = os.path.dirname(cpath)
+	tags["cdir"] = os.path.dirname(cpath)
 	# Ok, by now we have a context dict. Expand curly braces in it
-	context = expand_context(context)
+	context = expand_context(context, tags=tags)
+	context["tags"] = tags
 	# Set the preprocess path if we have one from config
 	if ppath:
 		entry = find_label(context["metadata"], "preprocess", whole=True)

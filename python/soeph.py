@@ -11,7 +11,7 @@ config.default("asteroid_list", "Ceres,Vesta,Pallas,Bamberga,Iris,Juno,Hygiea,Ze
 #config.default("asteroid_list", "Ceres,Vesta,Pallas,Bamberga,Iris,Juno,Hygiea,Zelinda,Daphne,Hebe,Eunomia,Fortuna,Melpomene", "Asteroids with peak f150 brightness > 200 mJy according to SPT's list")
 
 # This supports environment varaibles
-config.default("asteroid_path", "/global/cfs/cdirs/sobs/users/sigurdkn/ephemerides/objects")
+config.default("asteroid_path", "$SOPATH/metadata/ancil/ephemerides", "Path to directory with asteroid ephemerides")
 
 def setup(asteroid_path=None):
 	asteroid_path = os.path.expandvars(config.get("asteroid_path", asteroid_path))

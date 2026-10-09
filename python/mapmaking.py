@@ -101,7 +101,7 @@ class MLMapmaker:
 		# Technically SignalCut clobbers, but not in the sense we care about here
 		for signal in signals[:-1]:
 			if signal.clobbers:
-				raise gutils.SignalOrderError("Clobbering %s %s not last in list!" % (type(signal).__name__, signal.name))
+				raise errors.SignalOrderError("Clobbering %s %s not last in list!" % (type(signal).__name__, signal.name))
 		self.signals  = signals
 		self.dev      = dev or device.get_device()
 		self.dtype    = dtype
@@ -143,7 +143,7 @@ class MLMapmaker:
 			# If our previous pass didn't include this id, then that means we too will end up
 			# skipping it, so might as well do so right away. This isn't really an error, but it's
 			# convenient to raise an exception.
-			if not signal_guess.has(id): raise gutils.RecoverableError("Skipped in previous pass")
+			if not signal_guess.has(id): raise errors.RecoverableError("Skipped in previous pass")
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
 			signal_guess.forward(model, id)
 			gtod -= model
@@ -172,7 +172,7 @@ class MLMapmaker:
 				# we instead use a dummy noise model with tiny weight
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				if signal_guess is None:
-					raise gutils.RecoverableError(msg)
+					raise errors.RecoverableError(msg)
 				else:
 					iN = nmat.NmatNull(dev=self.dev)
 					L.print(msg + ". Nulling", level=2, color=colors.red)
@@ -191,7 +191,7 @@ class MLMapmaker:
 		t5 = self.dev.time()
 		# This is our last chance to safely abort, so check that our data makes sense
 		if not self.dev.np.isfinite(self.dev.np.sum(gtod)):
-			raise gutils.RecoverableError(f"Invalid value in N\"tod")
+			raise errors.RecoverableError(f"Invalid value in N\"tod")
 		# Add the observation to each of our signals
 		for signal in self.signals:
 			signal.add_obs(id, obs, iN, gtod)
@@ -1539,7 +1539,7 @@ def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], max
 			continue
 		if len(data.errors) > 0:
 			# Partial skip
-			L.print("Skipped parts %s" % format_nested_errors(data.errors), level=2, color=colors.red)
+			L.print("Skipped parts %s" % errors.format_multi_exception(data.errors), level=2, color=colors.red)
 		# Do configurable autocuts that are indpendent of the loading method here.
 		# Might want to wrap it into some higher-level load function.
 		# Autocut and gapfill cost about the same as add_obs, so they definitely
@@ -1720,7 +1720,7 @@ def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 			continue
 		if len(data.errors) > 0:
 			# Partial skip
-			L.print("Skipped parts %s" % format_nested_errors(data.errors), level=2, color=colors.red)
+			L.print("Skipped parts %s" % errors.format_multi_exception(data.errors), level=2, color=colors.red)
 		t2 = dev.time()
 		# We usually want to downsample quite a lot to avoid the movies being uselessly slow
 		# TODO: Should move this into gutils or something
@@ -1776,102 +1776,6 @@ def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 		tread = t2-t1
 		tdown = t3-t2
 		L.print("Processed %s in %6.3f. Read %6.3f down %6.3f proj %6.3f write %6.3f" % (id, t7-t1, tread, tdown, tproj, twrite), level=2)
-
-class SimpleLoader:
-	def __init__(self, fname_fun=None, empty_fun=None):
-		# Must import before ArgumentParser is initialized to import args from config
-		import numpy as np, os, time, sys
-		from pixell import config, utils, mpi, colors, bench
-		from . import logging, mapmaking, loading, device, gutils
-		# Have to do all imports that could contain configuration before
-		# building config.ArgumentParser because these may define variables.
-		# This means we can't bail out early when called with wrong arguments;
-		# we have to wait for potentially slow imports first. Oh well.
-		parser = config.ArgumentParser("sogma")
-		parser.add_argument(      "--odir",    type=str, default=".")
-		parser.add_argument("-C", "--context", type=str, default="lat", help="Either a config.yaml, context.yaml or a telescope name, like lat, satp1, etc.. The most general is config.yaml, which works with both the sofast and soslow loaders. Using just a context only works with sofast, and must be a context that includes the preprocess database. Telescope names expand to the default preprocess context using $SOPATH, which should point to the SO top-level directory (the one that contains the metadata directory).")
-		parser.add_argument("-Q", "--query",   type=str, default=None)
-		parser.add_argument("-p", "--prefix",  type=str, default=None)
-		parser.add_argument("-v", "--verbose", action="count", default=1)
-		parser.add_argument("-q", "--quiet",   action="count", default=0)
-		parser.add_argument("-L", "--loader",  type=str, default="auto")
-		parser.add_argument("-D", "--device",  type=str, default="auto")
-		parser.add_argument(      "--ignore",  type=str, default="recover")
-		parser.add_argument("-j", "--joint",   type=str, default="oband", help="full, obs, oband, wafer, wband or none")
-		parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
-		parser.add_argument(      "--tsplit",  type=float, default=None, help="Split obs-groups in time to keep them shorter than this many seconds. See also --split")
-		parser.add_argument(      "--sel",     type=str, default=":")
-		parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
-		parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
-		parser.add_argument("-c", "--cont",    action="store_true")
-		self.parser = parser
-		self.comm   = mpi.COMM_WORLD
-		self.fname_fun = fname_fun
-		self.empty_fun = empty_fun
-	def add_argument(self, *args, **kwargs):
-		self.parser.add_argument(*args, **kwargs)
-	def init(self):
-		import numpy as np, os, time, sys
-		from pixell import utils, mpi, colors, bench
-		from . import logging, mapmaking, loading, device, gutils
-		args = self.parser.parse_args()
-		mpi.install_abort_hook()
-		dev  = device.get_device(args.device)
-		# Set up our logging
-		verbosity  = args.verbose-args.quiet
-		L = logging.Logger(dev, id=self.comm.rank, level=verbosity, fmt="{id:3d} {t:8.3f} {mem:5.2f} {dmem_pools:5.2f} {dmem_rest:5.2f} {dmem_unknown:5.2f} {msg:s}").setdefault()
-		bench.set_verbose(verbosity >= 4)
-		L.print("Init", level=0, id=0, color=colors.lgreen)
-		# Benchmarking
-		bench.set_tfun(dev.time)
-		# Set up our data loader
-		loader = loading.Loader(args.context, type=args.loader, dev=dev)
-		linfo  = loader.query(args.query)
-		linfo  = linfo[gutils.parse_slice(args.sel)]
-		if len(linfo.nobs) == 0:
-			L.print("No tods selected", level=0, id=0, color=colors.red)
-			raise errors.NothingLeft("No data selected")
-		# Optional detector restriction
-		dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
-		detids = gutils.read_detnames(args.detids) if args.detids is not None else None
-		L.print("Processing %d tods with %d mpi tasks" % (linfo.nobs, self.comm.size), level=0, id=0, color=colors.lgreen)
-		prefix = args.odir + "/"
-		if args.prefix: prefix += args.prefix + "_"
-		utils.mkdir(args.odir)
-		# Write out our arguments
-		if self.comm.rank == 0:
-			with open(prefix + "args.txt", "w") as ofile:
-				ofile.write(" ".join(sys.argv) + "\n")
-		# Useful to have in log-files too
-		L.print(" ".join(sys.argv), level=0, id=0, color=colors.lgreen)
-		# Set up exception types we will ignore
-		catch = make_catch_list(args.ignore)
-		if dev is None: dev = device.get_device()
-		# Register interface
-		locs = locals()
-		for name in ["args", "dev", "linfo", "L", "verbosity", "catch", "dets", "detids", "prefix"]:
-			setattr(self, name, locs[name])
-	def get_obs(self, ind=0, id=None):
-		if id is None: id = self.linfo.obsinfo.id[ind]
-		return self.lilnfo.load(id, dets=self.dets, detids=self.detids)
-	def obs_iter(self, inds=None, fname_fun=None, empty_fun=None):
-		from . import tiling
-		if fname_fun is None: fname_fun = self.fname_fun
-		if empty_fun is None: empty_fun = self.empty_fun
-		if empty_fun is None: empty_fun = lambda self,id: fname_fun(self,id).replace(".txt", ".empty")
-		for ind in inds:
-			id = self.linfo.obsinfo.id[ind]
-			subpre = self.prefix + id.replace(":","_") + "_"
-			if self.args.cont and fname_fun and (os.path.isfile(fname_fun(self, id)) or os.path.isfile(empty_fun(self, id))):
-				L.print("Skipped %s: done" % (id), level=2, color=colors.gray)
-				continue
-			try:
-				obs = self.get_obs(ind)
-				yield bunch.Bunch(obs=obs, ind=ind, id=id, subpre=subpre)
-				del obs
-			except self.catch as e:
-				if empty_fun: utils.touch(empty_fun(self, id))
-				L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
 
 config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
 def distribute_tasks(obsinfo, comm, taskdist=None):

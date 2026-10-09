@@ -1,6 +1,7 @@
 import numpy as np, contextlib, json, time, os, scipy, re, yaml, ast, h5py
-from pixell import utils, bunch, bench, sqlite, coordsys, config
+from pixell import utils, bunch, bench, sqlite, coordsys, config, colors
 from .. import device, gutils, socut, errors, socal
+from ..logging import L
 from . import socommon, soquery, minisotodlib
 from .socommon import cmeta_lookup
 
@@ -302,8 +303,8 @@ def fast_data(finfos, detax, sampax, alloc=None, fields=[
 
 debug_det = None # "Mv21_f090_Ar00c02A"
 
-config.default("fftlen", "crop", "How to adjust tod len to be fft-friendly. crop or pad. Any padding will happen beyond the deslope region, and will be marked as fully cut.")
-config.default("pad",    10.0,   "When sing fftlen=crop, pad by at least this many seconds. Intended to reduce fft wrapping artifacts.")
+config.default("fftlen", "pad", "How to adjust tod len to be fft-friendly. crop or pad. Any padding will happen beyond the deslope region, and will be marked as fully cut.")
+config.default("pad",    0.0,   "When sing fftlen=crop, pad by at least this many seconds. Intended to reduce fft wrapping artifacts.")
 
 # This config moved to loading.py because sofast is only imported conditionally
 def calibrate(data, meta, mul=32, dev=None, prev_obs=None, dtype=np.float32, pool_map={}):
@@ -719,8 +720,13 @@ class FplaneCache:
 		self.fname = fname
 		self.index = {}
 		with sqlite.open(fname) as sfile:
+			# Handle two different wafer name formats. Annoying
+			if "dets:wafer.array" in sfile.columns("map"):
+				wafstr = "'ufm_' || [dets:wafer.array]"
+			else:
+				wafstr = "[dets:stream_id]"
 			# This handles both the case when time ranges are present and when they aren't
-			query = trange_fmt(sfile, "select [dets:stream_id], {t1}, {t2}, files.name, dataset from map inner join files on file_id = files.id")
+			query = trange_fmt(sfile, "select %s, {t1}, {t2}, files.name, dataset from map inner join files on file_id = files.id" % wafstr)
 			# Wafer here is e.g. ufm_mv15, not the wafer slot (w.g. ws0)
 			for wafer_name, t1, t2, hfname, gname in sfile.execute(query):
 				if wafer_name not in self.index:

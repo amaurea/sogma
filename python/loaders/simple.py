@@ -1,5 +1,5 @@
-import numpy as np, time
-from pixell import utils, fft, bunch
+import numpy as np, time, os
+from pixell import utils, fft, bunch, bench
 from . import socommon
 from .. import device, socut
 
@@ -7,6 +7,7 @@ class SimpleLoader(socommon.Loader):
 	def __init__(self, infofile, dev=None, dtype=np.float32, pool_map={}):
 		"""context is really just a list of tods and meta here"""
 		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype)
+		self.infodir = os.path.dirname(infofile)
 		self.obsinfo = read_obsinfo(infofile)
 		self.omap    = {id:i for i,id in enumerate(self.obsinfo.id)}
 	def query(self, query=None, dets=None, detids=None):
@@ -18,14 +19,16 @@ class SimpleLoader(socommon.Loader):
 		# No det-slicing yet, but easy to add
 		ind = linfo.omap[id]
 		row = linfo.obsinfo[ind]
-		return ProbeInfo(row.ndet, row.nsamp, row.ctime, (row.nsamp-1)/row.dur, ind=ind)
+		return socommon.ProbeInfo(row.ndet, row.nsamp, row.ctime, (row.nsamp-1)/row.dur, ind=ind)
 	def load(self, linfo, id, dets=None, detids=None, samprange=None, pinfo=None):
 		if pinfo is None: pinfo = linfo.probe(id, dets=dets, detids=detids)
+		# mul, dets, detids, samprange, etc. not supported
 		with bench.mark("SimpleLoader read"):
-			obs = read_tod(self.obsinfo[ind].path, mul=self.dev.lib.bsize)
+			fname = os.path.join(self.infodir, self.obsinfo[pinfo.ind].path)
+			obs   = read_data(fname, dev=self.dev)
 		with bench.mark("SimpleLoader tod2dev"):
 			obs.tod = self.pool("tod").array(obs.tod)
-		obs.subids = [srange_suffix(id, samprange)]
+		obs.subids = [id]
 		obs.errors = []
 		return obs
 	def prealloc(self, linfo):

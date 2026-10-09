@@ -51,7 +51,8 @@ comm_all   = mpi.COMM_WORLD
 comm_per   = mpi.COMM_SELF if separate else mpi.COMM_WORLD
 mpi.install_abort_hook()
 dtype      = {32:np.float32, 64:np.float64}[args.bits]
-shape, wcs = enmap.read_map_geometry(args.area)
+gfile      = gutils.find_geometry(args.area)
+shape, wcs = enmap.read_map_geometry(gfile)
 if args.dump == "none" or "": dump = []
 else: dump = [int(w) for w in args.dump.split(",")]
 ocomps     = utils.parse_ints(args.ocomps)
@@ -74,7 +75,7 @@ dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
 detids = gutils.read_detnames(args.detids) if args.detids is not None else None
 # Set up our data loader
 split     = args.split*1e9 if args.split else None
-fast_fail = args.ignore != "none"
+fast_fail = args.ignore == "none"
 loader    = loading.get_loader(args.context, type=args.loader, group=args.joint, split=split, tsplit=args.tsplit, fast_fail=fast_fail, dev=dev, dtype=dtype)
 linfo   = loader.query(args.query, dets=dets, detids=detids)
 linfo   = linfo[gutils.parse_slice(args.sel)]
@@ -89,6 +90,7 @@ utils.mkdir(args.odir)
 if comm_all.rank == 0:
 	with open(prefix + "args.txt", "w") as ofile:
 		ofile.write(" ".join(sys.argv) + "\n")
+	config.save(prefix + "config.txt")
 # Useful to have in log-files too
 L.print(" ".join(sys.argv), level=0, id=0, color=colors.lgreen)
 # Set up what to output for each signal. This is limited and hacky,

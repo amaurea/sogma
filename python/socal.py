@@ -36,7 +36,7 @@ def autocut(obs, id="?", which=None, geo=None, dev=None, meta=None):
 	obs.fill = fill
 	return obs
 
-config.default("object_cut",    "planets:10,asteroids:5")
+config.default("object_cut",    "planets:10,asteroids:5", "Comma-separated list of which object classes to cut. Format objtype1:rad1,objtype2:rad2, etc. Objtype can be planets and asteroids. The radii are in arcminutes, and can be left out, in which case they default to 30 arcmin")
 def object_cut(obs, id="?", object_list=None, geo=None, sysdown=8, base_res=0.5*utils.arcmin,
 		dt=100, dr=1*utils.arcsec, dev=None, meta=None):
 	from pixell import mpi

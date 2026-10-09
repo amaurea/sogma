@@ -478,8 +478,12 @@ def finish_query(res_db, pycode, slices=[], sweeps=True, output="sogma"):
 	)
 	# Build a band-string, which is band:det_type, except for normal OPTC
 	# detectors where it's just band
-	dtype = [("id","U100"),("ndet","i"),("nsamp","i"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("fhwp","d"),("r","d"),("sweep","d",(6,2)),("band","U100")]
+	dtype = [("id","U100"),("ndet","i"),("nsamp","i8"),("ctime","d"),("dur","d"),("baz","d"),("waz","d"),("bel","d"),("wel","d"),("roll","d"),("fhwp","d"),("r","d"),("sweep","d",(6,2)),("band","U100")]
 	obsinfo = np.zeros(len(info), dtype).view(np.recarray)
+	# Resultset will have wrong dtype if empty, so short ciruit here
+	# to avoid exceptions later for the len=0 special case
+	if len(info) == 0:
+		return info if output == "resultset" else obsinfo
 	obsinfo.id    = info["subobs_id"]
 	obsinfo.ndet  = ndet
 	obsinfo.nsamp = info["n_samples"]

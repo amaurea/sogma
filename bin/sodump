@@ -1,8 +1,8 @@
 #!/usr/bin/env -S python -u
 import numpy as np, os, time, sys
 from pixell import config, enmap, utils, mpi, colors, bench, bunch
-from sogma import logging, mapmaking, loading, tiling, nmat, device, gutils
-from sogma.loaders import sofast, simple
+from sogma import logging, loading, device, gutils, errors, soeph
+from sogma.loaders import simple
 # Have to do all imports that could contain configuration before
 # building config.ArgumentParser because these may define variables.
 # This means we can't bail out early when called with wrong arguments;
@@ -38,71 +38,57 @@ bench.set_verbose(verbosity >= 3)
 L.print("Init", level=0, id=0, color=colors.lgreen)
 # Benchmarking
 bench.set_tfun(dev.time)
-# Set up our data loader
-loader  = loading.Loader(args.context, type=args.loader, dev=dev)
-obsinfo = loader.query(args.query)
-if len(obsinfo) == 0:
-	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
-	sys.exit(1)
+# Register ephemerides
+soeph.setup()
 # Optional detector restriction
 dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
 detids = gutils.read_detnames(args.detids) if args.detids is not None else None
-# Define obs-groups
-joint   = loader.group_obs(obsinfo, mode=args.joint)
-ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-post    = mapmaking.post_settings(ginfo)
-joint   = gutils.time_split(joint, ginfo, post=post, maxsize=args.split*1e9, maxdur=args.tsplit)
-# group selection. Sadly this can't be done with the query-level selection, as that
-# happens before grouping.
-jinds   = eval("list(range(%d))[%s]" % (len(joint.groups),args.sel))
-joint   = gutils.select_groups(joint, jinds)
-ngroup  = len(joint.groups)
-if joint.joint:
-	bandmsg = ",".join(joint.bands)
-	if len(joint.nullbands) > 0:
-		bandmsg += " null " + ",".join(joint.nullbands)
-	L.print("Dumping %d tod-groups across %s with %d mpi tasks" % (ngroup, bandmsg, comm.size), level=0, id=0, color=colors.lgreen)
-else:
-	L.print("Dumping %d tods with %d mpi tasks" % (ngroup, comm.size), level=0, id=0, color=colors.lgreen)
+# Set up our data loader
+split     = args.split*1e9 if args.split else None
+fast_fail = args.ignore != "none"
+loader    = loading.get_loader(args.context, type=args.loader, group=args.joint, split=split, tsplit=args.tsplit, fast_fail=fast_fail, dev=dev, dtype=dtype)
+linfo   = loader.query(args.query, dets=dets, detids=detids)
+linfo   = linfo[gutils.parse_slice(args.sel)]
+if linfo.nobs == 0:
+	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
+	sys.exit(1)
+L.print("Dumping %d tods with %d mpi tasks" % (linfo.nobs, comm.size), level=0, id=0, color=colors.lgreen)
 utils.mkdir(args.odir)
 # Set up exception types we will ignore
-if   args.ignore == "all":     etypes, load_catch = (Exception,), "all"
-elif args.ignore == "missing": etypes, load_catch = (utils.DataMissing,), "expected"
-elif args.ignore == "recover": etypes, load_catch = (utils.DataMissing, gutils.RecoverableError), "all"
-elif args.ignore == "none":    etypes, load_catch = (), "none"
+if   args.ignore == "all":     etypes = (Exception,)
+elif args.ignore == "missing": etypes = (errors.DataMissing,)
+elif args.ignore == "recover": etypes = (errors.RecoverableError,)
+elif args.ignore == "none":    etypes = ()
 else: raise ValueError("Unrecognized error ignore setting '%s'" % str(args.ignore))
+if comm.rank == 0: simple.write_obsinfo(args.odir + "/obsinfo.npy", linfo.obsinfo)
 
-# We will use joint.name as file names for the dumped files, and it's
-# annoying to have to escape : in the file names all the time, so replace them with _
-joint.names = [name.replace(":","_") for name in joint.names]
-
-# Output preliminary obsinfo, in case we get interrupted. This
-# will differ slightly from the final one in that it doesn't know about
-# parts of the data that get skipped
-oinfo = mapmaking.merge_obsinfo(obsinfo, joint)
-if comm.rank == 0: simple.write_obsinfo(args.odir + "/obsinfo.npy", oinfo)
-
-# Loop through and dump
-inds  = mapmaking.distribute_tasks(obsinfo, joint, comm, taskdist="simple")
+# Will record the actual number of detectors and samples here
+oinfo_dtype = linfo.obsinfo.dtype.descr + [("path","U256")]
+oinfo = np.zeros(linfo.nobs, dtype=oinfo_dtype).view(np.recarray)
+for key in linfo.obsinfo.dtype.names:
+	oinfo[key] = linfo.obsinfo[key]
 oinfo.ndet  = 0
 oinfo.nsamp = 0
+# Loop through and dump
+inds  = range(comm.rank, linfo.nobs, comm.size)
 for i, ind in enumerate(inds):
-	name   = joint.names[ind]
-	subids = obsinfo.id[joint.groups[ind]]
 	t1     = time.time()
+	id     = linfo.obsinfo.id[ind]
+	name   = id.replace(":","_")
 	try:
-		data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids, post=post, dtype=dtype)
+		data  = linfo.load(id)
 	except etypes as e:
-		L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
+		L.print("Skipped %d %s: %s" % (ind, id, str(e)), level=2, color=colors.red)
 		continue
 	if len(data.errors) > 0:
 		# Partial skip
 		L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
 	# Finish our row of oinfo
-	oinfo.ndet, oinfo.nsamp = data.tod.shape
+	oinfo.ndet[ind], oinfo.nsamp[ind] = data.tod.shape
+	oinfo.path[ind] = name + ".hdf"
 	# Output our data
 	data.tod = dev.get(data.tod)
-	simple.write_data(args.odir + "/" + name + ".hdf", data)
+	simple.write_data(args.odir + "/" + oinfo.path[ind], data)
 	L.print("Processed %d %s %4d %6d" % (ind, name, *data.tod.shape), level=1)
 # Output final obsinfo
 oinfo.ndet  = utils.allreduce(np.ascontiguousarray(oinfo.ndet),  comm)

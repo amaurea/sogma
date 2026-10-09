@@ -151,7 +151,7 @@ class Sampcut:
 		self.nsamp  = nsamp # not *really* necessary, but nice to have
 	def __getitem__(self, sel):
 		"""Extract a subset of detectors and/or samples. Always functions
-		as a slice, so the reslut is a new Sampcut. Only standard slicing is
+		as a slice, so the result is a new Sampcut. Only standard slicing is
 		allowed in the sample direction - no direct indexing or indexing by lists."""
 		if not isinstance(sel, tuple): sel = (sel,)
 		if len(sel) == 0: return self
@@ -345,6 +345,7 @@ def merge_sampcuts(cuts):
 	"""Get the union of the given list of Sampcuts"""
 	# 1. Flatten each cut. After this, franges will contain
 	# a concatenated but not sorted set of flattened cuts.
+	cuts = [cut.simplify() for cut in cuts]
 	ndet = len(cuts[0].bins)
 	nsamp= cuts[0].nsamp
 	N    = nsamp+1 # +1 to avoid merging across dets

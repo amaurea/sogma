@@ -1,11 +1,8 @@
 import time, contextlib, os, re
 import numpy as np
-from pixell import utils, colors, bunch, fft
+from pixell import utils, colors, bunch, fft, config
 from . import device
 from .logging import L
-
-class RecoverableError(Exception): pass
-class SignalOrderError(Exception): pass
 
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
@@ -54,6 +51,19 @@ def detmean_ps(ftod):
 	ps  = detsum_ps(ftod)
 	ps /= 2*ftod.shape[0]
 	return ps
+
+def multi_cov(a, b):
+	"""Calculates the covariance of a and b over the last axis.
+	They must have the same shape. No broadcasting is done.
+	Will not produce large intermediates as long as pre-dimensions
+	do not have non-trivial strides"""
+	ap    = device.anypy(a)
+	rtype = utils.real_dtype(a.dtype)
+	ra    = a.view(rtype)
+	rb    = b.view(rtype)
+	cov   = ap.einsum("...i,...i->...", ra, rb)
+	cov  /= a.shape[-1]
+	return cov
 
 def between_inplace(x, v1, v2):
 	"""For each element in x, replace it with 0/1 if that element
@@ -387,6 +397,7 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 	if dev is None: dev = device.get_device()
 	if not inplace: tod = tod.copy()
 	ndet, nsamp = tod.shape
+	stride = tod.strides[-2]//tod.strides[-1]
 	B    = dev.np.empty([2,nsamp],dtype=tod.dtype) # [{a,b},nsamp]
 	B[0] = x
 	B[1] = one
@@ -397,7 +408,7 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 		# tod      = tod_mul*otod
 		# transposed: coeffs' = abmul*otod.dot(B')
 		coeffs = dev.np.zeros((2,ndet), tod.dtype) # [{a,b},ndet]
-		dev.lib.gemm("T", "N", ndet, 2, nsamp, abmul, tod, nsamp, B, nsamp, 0, coeffs, ndet)
+		dev.lib.gemm("T", "N", ndet, 2, nsamp, abmul, tod, stride, B, nsamp, 0, coeffs, ndet)
 		if tod_mul != 1: tod *= tod_mul
 	else:
 		# otod = abmul*coeffs.T.dot(B) + tod_mul*tod
@@ -405,7 +416,7 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 		# In standard form
 		# [otod] = [abmul*B' tod_mul*I] [coeffs tod]'
 		coeffs = dev.np.array([a,b]) # [{a,b},ndet]
-		dev.lib.gemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
+		dev.lib.gemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, stride)
 	return tod, coeffs[0], coeffs[1]
 
 def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, npad=None, dev=None, external_v=False, return_edges=False):
@@ -1047,3 +1058,9 @@ def parse_pickup(desc):
 	parser.add_argument("mode", choices=["none", "az", "phase"])
 	parser.add_argument("-r", "--res", type=float, default=15)
 	return parser.parse_args(desc)
+
+# This and other SOPATH stuff (like in soeph) should go into a new module, and hook into the site config
+config.default("geometry_path", "$SOPATH/sore/amaurea/geometry/current", "Path to directory with standard geometries")
+def find_geometry(name):
+	if name.endswith(".fits"): return name
+	else: return os.path.join(os.path.expandvars(config.get("geometry_path")), name + ".fits")

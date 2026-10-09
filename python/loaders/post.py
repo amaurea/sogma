@@ -1,12 +1,14 @@
 import numpy as np
-from pixell import utils, bunch, bench, config, fft
-from .. import errors, socut
+from pixell import utils, bunch, bench, config, fft, colors
+from .. import errors, socut, device, gutils
+from ..logging import L
 from . import socommon
 from .socommon import srange_chain, srange_expand
 
 config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
 config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")
 config.default("down", 1.0, "Downsampling factor. Set to 0 or 1 to disable downsampling")
+config.default("diff", "none", "Detector pair-differencing. none, band or pair")
 
 class PostLoader(socommon.Loader):
 	"""Uses the memory pools tod, ft, wtod, dtod. The last 3 only if demod/down. Pass pool_map
@@ -42,14 +44,15 @@ class PostLoader(socommon.Loader):
 		# linfo:[obsinfo:[id,ndet,nsamp,ctime,dur,bas,waz,bel,wel,roll,fhwp,r,sweep], ...]
 		linfo   = self.loader.query(query, dets=dets, detids=detids)
 		# Settings for demodulation and downsampling
-		fhwp  = np.mean(np.abs(linfo.obsinfo.fhwp))
+		fhwp  = np.mean(np.abs(linfo.obsinfo.fhwp)) if linfo.obsinfo.size > 0 else 0
 		demod = check_demod(config.get("demod"), has_hwp=fhwp>0)
 		comps = config.get("comps")
 		down  = config.get("down") or 1
+		diff  = config.get("diff")
 		# Apply grouping
 		# joint:[names[ng],groups[ng][nmemb],bands[nband],nullbands[nnull],joint:bool,sampranges=None]
 		joint   = self.loader.group_obs(linfo, mode=self.group)
-		obsinfo_merged = merge_obsinfo(linfo.obsinfo, joint.groups, joint.names)
+		obsinfo_merged = merge_obsinfo(linfo.obsinfo, joint.groups, joint.names, diff=diff)
 		# Should find a better name for this. It splits in time both based on duration and size,
 		# and also calculates the total downsampling factor (including demodulation) and detector duplication factor
 		post    = prepare_post(obsinfo_merged, demod=demod, down=down, comps=comps, maxsize=self.split, maxdur=self.tsplit)
@@ -59,18 +62,18 @@ class PostLoader(socommon.Loader):
 		# Update nsamp and ndet to take into account demodulation etc.
 		# We do this because the obsinfo we expose refers to the fully processed tods, not the underlying raw ones
 		obsinfo.nsamp = utils.nint(obsinfo.nsamp/post.downfact[ind_map])
-		obsinfo.ndet *= post.detfact
+		obsinfo.ndet *= post.detfact // post.diffdown
 		# Make our sub-loader aware of our samprange plans. Used only for
 		# preallocation
-		linfo.maxnsamp = np.max(sampranges[:,1]-sampranges[:,0])
+		linfo.maxnsamp = np.max(sampranges[:,1]-sampranges[:,0], initial=0)
 		# Build the final it→id map
 		imap = [joint.groups[ind] for ind in ind_map]
 		# sampranges refers to the raw subobs ranges we want. It has the same length as obsinfo,
 		# but refers to raw samples, not demodulated ones
 		return PostLoadInfo(self, obsinfo, sublinfo=linfo, imap=imap,
-			sampranges=sampranges, demod=demod, comps=comps, down=down,
-			downfact=post.downfact[ind_map], detfact=post.detfact)
-	def probe(self, linfo, id, dets=None, detids=None):
+			sampranges=sampranges, demod=demod, comps=comps, down=down, diff=diff,
+			downfact=post.downfact[ind_map], detfact=post.detfact, diffdown=post.diffdown)
+	def probe(self, linfo, id, dets=None, detids=None, minsamps=10):
 		"""The job of this function is to find how our subids' samples align, so we
 		can read in consistently aligned samples. It also estimates the resulting ndet and nsamp,
 		but these can deviate from what actually gets read due to internal cuts in load()
@@ -87,6 +90,7 @@ class PostLoader(socommon.Loader):
 		subinfo = subinfo[order]
 		# Probe the individual subobs
 		pinfos     = []
+		valid      = []
 		exceptions = []
 		eids       = []
 		for si, subid in enumerate(subinfo.id):
@@ -94,16 +98,28 @@ class PostLoader(socommon.Loader):
 				with bench.mark("PostLoader subprobe"):
 					pinfo = linfo.sublinfo.probe(subid, dets=dets, detids=detids)
 				pinfos.append(pinfo)
+				valid.append(si)
 			except self.catch as e:
 				exceptions.append(e)
 				eids.append(subid)
 		if len(pinfos) == 0:
-			raise errors.LoadError(format_multi_exception(exceptions, eids))
+			raise errors.LoadError(errors.format_multi_exception(zip(eids, exceptions)))
+		# Prune subobs we could not probe
+		sinds   = np.array(sinds)[valid]
+		subinfo = subinfo[valid]
 		# Find the overlapping and aligned sample ranges for the given sampranges, if
 		# possible. FIXME handle exception here
 		subranges = pinfo_overlap(pinfos)
 		subranges = srange_chain(subranges, linfo.sampranges[oind])
-		ndet  = sum([pinfo.ndet for pinfo in pinfos])*linfo.detfact
+		# It's possible for the actual file to be shorter than the obsdb claims,
+		# in which case some ranges could have no samples. Eliminate those
+		valid   = np.where(subranges[:,1]-subranges[:,0] >= minsamps)[0]
+		if len(valid) == 0:
+			raise errors.LoadError("Fewer samples than expected in file")
+		sinds, subinfo, subranges = [a[valid] for a in  [sinds, subinfo, subranges]]
+		pinfos  = [pinfos[i] for i in valid]
+		# Ok, done pruning
+		ndet  = sum([pinfo.ndet for pinfo in pinfos])*linfo.detfact // linfo.diffdown
 		# At this point we know our samples are compatible, so can summarize timing from first
 		nsamp = subranges[0,1]-subranges[0,0]
 		srate = pinfos[0].srate
@@ -154,13 +170,12 @@ class PostLoader(socommon.Loader):
 			obs.cuts.append(subobs.cuts)
 			obs.fill.append(subobs.fill)
 			obs.subids += subobs.subids
-			obs.errors += subobs.errors
 			# Copy tod over to the right part of the output buffer
 			obs.tod[dcum:dcum+len(subobs.tod)] = subobs.tod
 			dcum += len(subobs.tod)
 		# Were we left with anything at all?
 		if dcum == 0:
-			raise errors.NothingLeft(format_multi_exception(pinfo.exceptions, pinfo.eids))
+			raise errors.NothingLeft(errors.format_multi_exception(zip(pinfo.eids, pinfo.exceptions)))
 		# Concatenate the work-lists into the final arrays
 		for field, axis in append_fields:
 			obs[field] = np.concatenate(obs[field],axis) if obs[field][0] is not None else None
@@ -168,6 +183,10 @@ class PostLoader(socommon.Loader):
 		obs.fill = socut.Simplecut.detcat(obs.fill)
 		# Trim tod in case we lost some detectors
 		obs.tod = obs.tod[:dcum]
+		# Experimental pair-differencing. Can't be done with demod and down, because
+		# we don't have multiple bands there
+		if linfo.diff != "none":
+			obs = detdiff(obs, mode=linfo.diff, dev=self.dev, pool_map=self.pool_map)
 		# Record non-fatal errors and where they came from
 		obs.errors = list(zip(pinfo.eids, pinfo.exceptions))
 		return obs
@@ -178,6 +197,7 @@ class PostLoader(socommon.Loader):
 		nsamp = np.minimum(obsinfo.nsamp, linfo.maxnsamp)
 		nout = s(obsinfo.ndet, nsamp)
 		# max size of full processed subobs. Differs from nout by having fewer dets
+		# Hack: No diffdown here, to ensure the pre-diff buffers are large enough
 		nper = s(obsinfo.ndet/linfo.detfact, nsamp)
 		# max size of raw output from subloader
 		nsub = s(obsinfo.ndet/linfo.detfact, nsamp*linfo.downfact)
@@ -193,10 +213,10 @@ class PostLoadInfo(socommon.LoadInfo):
 	"""Class representing a set of observations to load, and metadata needed to load it.
 	Contains at least the .obsinfo member a numpy table of the observations and their properties,
 	and provides the load() meathod for reading in an observation"""
-	def __init__(self, loader, obsinfo, sublinfo, imap, sampranges, demod, comps, down, downfact, detfact, omap=None):
+	def __init__(self, loader, obsinfo, sublinfo, imap, sampranges, demod, comps, down, downfact, diff, detfact, diffdown, omap=None):
 		super().__init__(loader, obsinfo, omap=omap)
 		loc = locals()
-		for key in ["sublinfo", "imap", "sampranges", "demod", "comps", "down", "downfact", "detfact"]:
+		for key in ["sublinfo", "imap", "sampranges", "demod", "comps", "down", "downfact", "diff", "detfact", "diffdown"]:
 			setattr(self, key, loc[key])
 	def __getitem__(self, sel):
 		res = super().__getitem__(sel)
@@ -282,6 +302,8 @@ def demodulate(data, frel=1, comps="TQU", mul=None, dev=None, pool_map={}):
 	# Resample cuts, and duplicate them across the virtual detectors
 	recuts      = data.cuts.to_sampcut()[:,:intrunc].to_simple().resample(onsamp).simplify()
 	odata.cuts  = socut.Simplecut.detcat([recuts]*len(modfuns))
+	refill      = data.fill.to_sampcut()[:,:intrunc].to_simple().resample(onsamp).simplify()
+	odata.fill  = socut.Simplecut.detcat([refill]*len(modfuns))
 	odata.tod   = pool_dtod.zeros((len(odets),onsamp), dtype) # filled below
 	# Ok, here comes the actual demodulation part
 	hwp = dev.np.array(data.hwp[:intrunc].astype(dtype))
@@ -301,7 +323,7 @@ def demodulate(data, frel=1, comps="TQU", mul=None, dev=None, pool_map={}):
 		ftod   *= 2/intrunc
 		# can finally transform back
 		dev.lib.irfft(ftod, odata.tod[i*ndet:(i+1)*ndet])
-	odata.cuts.gapfill(odata.tod, dev=dev)
+	odata.fill.gapfill(odata.tod, dev=dev)
 	gutils.deslope(odata.tod, dev=dev, inplace=True, npad=odata.npad, w=100)
 	# T-detectors have response [1,0,0]
 	if comps == "TQU": odata.response[0,:ndet] = 1
@@ -352,6 +374,7 @@ def downsample(data, fsamp=None, down=None, mul=None, dev=None, pool_map=None):
 	odata.npad  = utils.nint(data.npad*onsamp/insamp)
 	# Resample cuts, and duplicate them across the virtual detectors
 	odata.cuts  = data.cuts.to_sampcut().to_simple().resample(onsamp).simplify().to_simple()
+	odata.fill  = data.fill.to_sampcut().to_simple().resample(onsamp).simplify().to_simple()
 	# Resample the tod
 	work    = pool_wtod.array(data.tod)
 	ftod    = pool_ft.empty((ndet, data.tod.shape[-1]//2+1), ctype)
@@ -367,16 +390,146 @@ def downsample(data, fsamp=None, down=None, mul=None, dev=None, pool_map=None):
 			odata[key] = data[key]
 	return odata
 
-def format_multi_exception(exceptions, subids):
-	msgs   = np.array([str(ex) for ex in exceptions])
-	uvals, order, inds = utils.find_equal_groups_fast(msgs)
-	omsgs  = []
-	for ui, uval in enumerate(uvals):
-		mysubs = [subids[o] for o in order[inds[ui]:inds[ui+1]]]
-		omsgs.append(",".join(mysubs) + ": " + uval)
-	return ", ".join(omsgs)
+def detdiff(data, mode="band", dev=None, pool_map=None, calibrate=True, bsize=100):
+	"""Return a pair-differenced version of data. The differencing type is controlled by
+	the mode argument, see the build_pairs function. If calibrate is True (the default),
+	then the detectors will be calibrated against each other before subtraction"""
+	if dev   is None: dev = device.get_device()
+	pool_tod, pool_ft, = [dev.pools[name] for name in utils.vmap(pool_map, ["tod", "ft"])]
+	ibase, iref = build_pairs(data.detids, mode=mode).T
+	npair = len(ibase)
+	nsamp = data.tod.shape[1]
+	if npair == 0: raise errors.NothingLeft("No detector pairs found (mode = '%s')" % str(mode))
+	work  = pool_ft.zeros((2*npair,data.tod.shape[1]), data.tod.dtype)
+	# First copy over the base and ref. After this, it is safe to overwrite tod
+	base, ref = work[:npair], work[npair:2*npair]
+	dev.np.take(data.tod, ibase, axis=0, out=base)
+	dev.np.take(data.tod, iref,  axis=0, out=ref)
 
-def merge_obsinfo(obsinfo, groups, names):
+	# Calibrate ref to base. We split into blocks, and for each
+	# block model base = ref*a+b. Then we use the median in the end.
+	# Blocks both make it more robust, and act as a highpass filter.
+	# We want to be atmosphere-dominated
+	if calibrate:
+		# Will calibrate with fourier-space ILC, so start by ffting
+		nfreq = nsamp//2+1
+		ctype = utils.complex_dtype(data.tod.dtype)
+		fwork = pool_tod.zeros((work.shape[0], nfreq), ctype)
+		dev.lib.rfft(work, fwork)
+		fbase,  fref  = fwork[:npair], fwork[npair:]
+		fbase = fblock_ilc(fbase, fref, bsize=bsize, inplace=True, dev=dev)
+		# Transform result back
+		dev.lib.irfft(fbase, base)
+		base /= nsamp
+	else:
+		base -= ref
+
+	def build_cuts(cuts):
+		cuts = cuts.to_sampcut()
+		c1 = cuts[ibase]
+		c2 = cuts[iref]
+		ocuts = socut.Sampcut.merge([c1,c2])
+		ocuts = ocuts.to_simple()
+		return ocuts
+
+	# Construct output data
+	odata = bunch.Bunch()
+	odata.tod  = pool_tod.array(base)
+	odata.cuts = build_cuts(data.cuts)
+	odata.fill = build_cuts(data.fill)
+	odata.dets   = data.dets  [ibase] + "-" + data.dets[iref]
+	odata.detids = data.detids[ibase] + "-" + data.detids[iref]
+	odata.polangle = data.polangle[ibase] # FIXME for pair mode
+	odata.point_offset = data.point_offset[ibase]
+	if "band" in mode:
+		odata.bands = data.bands[ibase] + "+" + data.bands[iref]
+
+	# Everything else will be simply copied over
+	for key in data:
+		if key not in odata:
+			odata[key] = data[key]
+
+	return odata
+
+def build_pairs(detids, mode="band"):
+	"""Given detids of the form Mv21_f090_Ar00c02A returns an array of
+	indices pairs[npair,base,ref], where base is the base is the
+	detector to be compared, and ref is the detector to
+	compare it to. How these are built depend on the value of mode:
+	* mode = "band": pair[npair,{low-band,high-band}]. That is, base
+	  is the low-band detector in a pixel, and there is exactly one
+	  ref, its high-band partner. If either is missing, the pair is
+	  skipped.
+	* mode = "pair": pair[npair,{A,B}]. So like band, but comparing
+	  the A and B detectors in the same band.
+	* mode = "band-any": Like band, but if the band-partner is missing,
+	  that detectors AB-partner is substituted if available. This
+	  mode can be useful if polarization isn't important, and one
+	  wants to lose fewer detectors due to missing partners.
+
+	This function assumes that there are just two bands/pairs involved,
+	and will exit with an assertion if there are more."""
+	wafid, _, rest = np.char.partition(detids, "_").T
+	band  = np.strings.slice(rest, 0,  4)
+	pixel = np.strings.slice(rest, 5, 12)
+	AB    = np.strings.slice(rest,12, 13)
+	if   mode == "band":
+		pname, pid = np.unique(wafid + pixel + AB, return_inverse=True)
+		sname, sid = np.unique(band, return_inverse=True)
+	elif mode == "pair":
+		pname, pid = np.unique(wafid + pixel + band, return_inverse=True)
+		sname, sid = np.unique(AB, return_inverse=True)
+	elif mode == "band-any":
+		# both members in the other-band pair will be used
+		pname, pid = np.unique(wafid + pixel, return_inverse=True)
+		sname, sid = np.unique(band  + AB, return_inverse=True)
+	else:
+		raise ValueError("Unrecognized build_pairs mode '%s'" % str(mode))
+	def firstvalid(vals): return np.where(vals[0]>=0, vals[0], vals[1])
+	pairs = np.full((len(pname),len(sname)), -1, dtype=int)
+	pairs[pid,sid] = np.arange(len(detids))
+	if mode == "band-any":
+		# Have ndet,{b1p1,b1p2,b2p1,b2p2} now, but want
+		# [b1p1,b2p1,b2p2]
+		# [b1p2,b2p1,b2p2]
+		# If we only have a single band, then we can't form any pairs.
+		if pairs.shape[1] != 4: return np.zeros((0,2), int)
+		refgood = np.any(pairs[:,2:]>=0,1)
+		good1 = (pairs[:,0]>=0) & refgood
+		good2 = (pairs[:,1]>=0) & refgood
+		ng1, ng2 = np.sum(good1), np.sum(good2)
+		work  = np.zeros((ng1+ng2,2), dtype=int)
+		work[:ng1,0] = pairs[good1,0]
+		work[ng1:,0] = pairs[good2,1]
+		work[:ng1,1] = firstvalid(pairs[good1,2:].T)
+		work[ng1:,1] = firstvalid(pairs[good2,3:1:-1].T)
+		pairs = work
+	else:
+		if pairs.shape[1] != 2: return np.zeros((0,2), int)
+	good = np.all(pairs>=0,1)
+	pairs = pairs[good]
+	return pairs
+
+def fblock_ilc(fbase, fref, bsize=100, dev=None, inplace=False):
+	if dev is None: dev = device.get_device()
+	if not inplace: fbase = fbase.copy()
+	bbase = gutils.blockify(fbase, bsize)
+	bref  = gutils.blockify(fref,  bsize)
+	# Calculate the variances
+	Vb    = dev.np.var(bbase, axis=-1)
+	Vr    = dev.np.var(bref,  axis=-1)
+	Vbr   = gutils.multi_cov(bbase, bref)
+	# Calculate the ILC factor. Not sample variance bias corrected,
+	# so pass in a big enough bsize
+	a     = (Vr-Vbr)/(Vb-Vbr)
+	# Apply the scaling. (fbase*a+fref)/(1+a). I do it this way
+	# because it makes it easier to use in-place operations
+	dev.lib.block_scale(fbase, a, bsize=bsize, inplace=True)
+	fbase += fref
+	dev.lib.block_scale(fbase, 1/(1+a), bsize=bsize, inplace=True)
+	return fbase
+
+def merge_obsinfo(obsinfo, groups, names, diff="none"):
 	"""Merge obsinfo into groups with the given names. Returns new obsinfo"""
 	first = np.array([group[0] for group in groups], dtype=int)
 	oinfo = obsinfo[first].copy()
@@ -387,6 +540,12 @@ def merge_obsinfo(obsinfo, groups, names):
 		oinfo.ndet[gi] = np.sum(obsinfo.ndet[group])
 		# Band concats
 		oinfo.band[gi] = "+".join(np.unique(obsinfo.band[group]))
+	# FIXME: Consider reducing ndet here if diff is on. Would need to
+	# change some prealloc info at the same time
+	if "band" in diff:
+		# In band-diff mode, we must have exactly two bands per group
+		nband = np.strings.count(oinfo.band, '+')+1
+		oinfo = oinfo[nband==2]
 	return oinfo
 
 def split_obsinfo(obsinfo, targ_nsamps, fmt=":split%d"):
@@ -411,7 +570,7 @@ def split_obsinfo(obsinfo, targ_nsamps, fmt=":split%d"):
 	assert oi == len(oinfo)
 	return oinfo, ind_map, sampranges
 
-def prepare_post(obsinfo, demod=False, down=None, comps="TQU", maxsize=None, maxdur=None, frel=1):
+def prepare_post(obsinfo, demod=False, down=None, comps="TQU", diff="none", maxsize=None, maxdur=None, frel=1):
 	# Find our total downsampling factor
 	nsplits  = np.full(len(obsinfo),1,int)
 	downfact = np.full(len(obsinfo),1,float)
@@ -432,7 +591,9 @@ def prepare_post(obsinfo, demod=False, down=None, comps="TQU", maxsize=None, max
 	# Split by duration
 	if maxdur is not None:
 		nsplits = np.maximum(nsplits, utils.floor(obsinfo.dur/maxdur)+1)
-	return bunch.Bunch(nsplits=nsplits, downfact=downfact, detfact=detfact)
+	# Pair-differencing. Usually not on
+	diffdown = 1 if diff == "none" else 2
+	return bunch.Bunch(nsplits=nsplits, downfact=downfact, detfact=detfact, diffdown=diffdown)
 
 def nsplit2bsize(nsplit, nsamp, factors=[2,3,5,7], mul=32):
 	return fft.fft_len(utils.ceil(nsamp/nsplit/mul), factors=factors, direction="above")*mul
@@ -454,7 +615,7 @@ def pinfo_overlap(pinfos, tol=0.1):
 	misalign1 = np.abs((t1s+i1s/srates-t1)*srates)
 	misalign2 = np.abs((t1s+i2s/srates-t2)*srates)
 	if np.any(misalign1 > tol) or np.any(misalign2 > tol):
-		raise ValueError("incompatible timestamps")
+		raise errors.LoadError("incompatible timestamps")
 	sranges = np.concatenate([i1s[...,None],i2s[...,None]],-1)
 	return sranges
 

@@ -1072,7 +1072,6 @@ class NmatTree(Nmat):
 		if not inplace: tod = tod.copy()
 		self.tr_win.apply(tod, nwin=nwin)
 		rft = self.tr_ft.apply(tod)
-		rft /= 1e9
 		self.tr_tree.apply(rft)
 		self.dev.lib.block_scale(rft, self.iD, bsize=self.bsize, inplace=True)
 		self.tr_tree.transpose(rft)

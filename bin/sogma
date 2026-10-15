@@ -155,6 +155,7 @@ elif args.nmat == "new2":   noise_model = nmat.NmatAdaptive2(dev=dev)
 elif args.nmat == "newtest":noise_model = nmat.NmatAdaptive(dev=dev, atm_res=2**0.5)
 elif args.nmat == "jons":   noise_model = nmat.NmatDetvecsScaled(dev=dev)
 elif args.nmat == "prot":   noise_model = nmat.NmatPairRot(nmat.NmatDetvecsScaled(dev=dev), dev=dev)
+elif args.nmat == "tree":   noise_model = nmat.NmatTree(dev=dev)
 else: raise ValueError("Unrecognized noise model '%s'" % (str(args.nmat)))
 # Set up the mapmaker
 mapmaker = mapmaking.MLMapmaker(signals=signals, dtype=dtype, verbose=True, noise_model=noise_model, dev=dev, outputs=ml_out)

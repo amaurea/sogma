@@ -244,7 +244,7 @@ try:
 			self.lib.block_scale = cpu_mm.block_scale
 			# Pair-rotation
 			self.lib.pair_rot = cpu_mm.pair_rot
-			self.lib.pair_cov = com_mm.pair_cov
+			self.lib.pair_cov = cpu_mm.pair_cov
 
 	device_types.cpu = MMDeviceCpu
 

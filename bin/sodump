@@ -92,6 +92,6 @@ for i, ind in enumerate(inds):
 	L.print("Processed %d %s %4d %6d" % (ind, name, *data.tod.shape), level=1)
 # Output final obsinfo
 oinfo.ndet  = utils.allreduce(np.ascontiguousarray(oinfo.ndet),  comm)
-oinfo.nsamp = utils.allreduce(np.ascontiguousarray(oinfo.nsamp), comm)
+oinfo.nsamp = utils.allreduce(np.ascontiguousarray(oinfo.nsamp.astype(np.int32)), comm)
 oinfo = oinfo[oinfo.ndet > 0]
 if comm.rank == 0: simple.write_obsinfo(args.odir + "/" + "obsinfo.npy", oinfo)

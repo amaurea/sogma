@@ -1042,14 +1042,14 @@ class NmatTree(Nmat):
 		self.tr_win  = tr_win  or TransWindow (dev=self.dev)
 		self.tr_ft   = tr_ft   or TransFourier(dev=self.dev, real=True)
 		self.tr_tree = tr_tree or TransTree   (dev=self.dev)
-		self.ready = tr_win.ready and tr_ft.ready and tr_tree.ready
+		self.ready = self.tr_win.ready and self.tr_ft.ready and self.tr_tree.ready
 		if self.ready:
 			self.unit = self.tr_win.unit * self.tr_ft.unit * self.tr_tree.unit
 			self.norm = self.tr_win.norm * self.tr_ft.norm * self.tr_tree.norm
 			self.ivar = 1/(self.tr_tree.info.white * self.unit**2)
-			self.iD   = 1/(self.tr_tree.info.bvar  * self.unit**2)
+			self.iD   = 1/(self.tr_tree.info.bvars * self.unit**2)
 			# Pre-multiply the backward transform's normalization
-			self.iD  *= self.tr_tree.info.norm
+			self.iD  *= self.norm
 			self.bsize= self.tr_tree.bsize
 	def build(self, tod, srate, obs, **kwargs):
 		tr_win = self.tr_win.build(tod, srate=srate)
@@ -1060,24 +1060,33 @@ class NmatTree(Nmat):
 		# Unmangle tod
 		tr_win.inverse(tod)
 		return NmatTree(tr_win, tr_ft, tr_tree, dev=self.dev)
-	def white(self, tod, inplace=True):
+	def white(self, tod, inplace=True, nwin=None):
 		self.check_ready()
 		if not inplace: tod = tod.copy()
-		self.tr_win.apply(tod)
+		self.tr_win.apply(tod, nwin=None)
 		tod *= self.ivar[:,None]
-		self.tr_win.apply(tod)
+		self.tr_win.transpose(tod, nwin=None)
 		return tod
-	def apply(self, tod, inplace=True):
+	def apply(self, tod, inplace=True, nwin=None):
 		self.check_ready()
 		if not inplace: tod = tod.copy()
-		self.tr_win.apply(tod)
+		self.tr_win.apply(tod, nwin=nwin)
 		rft = self.tr_ft.apply(tod)
+		rft /= 1e9
 		self.tr_tree.apply(rft)
 		self.dev.lib.block_scale(rft, self.iD, bsize=self.bsize, inplace=True)
 		self.tr_tree.transpose(rft)
 		self.tr_ft.transpose(rft, tod)
-		self.tr_win.transpose(tod)
+		self.tr_win.transpose(tod, nwin=nwin)
 		return tod
+	def write(self, fname):
+		b = bunch.Bunch(
+			type="NmatTree",
+			tr_win  = self.tr_win .export(),
+			tr_ft   = self.tr_ft  .export(),
+			tr_tree = self.tr_tree.export(),
+		)
+		bunch.write(fname, b)
 
 # The idea here was to have Transformation classes encapsulating a
 # TOD transformation that is used when building the noise model,
@@ -1102,11 +1111,16 @@ class NmatTree(Nmat):
 # won't work without much more thought.
 
 class Transformation:
-	def init(self, dev=None, info=None, inplace=False, build_behavior="plain", uses_pools=[]):
+	def __init__(self, dev=None, info=None, inplace=False, build_behavior="plain", uses_pools=[]):
 		self.dev = dev or device.get_device()
 		self.inplace = inplace
 		self.build_behavior = build_behavior
 		self.uses_pools = uses_pools
+		# Info relects quantities built during build() that could be useful to
+		# the caller. It's packaged like this so multiple transformations'
+		# results can be merged into a single dict. This would have been useful
+		# when arbitrarily chaining transformations, but since that doesn't really
+		# work, it would probably have been better to make them normal members
 		self.info = info
 	@property
 	def ready(self): return self.info is not None
@@ -1121,6 +1135,7 @@ class Transformation:
 	def apply(self, idata, odata): raise NotImplementedError
 	def transpose(self, idata, odata): raise NotImplementedError
 	def inverse(self, idata, odata, normalize=False): return NotImplementedError
+	def export(self): raise NotImplementedError
 
 class TransWindow(Transformation):
 	def __init__(self, window=2.0, dev=None, info=None):
@@ -1129,14 +1144,18 @@ class TransWindow(Transformation):
 	def build(self, data, srate, **kwargs):
 		nwin = utils.nint(self.window*srate)
 		return TransWindow(window=self.window, dev=self.dev, info=bunch.Bunch(nwin=nwin))
-	def apply(self, data, dummy=None):
-		gutils.apply_window(data, self.info.nwin)
+	def apply(self, data, dummy=None, nwin=None):
+		if nwin is None: nwin = self.info.nwin
+		gutils.apply_window(data, nwin)
 		return data
-	def transpose(self, data, dummy=None):
-		return self.apply(data)
-	def inverse(self, data, dummy=None, normalize=False):
-		gutils.apply_window(data, self.info.nwin, -1)
+	def transpose(self, data, dummy=None, nwin=None):
+		return self.apply(data, nwin=nwin)
+	def inverse(self, data, dummy=None, normalize=False, nwin=None):
+		if nwin is None: nwin = self.info.nwin
+		gutils.apply_window(data, nwin, -1)
 		return data
+	def export(self):
+		return bunch.Bunch(window=self.window, nwin=self.info.nwin)
 
 class TransFourier(Transformation):
 	def __init__(self, real=False, dev=None, info=None):
@@ -1150,12 +1169,12 @@ class TransFourier(Transformation):
 			freqs = self.dev.np.repeat(freqs, 2)
 			unit *= 2**0.5
 		norm  = 1/nsamp
-		return TransFourier(real=self.real, dev=self.dev, info=Bunch.Bunch(nsamp=nsamp, freqs=freqs, unit=unit, norm=norm))
+		return TransFourier(real=self.real, dev=self.dev, info=bunch.Bunch(nsamp=nsamp, freqs=freqs, unit=unit, norm=norm))
 	def obuf(self, idata):
-		return self.dev.pools["ft"].zeros(idata.shape[:-1]+(idata.shape[-1]//2+1), utils.complex_dtype(idata.dtype))
-	def apply(self, idata, odata):
-		self.dev.lib.rfft(idata, odata=None)
+		return self.dev.pools["ft"].zeros(idata.shape[:-1]+(idata.shape[-1]//2+1,), utils.complex_dtype(idata.dtype))
+	def apply(self, idata, odata=None):
 		if odata is None: odata = self.obuf(idata)
+		self.dev.lib.rfft(idata, odata)
 		if self.real: odata = odata.view(idata.dtype)
 		# We do not normalize here. Instead us .unit to get the relevant factor for scaling ivar to sample space
 		return odata
@@ -1167,16 +1186,18 @@ class TransFourier(Transformation):
 		self.dev.lib.irfft(idata, odata)
 		if normalize: odata *= self.norm
 		return odata
+	def export(self):
+		return bunch.Bunch(real=self.real, nsamp=self.info.nsamp, freqs=self.dev.get(self.info.freqs), unit=self.info.unit, norm=self.info.norm)
 
 class TransTree(Transformation):
-	def __init__(self, bsize=128, mode="auto", dev=None, info=None):
+	def __init__(self, bsize=64, mode="auto", dev=None, info=None):
 		super().__init__(dev=dev, info=info, inplace=True, build_behavior="apply")
 		self.bsize = bsize
 		self.mode  = mode
 	def build(self, data, point_offsets, detids, **kwargs):
 		# data is [ndet,n]
 		nbin = max(data.shape[-1]//self.bsize,1)
-		passes = gutils.build_pair_passes(point_offsets, detids=detids, mode=mode)
+		passes = gutils.build_pair_passes(point_offsets, detids=detids, mode=self.mode)
 		## Flatten
 		#pairs  = np.concatenate(pair_passes, -1)
 		#passes = utils.cumsum([len(p) for p in pair_passes], endpoint=True)
@@ -1185,9 +1206,9 @@ class TransTree(Transformation):
 		bvars  = self.dev.np.var(bdata, axis=-1)   # [ndet,nblock]
 		ndet, nblock = bvars.shape
 		# Handle incomplete bin
-		extra  = data.shape[-1] - bdata.shape[-2]*bsize
+		extra  = data.shape[-1] - bdata.shape[-2]*self.bsize
 		if extra > 0:
-			bvars[...,-1] = (bvars[...,-1]*bsize + self.dev.np.var(data[...,-extra:], axis=-1)*extra)/(bsize+extra)
+			bvars[...,-1] = (bvars[...,-1]*self.bsize + self.dev.np.var(data[...,-extra:], axis=-1)*extra)/(self.bsize+extra)
 		# Estimate white noise level, since detectors will be mixed up after us.
 		# Sadly we can't in general know that we're in fourier space here, so hard to
 		# select specific frequency range
@@ -1195,13 +1216,21 @@ class TransTree(Transformation):
 		# Do the passes while measuring
 		nrot   = sum([len(pairs) for pairs in passes])
 		rots   = []
-		rots   = self.dev.np.zeros((2,nrot,nblock), data.dtype)
 		icum   = 0
 		for ip, pairs in enumerate(passes):
 			plen    = len(pairs)
 			d1, d2  = pairs.T
-			covs = self.dev.lib.pair_covs(data, pairs, bsize)
+			covs = self.dev.lib.pair_cov(data, pairs, self.bsize)
 			C    = self.dev.np.zeros((plen,nblock,2,2), covs.dtype)
+			# In theory, we can just use bvars here. In practice,
+			# numerical errors can push extremely correlated modes
+			# (>99.99% correlated) over to negative eigenvalues.
+			# Avoid that by just spending some time remeasuring.
+			# These two pair_covs should cost less than a pair_rot
+			auto1= np.repeat(pairs[:,0,None],2,axis=1)
+			auto2= np.repeat(pairs[:,1,None],2,axis=1)
+			bvars[d1] = self.dev.lib.pair_cov(data, auto1, self.bsize)
+			bvars[d2] = self.dev.lib.pair_cov(data, auto2, self.bsize)
 			C[:,:,0,0] = bvars[d1]
 			C[:,:,1,1] = bvars[d2]
 			C[:,:,0,1] = C[:,:,1,0] = covs
@@ -1220,11 +1249,17 @@ class TransTree(Transformation):
 			self.dev.lib.pair_rot(data, pairs, rot, self.bsize)
 		return data
 	def transpose(self, data, dummy=None):
-		return self.inverse(self, data)
+		return self.inverse(data)
 	def inverse(self, data, dummy=None):
-		for pairs, rot in zip(self.info.passes, self.info.rots):
+		for pairs, rot in zip(self.info.passes[::-1], self.info.rots[::-1]):
 			self.dev.lib.pair_rot(data, pairs, rot, self.bsize, inv=True)
 		return data
+	def export(self):
+		passes = utils.cumsum([len(pairs) for pairs in self.info.passes], endpoint=True)
+		pairs  = np.concatenate(self.info.passes,0)
+		rots   = np.concatenate([self.dev.get(rot) for rot in self.info.rots],1)
+		return bunch.Bunch(bsize=self.bsize, mode=self.mode, passes=passes, pairs=pairs,
+			rots=rots, bvars=self.dev.get(self.info.bvars), white=self.dev.get(self.info.white))
 
 class Filter:
 	def __init__(self, dev=None):

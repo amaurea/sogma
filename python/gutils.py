@@ -624,6 +624,8 @@ def fourier_resample(itod, otod, normalize=False, nofft=False, ipool=None, opool
 			otod /= norm
 	return otod
 
+def get_srate(ctime): return (len(ctime)-1)/(ctime[-1]-ctime[0])
+
 def jacobi(tod, op, iop=lambda x:x, niter=4):
 	res = op(tod)
 	for it in range(niter):
@@ -1230,7 +1232,7 @@ def build_pair_hierarchy_sohex(poss, detids, tol=1.5):
 
 def remap_dark(detinfo):
 	detinfo = detinfo.copy()
-	dark  = np.char.slice(detinfo.band, 0, 1) != "f"
+	dark  = np.strings.slice(detinfo.band, 0, 1) != "f"
 	idark = np.where(dark)[0]
 	if np.sum(dark) == 0: return detinfo
 	# Sort dark by wafer, row and col, then assign running numbers

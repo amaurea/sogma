@@ -140,6 +140,10 @@ try:
 					tod[...,nblock*bsize:] *= bscale[...,-1,None]
 				return tod
 			self.lib.block_scale = block_scale
+			# Pair-rotation
+			self.lib.pair_rot = gpu_mm.pair_rot
+			self.lib.pair_cov = gpu_mm.pair_cov
+			self.lib.eigh2    = gpu_mm.eigh2
 
 	def get_cublas_op(op):
 		# TODO add more
@@ -245,6 +249,7 @@ try:
 			# Pair-rotation
 			self.lib.pair_rot = cpu_mm.pair_rot
 			self.lib.pair_cov = cpu_mm.pair_cov
+			self.lib.eigh2    = cpu_mm.eigh2
 
 	device_types.cpu = MMDeviceCpu
 

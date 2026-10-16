@@ -662,6 +662,7 @@ class NmatPairRot(Nmat):
 	@staticmethod
 	def from_bunch(data, dev=None): raise NotImplementedError
 
+# TODO: This one should use dev.lib.pair_rot instead
 class PairRot:
 	def __init__(self, singles, pairs, amps, pool=None, dev=None):
 		if dev  is None: dev  = device.get_device()
@@ -1196,10 +1197,9 @@ class TransTree(Transformation):
 	def build(self, data, point_offsets, detids, **kwargs):
 		# data is [ndet,n]
 		nbin = max(data.shape[-1]//self.bsize,1)
+		# Build passes and put them on the device with the right dtype
 		passes = gutils.build_pair_passes(point_offsets, detids=detids, mode=self.mode)
-		## Flatten
-		#pairs  = np.concatenate(pair_passes, -1)
-		#passes = utils.cumsum([len(p) for p in pair_passes], endpoint=True)
+		passes = [self.dev.np.asarray(pairs, dtype=np.int32) for pairs in passes]
 		# Measure all the variances
 		bdata  = gutils.blockify(data, self.bsize) # [ndet,nblock,bsize]
 		bvars  = self.dev.np.var(bdata, axis=-1)   # [ndet,nblock]
@@ -1219,28 +1219,22 @@ class TransTree(Transformation):
 		for ip, pairs in enumerate(passes):
 			plen    = len(pairs)
 			d1, d2  = pairs.T
-			covs = self.dev.lib.pair_cov(data, pairs, self.bsize)
-			C    = self.dev.np.zeros((plen,nblock,2,2), covs.dtype)
+			covs  = self.dev.lib.pair_cov(data, pairs, self.bsize)
 			# In theory, we can just use bvars here. In practice,
 			# numerical errors can push extremely correlated modes
 			# (>99.99% correlated) over to negative eigenvalues.
 			# Avoid that by just spending some time remeasuring.
 			# These two pair_covs should cost less than a pair_rot
-			auto1= np.repeat(pairs[:,0,None],2,axis=1)
-			auto2= np.repeat(pairs[:,1,None],2,axis=1)
-			bvars[d1] = self.dev.lib.pair_cov(data, auto1, self.bsize)
-			bvars[d2] = self.dev.lib.pair_cov(data, auto2, self.bsize)
-			C[:,:,0,0] = bvars[d1]
-			C[:,:,1,1] = bvars[d2]
-			C[:,:,0,1] = C[:,:,1,0] = covs
-			E, V = self.dev.np.linalg.eigh(C)
-			# E is [plen,nblock,2], V is [plen,nblock,2,2]
-			bvars[d1,:] = E[:,:,0]
-			bvars[d2,:] = E[:,:,1]
-			rot = self.dev.np.moveaxis(V[:,:,:,0], 2, 0)
-			rot = self.dev.np.ascontiguousarray(rot)
+			auto1 = self.dev.np.repeat(pairs[:,0,None],2,axis=1)
+			auto2 = self.dev.np.repeat(pairs[:,1,None],2,axis=1)
+			vars1 = self.dev.lib.pair_cov(data, auto1, self.bsize)
+			vars2 = self.dev.lib.pair_cov(data, auto2, self.bsize)
+			E, rot = self.dev.lib.eigh2(vars1, covs, vars2)
+			bvars[d1,:] = E[0]
+			bvars[d2,:] = E[1]
 			rots.append(rot)
 			self.dev.lib.pair_rot(data, pairs, rot, self.bsize)
+			self.dev.synchronize()
 		info = bunch.Bunch(passes=passes, rots=rots, bvars=bvars, white=white)
 		return TransTree(bsize=self.bsize, mode=self.mode, dev=self.dev, info=info)
 	def apply(self, data, dummy=None):

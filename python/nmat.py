@@ -1088,6 +1088,9 @@ class NmatTree(Nmat):
 		)
 		bunch.write(fname, b)
 
+# We define w = Tx and define D = cov(w) = TCT'. Now want to apply
+# C"x = (T"DT'")"x = T'D"T x
+
 # The idea here was to have Transformation classes encapsulating a
 # TOD transformation that is used when building the noise model,
 # where transofrmation could be chained without the noise model
@@ -1194,6 +1197,7 @@ class TransTree(Transformation):
 		super().__init__(dev=dev, info=info, inplace=True, build_behavior="apply")
 		self.bsize = bsize
 		self.mode  = mode
+		self.corrtol = 0.1
 	def build(self, data, point_offsets, detids, **kwargs):
 		# data is [ndet,n]
 		nbin = max(data.shape[-1]//self.bsize,1)
@@ -1219,6 +1223,8 @@ class TransTree(Transformation):
 		for ip, pairs in enumerate(passes):
 			plen    = len(pairs)
 			d1, d2  = pairs.T
+			# Might be best to just make a single function to measure
+			# covs, vars1 and vars2 in one go
 			covs  = self.dev.lib.pair_cov(data, pairs, self.bsize)
 			# In theory, we can just use bvars here. In practice,
 			# numerical errors can push extremely correlated modes
@@ -1229,6 +1235,12 @@ class TransTree(Transformation):
 			auto2 = self.dev.np.repeat(pairs[:,1,None],2,axis=1)
 			vars1 = self.dev.lib.pair_cov(data, auto1, self.bsize)
 			vars2 = self.dev.lib.pair_cov(data, auto2, self.bsize)
+			# Clamp correlation based on machine error estimate.
+			# An alternative would be a more robust covariance measurement
+			err = np.finfo(data.dtype).resolution * self.bsize**0.5 / self.corrtol
+			cmax= vars1**0.5 * vars2**0.5 * (1-err)
+			self.dev.np.clip(covs, -cmax, cmax, out=covs)
+			# Should be safe to decompose now
 			E, rot = self.dev.lib.eigh2(vars1, covs, vars2)
 			bvars[d1,:] = E[0]
 			bvars[d2,:] = E[1]
@@ -1294,7 +1306,7 @@ class Nprep:
 	@contextlib.contextmanager
 	def __call__(self, tod, obs):
 		try: yield
-		finally: return
+		finally: pass
 
 class NprepNone(Nprep): pass
 

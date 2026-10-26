@@ -1225,16 +1225,7 @@ class TransTree(Transformation):
 			d1, d2  = pairs.T
 			# Might be best to just make a single function to measure
 			# covs, vars1 and vars2 in one go
-			covs  = self.dev.lib.pair_cov(data, pairs, self.bsize)
-			# In theory, we can just use bvars here. In practice,
-			# numerical errors can push extremely correlated modes
-			# (>99.99% correlated) over to negative eigenvalues.
-			# Avoid that by just spending some time remeasuring.
-			# These two pair_covs should cost less than a pair_rot
-			auto1 = self.dev.np.repeat(pairs[:,0,None],2,axis=1)
-			auto2 = self.dev.np.repeat(pairs[:,1,None],2,axis=1)
-			vars1 = self.dev.lib.pair_cov(data, auto1, self.bsize)
-			vars2 = self.dev.lib.pair_cov(data, auto2, self.bsize)
+			vars1, covs, vars2  = self.dev.lib.pair_cov(data, pairs, self.bsize)
 			# Clamp correlation based on machine error estimate.
 			# An alternative would be a more robust covariance measurement
 			err = np.finfo(data.dtype).resolution * self.bsize**0.5 / self.corrtol
@@ -1242,11 +1233,15 @@ class TransTree(Transformation):
 			self.dev.np.clip(covs, -cmax, cmax, out=covs)
 			# Should be safe to decompose now
 			E, rot = self.dev.lib.eigh2(vars1, covs, vars2)
-			bvars[d1,:] = E[0]
-			bvars[d2,:] = E[1]
 			rots.append(rot)
 			self.dev.lib.pair_rot(data, pairs, rot, self.bsize)
 			self.dev.synchronize()
+		# In theory we have bvars already, from the eigendecomposition E above.
+		# In practice it's safer to just measure it again, to be robust against
+		# numerical cancellation in rare cases
+		bvars  = self.dev.np.var(bdata, axis=-1)   # [ndet,nblock]
+		if extra > 0:
+			bvars[...,-1] = (bvars[...,-1]*self.bsize + self.dev.np.var(data[...,-extra:], axis=-1)*extra)/(self.bsize+extra)
 		info = bunch.Bunch(passes=passes, rots=rots, bvars=bvars, white=white)
 		return TransTree(bsize=self.bsize, mode=self.mode, dev=self.dev, info=info)
 	def apply(self, data, dummy=None):
@@ -1261,7 +1256,7 @@ class TransTree(Transformation):
 		return data
 	def export(self):
 		passes = utils.cumsum([len(pairs) for pairs in self.info.passes], endpoint=True)
-		pairs  = np.concatenate(self.info.passes,0)
+		pairs  = np.concatenate([self.dev.get(pairs) for pairs in self.info.passes],0)
 		rots   = np.concatenate([self.dev.get(rot) for rot in self.info.rots],1)
 		return bunch.Bunch(bsize=self.bsize, mode=self.mode, passes=passes, pairs=pairs,
 			rots=rots, bvars=self.dev.get(self.info.bvars), white=self.dev.get(self.info.white))

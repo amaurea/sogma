@@ -187,6 +187,7 @@ class MLMapmaker:
 			gtod += model
 		t4 = self.dev.time()
 		# And apply it to the tod
+		moo = self.dev.pools["pointing"].array(gtod)
 		gtod = iN.apply(gtod)
 		t5 = self.dev.time()
 		# This is our last chance to safely abort, so check that our data makes sense

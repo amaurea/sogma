@@ -849,9 +849,22 @@ def find_label(cmeta, name, whole=False):
 		for key in ["label", "name"]: # both not standardized?
 			if key in entry and entry[key] == name:
 				return entry["db"] if not whole else entry
+
 def cmeta_lookup(context, name):
 	val = find_label(context["metadata"], name)
 	return val.format(**context["tags"]) if val else None
+
+def get_prepdb(context):
+	"""I used to have preprocess under context.metadata,
+	but sotodlib expects to be able to load that using the
+	standard metadata system, which doesn't work. So put it
+	at the top with the obsdb and obsfiledb. This function
+	makes the migration smoother"""
+	if "preprocess" in context:
+		return context["prepdb"]
+	else:
+		return cmeta_lookup("preprocess")
+
 def read_yaml(fname):
 	with open(fname, "r") as ifile:
 		return yaml.safe_load(ifile)

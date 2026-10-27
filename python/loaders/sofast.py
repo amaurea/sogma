@@ -56,7 +56,7 @@ class SoFastLoader:
 	def __init__(self, context_or_config_or_name, dev=None, mul=32):
 		self.context   = socommon.get_expanded_context(context_or_config_or_name)
 		self.obsdb     = sqlite.open(self.context["obsdb"])
-		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
+		self.predb     = sqlite.open(socommon.get_prepdb(self.context))
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
 		self.tags   = socommon.get_tags(self.obsdb.conn)

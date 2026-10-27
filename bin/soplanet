@@ -60,32 +60,19 @@ L.print("Init", level=0, id=0, color=colors.lgreen)
 bench.set_tfun(dev.time)
 # Register ephemerides
 soeph.setup()
-# Set up our data loader
-loader  = loading.Loader(args.context, type=args.loader, dev=dev)
-obsinfo = loader.query(args.query)
-if len(obsinfo) == 0:
-	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
-	sys.exit(1)
 # Optional detector restriction
 dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
 detids = gutils.read_detnames(args.detids) if args.detids is not None else None
-# Define obs-groups
-joint   = loader.group_obs(obsinfo, mode=args.joint)
-ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-post    = mapmaking.post_settings(ginfo)
-joint   = gutils.time_split(joint, ginfo, post=post, maxsize=args.split*1e9, maxdur=args.tsplit)
-# group selection. Sadly this can't be done with the query-level selection, as that
-# happens before grouping.
-jinds   = eval("list(range(%d))[%s]" % (len(joint.groups),args.sel))
-joint   = gutils.select_groups(joint, jinds)
-ngroup  = len(joint.groups)
-if joint.joint:
-	bandmsg = ",".join(joint.bands)
-	if len(joint.nullbands) > 0:
-		bandmsg += " null " + ",".join(joint.nullbands)
-	L.print("Mapping %d tod-groups across %s with %d mpi tasks" % (ngroup, bandmsg, comm_all.size), level=0, id=0, color=colors.lgreen)
-else:
-	L.print("Mapping %d tods with %d mpi tasks" % (ngroup, comm_all.size), level=0, id=0, color=colors.lgreen)
+# Set up our data loader
+split     = args.split*1e9 if args.split else None
+fast_fail = args.ignore != "none"
+loader    = loading.get_loader(args.context, type=args.loader, group=args.joint, split=split, tsplit=args.tsplit, fast_fail=fast_fail, dev=dev, dtype=dtype)
+linfo   = loader.query(args.query, dets=dets, detids=detids)
+linfo   = linfo[gutils.parse_slice(args.sel)]
+if linfo.nobs == 0:
+	L.print("No tods selected. Quitting", level=0, id=0, color=colors.red)
+	sys.exit(1)
+L.print("Mapping %d tods with %d mpi tasks" % (linfo.nobs, comm_all.size), level=0, id=0, color=colors.lgreen)
 prefix = args.odir + "/"
 if args.prefix: prefix += args.prefix + "_"
 utils.mkdir(args.odir)
@@ -95,7 +82,7 @@ if comm_all.rank == 0:
 		ofile.write(" ".join(sys.argv) + "\n")
 # Set up our planet coordinate system
 planet   = args.planet.lower()
-sys      = "hor,on=%s" % planet
+sys      = "sidelobe,on=%s" % planet
 # Make sure we don't cut the thing we're trying to map!
 planets  = [name.lower() for name in config.get("planet_list").split(",")]
 planets  = [name for name in planets if name != planet]
@@ -104,6 +91,7 @@ config.set("planet_list", ",".join(planets))
 config.set("object_cut",    "planets:5")
 # Set up the signals we will solve for
 map_out = ["map", "ivar"]
+bands = np.unique(linfo.obsinfo.band)
 if args.mode == "fbin":
 # Only safe to use buf="pointing" if we perform zero cg steps!
 	# Set up noise model
@@ -114,13 +102,13 @@ if args.mode == "fbin":
 	# Building SignalMapMulti globally like this means that we end up outputting per-band maps
 	# even when making oband observations, leading to a lot of empty maps. sogma in perobs
 	# mode suffers from the same problem. Need a redesign to avoid this problem.
-	if joint.joint:
-		signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
+	if len(bands) > 1:
+		signal_map = mapmaking.SignalMapMulti(shape, wcs, bands, comm_per, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
 	else:
 		signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
 	# Setup mapmaker and make the maps
 	mapmaker = mapmaking.MLMapmaker(signals=[signal_map], dtype=dtype, verbose=True, noise_model=noise_model, filters=filters, dev=dev)
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, maxiter=20, dets=dets, detids=detids, ignore=args.ignore, cont=args.cont, dump=dump)
+	mapmaking.make_maps_perobs(mapmaker, linfo, comm_all, comm_per, prefix=prefix, maxiter=20, ignore=args.ignore, cont=args.cont, dump=dump)
 elif args.mode == "prior":
 	# Build our zero-prior, which will constrain atmospheric modes at the cost of
 	# removing all signal outside that radius
@@ -131,15 +119,15 @@ elif args.mode == "prior":
 	strong_mask[0] = strong_mask.distance_from([0,0], rmax=strong_rad) < strong_rad
 	nprep = nmat.NprepMask(strong_mask, sys=sys, dev=dev)
 	noise_model = nmat.NmatDetvecs(dev=dev)
-	if joint.joint:
-		signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, prior=prior, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
+	if len(bands) > 1:
+		signal_map = mapmaking.SignalMapMulti(shape, wcs, bands, comm_per, prior=prior, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
 	else:
 		signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype, prior=prior, sys=sys, outputs=map_out, precon="div")
 	signal_cut = mapmaking.SignalCutFull(comm_per, dtype=dtype, dev=dev)
 	signal_src = mapmaking.SignalSrcSamp(strong_mask, comm_per, sys=sys, dtype=dtype, dev=dev)
 	# Setup mapmaker and make the maps
 	mapmaker = mapmaking.MLMapmaker(signals=[signal_cut,signal_src,signal_map], dtype=dtype, verbose=True, noise_model=noise_model, nprep=nprep, dev=dev)
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, maxiter=args.maxiter, maxerr=args.maxerr, dets=dets, detids=detids, ignore=args.ignore, cont=args.cont, dump=dump)
+	mapmaking.make_maps_perobs(mapmaker, linfo, comm_all, comm_per, prefix=prefix, maxiter=args.maxiter, maxerr=args.maxerr, ignore=args.ignore, cont=args.cont, dump=dump)
 elif args.mode == "prior2":
 	# Build our zero-prior, which will constrain atmospheric modes at the cost of
 	# removing all signal outside that radius
@@ -150,14 +138,14 @@ elif args.mode == "prior2":
 	strong_mask[0] = strong_mask.distance_from([0,0], rmax=strong_rad) < strong_rad
 	nprep = nmat.NprepMask(strong_mask, sys=sys, dev=dev)
 	noise_model = nmat.NmatDetvecs(dev=dev)
-	if joint.joint:
-		signal_map = mapmaking.SignalMapMulti(shape, wcs, joint.bands, comm_per, prior=prior, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
+	if len(bands):
+		signal_map = mapmaking.SignalMapMulti(shape, wcs, bands, comm_per, prior=prior, dev=dev, dtype=dtype, sys=sys, outputs=map_out, precon="div")
 	else:
 		signal_map = mapmaking.SignalMap(shape, wcs, comm_per, dev=dev, dtype=dtype, prior=prior, sys=sys, outputs=map_out, precon="div")
 	signal_cut = mapmaking.SignalCutFull(comm_per, dtype=dtype, dev=dev)
 	signal_sub = mapmaking.SignalSubSamp(comm_per, dtype=dtype, dev=dev)
 	# Setup mapmaker and make the maps
 	mapmaker = mapmaking.MLMapmaker(signals=[signal_cut, signal_sub, signal_map], dtype=dtype, verbose=True, noise_model=noise_model, nprep=nprep, dev=dev)
-	mapmaking.make_maps_perobs(mapmaker, loader, obsinfo, comm_all, comm_per, joint=joint, prefix=prefix, npass=2, maxiter=[10,args.maxiter], maxerr=args.maxerr, dets=dets, detids=detids, ignore=args.ignore, cont=args.cont, dump=dump, restart=True)
+	mapmaking.make_maps_perobs(mapmaker, linfo, comm_all, comm_per, prefix=prefix, npass=2, maxiter=[10,args.maxiter], maxerr=args.maxerrs, ignore=args.ignore, cont=args.cont, dump=dump, restart=True)
 else:
 	raise ValueError("Unrecognized mode '%s'" % str(args.mode))

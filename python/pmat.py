@@ -1,20 +1,13 @@
 import numpy as np, copy
 import quaternion
 import so3g
-from pixell import utils, enmap, coordsys, bench
+from pixell import utils, enmap, coordsys, bench, bunch
 from . import device, gutils
 from .logging import L
 
-class PmatDummy:
-	def __init__(self): pass
-	def forward(self, gtod, glmap): pass
-	def backward(self, gtod, glmap): pass
-	def precalc_setup(self, reset_buffer=True): pass
-	def precalc_free (self): pass
-
 class PmatMap:
 	def __init__(self, shape, wcs, ctime, bore, offs, polang, sys="cel", site=None, response=None,
-			ncomp=3, dev=None, dtype=np.float32, partial=False):
+			ncomp=3, dev=None, dtype=np.float32, partial=False, skip_invalid=True):
 		"""shape, wcs should be for a fullsky geometry, since we assume
 		x wrapping and no negative y pixels
 
@@ -38,34 +31,53 @@ class PmatMap:
 		self.partial  = partial
 		self.response = dev.np.array(response) if response is not None else None
 		self.pfit  = PointingFit(shape, wcs, ctime, bore, offs, polang, sys=self.sys, site=site, dtype=dtype, dev=self.dev)
-		self.preplan  = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
+		self.skip_invalid = skip_invalid
+		self.skip  = False
+		# PointingFit can produce out-of-bounds values, making the PrePlan fail. This usually
+		# only happens when mapping in weird coordinate systems where the observation crosses a pole.
+		# 
+		# We catch this case, and enable clipping just for those, since it's not free.
+		# But the whole pointing interpolation is dubious in this case... I used to use PmatDummy,
+		# but that required handling things everywhere .__init__() and variant() are called.
+		# If the pointing is too dubious, then it might be better to just make PmatMap itself skip
+		# things if this fails, e.g. self.skip = True
+		try:
+			self.preplan = self.dev.lib.PointingPrePlan(self.pfit.eval(), shape[-2], shape[-1], periodic_xcoord=True)
+		except RuntimeError as e:
+			if skip_invalid:
+				L.print("Error building PmatMap. Skipping coupling to sky", level=2)
+				self.skip = True
+			else: raise
 		self.pointing = None
 		self.plan     = None
 	def forward(self, gtod, glmap):
 		"""Argument is a LocalMap or equivalent"""
+		if self.skip: return gtod
 		t1 = self.dev.time()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
 		t2 = self.dev.time()
 		self.dev.lib.map2tod(gtod, glmap, pointing, plan, response=self.response, partial_pixelization=self.partial)
 		t3 = self.dev.time()
-		L.print("Pcore pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		L.print("Pcore map pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return gtod
 	def backward(self, gtod, glmap):
+		if self.skip: return glmap
 		t1 = self.dev.time()
 		pointing = self.pointing if self.pointing is not None else self.pfit.eval()
 		plan     = self.plan     if self.plan     is not None else self._make_plan(pointing)
 		t2 = self.dev.time()
 		self.dev.lib.tod2map(glmap, gtod, pointing, plan, response=self.response, partial_pixelization=self.partial)
 		t3 = self.dev.time()
-		L.print("P'core pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
+		L.print("P'core map pt %6.4f gpu %6.4f" % (t2-t1,t3-t2), level=3)
 		return glmap
 	def precalc_setup(self, reset_buffer=True):
+		if self.skip: return
 		t1 = self.dev.time()
 		self.pointing = self.pfit.eval(reset_buffer=reset_buffer)
 		self.plan     = self._make_plan(self.pointing, reset_buffer=reset_buffer)
 		t2 = self.dev.time()
-		L.print("Pprep %6.4f" % (t2-t1), level=3)
+		L.print("Pprep map %6.4f" % (t2-t1), level=3)
 	def precalc_free (self):
 		self.pointing = None
 		self.plan     = None
@@ -74,15 +86,69 @@ class PmatMap:
 			return self.dev.lib.PointingPlan(self.preplan, pointing)
 	def variant(self, step=1, down=1, Δpolang=0):
 		res = copy.copy(self)
-		res.pfit    = res.pfit.variant(step=step, down=down, Δpolang=Δpolang)
-		res.preplan = res.dev.lib.PointingPrePlan(res.pfit.eval(), res.pfit.shape[-2], res.pfit.shape[-1], periodic_xcoord=True)
-		res.plan    = None
-		res.pointing = None
-		# We don't need the others, but oh well
+		if not self.skip:
+			res.pfit    = res.pfit.variant(step=step, down=down, Δpolang=Δpolang)
+			try:
+				res.preplan = res.dev.lib.PointingPrePlan(res.pfit.eval(), res.pfit.shape[-2], res.pfit.shape[-1], periodic_xcoord=True)
+			except RuntimeError as e:
+				if res.skip_invalid: res.skip = True
+				else: raise
+			res.plan    = None
+			res.pointing = None
 		res.ctime = gutils.decimate_tod(res.ctime, step, contiguous=False)
 		res.bore  = gutils.decimate_tod(res.bore,  step, contiguous=False)
 		res.polang= res.polang+Δpolang
 		return res
+
+class PmatPickup:
+	def __init__(self, baz, dbaz, phase=False, dev=None):
+		self.dev  = dev or device.get_device()
+		self.dbaz = dbaz
+		self.baz  = baz
+		self.phase= phase
+		amin, amax= utils.minmax(baz)
+		i1        = utils.floor(amin/dbaz)
+		i2        = utils.floor(amax/dbaz)
+		self.baz0 = i1*dbaz
+		# We cover [0,m] inclusive, with m=i2-i1 Total nx = m+2.
+		# +1 to get a length, +1 because we need an extra element at end for bilinear
+		self.nx   = i2-i1+2
+		if phase:
+			# back-stroke is separate copy, appended
+			self.nx *= 2
+			sweeps, dir  = utils.find_sweeps(baz, return_dir=True)
+			self.back_bins = sweeps[1-dir::2]
+		self.xs = None
+	def _calc_xs(self, dtype):
+		xs  = self.dev.pools["xs"].array(self.baz, dtype=dtype)
+		xs -= self.baz0
+		xs /= self.dbaz
+		if self.phase:
+			for i1,i2 in self.back_bins:
+				xs[i1:i2] += self.nx//2
+		return xs
+	def forward(self, tod, pickup):
+		t1 = self.dev.time()
+		xs = self.xs if self.xs is not None else self._calc_xs(tod.dtype)
+		self.dev.lib.pickup2tod(pickup, tod, xs)
+		t2 = self.dev.time()
+		L.print("Pcore pck %6.4f" % (t2-t1), level=3)
+		return tod
+	def backward(self, tod, pickup):
+		t1 = self.dev.time()
+		xs = self.xs if self.xs is not None else self._calc_xs(tod.dtype)
+		self.dev.lib.tod2pickup(pickup, tod, xs)
+		t2 = self.dev.time()
+		L.print("P'core pck %6.4f" % (t2-t1), level=3)
+		return pickup
+	def precalc_setup(self, reset_buffer=True):
+		t1  = self.dev.time()
+		self.xs = self._calc_xs(tod.dtype)
+		print("xs", utils.minmax(xs), self.nx)
+		t2 = self.dev.time()
+		L.print("Pprep pck %6.4f" % (t2-t1), level=3)
+	def precalc_free (self):
+		self.xs = None
 
 # Cuts
 
@@ -255,36 +321,95 @@ def _normalize_bfun(a):
 
 # Misc
 
+# calc_pointing assumes a standard coordinate system, and breaks if we try to do
+# focal-plane coordinates. In practice we do
+#   lon,lat,psi = qbore*qdetoff*qpolang
+# but focal-plane coordinates need
+#   lon,lat,psi = 1/(qbore*qdetoff)
+#   psi -= polang
+# Adding in polang will be cheap, so can generalize to
+#   q = qbore*qdetoff
+#   if inverse: q **= -1
+#   lon,lat,psi = q
+#   if inverse: psi -= polang
+#   else:       psi += polang
+# Still want transform to be able to transform to sidelobe coordinates though.
+# So may want to let it take care of the qbore inversion and only apply qdetoff myself:
+#   q = transform(bore, inverse)
+#   if inverse: q = 1/qdetoff * q
+#   else:       q *= qdetoff
+#   lon,lat,psi = q
+#   if inverse: psi -= polang
+#   else:       psi += polang
+# To get inverse, expand sys ourselves
+# I think I can pack this into both the so3g and coordsys cases below
+
+#def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typical",
+#		dtype=np.float32, use_so3g="auto"):
+#	offs, polang = np.asarray(offs), np.asarray(polang)
+#	ndet, nsamp = len(offs), bore.shape[1]
+#	# Transform the boresight
+#	icoord = coordsys.Coords(az=bore[1], el=bore[0], roll=bore[2])
+#	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather)
+#	# Apply the detector offsets. Like so3g, we assume that they're all affected
+#	# by the same refraction, which is only an approximation
+#	if use_so3g == "auto":
+#		use_so3g = utils.can_import("so3g")
+#	if use_so3g:
+#		import so3g
+#		fplane  = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], polang)
+#		p       = so3g.ProjEng_CAR_TQU_NonTiled((1, 1, 1., 1., 1., 1.))
+#		q       = so3g.proj.quat.G3VectorQuat(quaternion.as_float_array(ocoord.q))
+#		pos_equ     = np.moveaxis(p.coords(q, fplane.quats, None),2,0)
+#		pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
+#		# Go from c1,s1 to psi
+#		pos_equ[2]  = np.arctan2(pos_equ[3],pos_equ[2])
+#		pos_equ     = pos_equ[:3]
+#	else:
+#		# This part is nicer, but makes the function take 440 ms
+#		# vs. 210 ms with so3g. The main slow part is the decomposition,
+#		# which seems like it needs to be moved to a lower-level language
+#		qdet   = coordsys.rotation_xieta(offs[:,1], offs[:,0], polang)
+#		ocoord = ocoord*qdet[:,None] # {ndet,nsamp}
+#		# Decompose into ra,dec. This step is surprisingly slow
+#		pos_equ= np.array([ocoord.dec, ocoord.ra, ocoord.psi]) # [{dec,ra,psi}]
+#	return pos_equ
+
 def calc_pointing(ctime, bore, offs, polang, sys="cel", site=None, weather="typical",
 		dtype=np.float32, use_so3g="auto"):
 	offs, polang = np.asarray(offs), np.asarray(polang)
 	ndet, nsamp = len(offs), bore.shape[1]
+	el, az, roll = bore
+	# Hack: Inverse coordinate systems like sidelobe coordinates does not fit into
+	# my normal coordinate system logic, so we need some special casing here. In particular,
+	# the detector offsets, polangs and to-rotation must be done differently
+	sys  = coordsys.expand_sys(sys, ctime=ctime, site=site, weather=weather)
+	# Separate out the final to-rotation, since we may need to do detector stuff in between
+	qto  = sys.iupto
+	sys.iupto = np.quaternion(1,0,0,0)
+	# Detector offsets, but no polang!
+	qdet   = coordsys.rotation_xieta(offs[:,1], offs[:,0])
 	# Transform the boresight
-	icoord = coordsys.Coords(az=bore[1], el=bore[0], roll=bore[2])
-	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather, bore=icoord)
-	# Apply the detector offsets. Like so3g, we assume that they're all affected
-	# by the same refraction, which is only an approximation
-	if use_so3g == "auto":
-		use_so3g = utils.can_import("so3g")
-	if use_so3g:
-		import so3g
-		fplane  = so3g.proj.coords.FocalPlane.from_xieta(offs[:,1], offs[:,0], polang)
-		p       = so3g.ProjEng_CAR_TQU_NonTiled((1, 1, 1., 1., 1., 1.))
-		q       = so3g.proj.quat.G3VectorQuat(quaternion.as_float_array(ocoord.q))
-		pos_equ     = np.moveaxis(p.coords(q, fplane.quats, None),2,0)
-		pos_equ[:2] = pos_equ[1::-1] # [{dec,ra,c1,s1},ndet,nsamp]
-		# Go from c1,s1 to psi
-		pos_equ[2]  = np.arctan2(pos_equ[3],pos_equ[2])
-		pos_equ     = pos_equ[:3]
-	else:
-		# This part is nicer, but makes the function take 440 ms
-		# vs. 210 ms with so3g. The main slow part is the decomposition,
-		# which seems like it needs to be moved to a lower-level language
-		qdet   = coordsys.rotation_xieta(offs[:,1], offs[:,0], polang)
-		ocoord = ocoord*qdet[:,None] # {ndet,nsamp}
-		# Decompose into ra,dec. This step is surprisingly slow
-		pos_equ= np.array([ocoord.dec, ocoord.ra, ocoord.psi]) # [{dec,ra,psi}]
-	return pos_equ
+	icoord = coordsys.Coords(az=az, el=el, roll=roll)
+	ocoord = coordsys.transform("hor", sys, icoord, ctime=ctime, site=site, weather=weather)
+	if sys.inverse: ocoord.q  = 1/qdet[:,None] * ocoord.q
+	else:           ocoord.q  = ocoord.q * qdet[:,None]
+	# Apply our to-rotation
+	ocoord.q = coordsys.mul(qto, ocoord.q)
+	# Decompose
+	pos_out  = np.array([ocoord.dec, ocoord.ra, ocoord.psi])
+	# Apply detector angles
+	if sys.leak:    pos_out[2]  = 0 # probably only makes sense together with inverse
+	if sys.inverse: pos_out[2] -= polang[:,None]
+	else:           pos_out[2] += polang[:,None]
+	# Hack: in postroll-coordinates, we rotate the focal plane back to roll=0
+	if sys.postroll:
+		ocoord = coordsys.Coords(ra=pos_out[1], dec=pos_out[0])
+		ocoord.q = qto*coordsys.euler(2,roll)/qto * ocoord.q
+		pos_out[0]  = ocoord.dec
+		pos_out[1]  = ocoord.ra
+		pos_out[2] -= ocoord.psi
+	return pos_out
 
 # How to evaluate xlink map cheaply?
 # 1. Want to not have to redo the fit. Thankfully eval is linear and coeffs[2]
@@ -332,13 +457,14 @@ class PointingFit:
 		"""
 		# TODO: Consider generalizing to more than just car
 		assert wcs.wcs.ctype[0][-3:] == "CAR", "Only CAR supported for now"
-		self.shape, self.wcs = shape, wcs
+		self.shape, self.wcs = shape, wcs # shape not used
 		self.nt, self.nx, self.ny = nt, nx, ny
 		self.dev   = dev or device.get_device()
 		self.dtype = dtype
 		self.store_basis = store_basis
 		self.subsamp     = subsamp
-		self.nphi = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
+		self.nphi   = utils.nint(360/np.abs(wcs.wcs.cdelt[0]))
+		self.ntheta = utils.nint(180/np.abs(wcs.wcs.cdelt[1]))
 		self.sys  = sys
 		self.site = site
 		self.weather = weather

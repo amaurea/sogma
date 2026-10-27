@@ -1,13 +1,12 @@
-import numpy as np, os, contextlib
-from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch, colors
-from . import pmat, tiling, device, socut, gutils, soeph
+import numpy as np, os, contextlib, warnings
+from pixell import config, utils, enmap, ephem, pointsrcs, coordsys, bunch, colors, wcsutils, colors
+from . import pmat, tiling, device, socut, gutils, soeph, errors
 from .logging import L
 
-config.default("autocut",       "objects,sidelobes", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut. sidelobes: The sidelobe cut")
-config.default("object_cut",    "planets:10,asteroids:5")
+config.default("autocut",       "objects,sidelobes", "Comma-separated list of which autocuts to apply. Currently recognized: objects: The object cut. sidelobes: The sidelobe cut. galaxy: Cuts low galactic latitudes")
 # planetas and asteroids defined in sogma.soeph
 
-def autocut(obs, id="?", which=None, geo=None, dev=None):
+def autocut(obs, id="?", which=None, geo=None, dev=None, meta=None):
 	"""Main driver. Performs all autocuts, merges them with any existing cuts,
 	updates obs and gpfills tod"""
 	if dev is None: dev = device.get_device()
@@ -15,7 +14,7 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	if which == "none" or len(which) == 0: return obs
 	which   = which.split(",")
 	# The functions that implement each autocut type
-	cutfuns = {"objects": object_cut, "sidelobes": sidelobe_cut}
+	cutfuns = {"objects": object_cut, "sidelobes": sidelobe_cut, "galaxy":galaxy_cut}
 	# Whether these are generally bright enough that they should
 	# be gapfilled. This is the case if they are bright enough that
 	# they would distort the noise model, or if they represent a sudden
@@ -23,11 +22,11 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	# cut would not be able to represent. Not gapfilling is beneficial for
 	# broad regions like sidelobe cuts, which can be tens of degrees across,
 	# since removing these would mess up the noise model too.
-	bright  = {"objects": True,       "sidelobes": False}
+	bright  = {"objects": True,       "sidelobes": False,        "galaxy": False}
 	cuts = [obs.cuts]
 	fill = [obs.fill]
 	for i, cutname in enumerate(which):
-		cut   = cutfuns[cutname](obs, id=id, geo=geo, dev=dev)
+		cut   = cutfuns[cutname](obs, id=id, geo=geo, dev=dev, meta=meta)
 		cuts += cut
 		if bright[cutname]: fill += cut
 	cuts = socut.Simplecut.merge(cuts)
@@ -37,41 +36,80 @@ def autocut(obs, id="?", which=None, geo=None, dev=None):
 	obs.fill = fill
 	return obs
 
-# TODO: This function takes around 1 sec, dominated by ephem_map+lmap+pmap
-# Could potentially speed up by using pmap.backward to figure out which tiles
-# are hit, instead of building a fullsky map.
-def object_cut(obs, id="?", object_list=None, geo=None, down=8, base_res=0.5*utils.arcmin,
-		dt=100, dr=1*utils.arcsec, dev=None):
+config.default("object_cut",    "planets:10,asteroids:5", "Comma-separated list of which object classes to cut. Format objtype1:rad1,objtype2:rad2, etc. Objtype can be planets and asteroids. The radii are in arcminutes, and can be left out, in which case they default to 30 arcmin")
+def object_cut(obs, id="?", object_list=None, geo=None, sysdown=8, base_res=0.5*utils.arcmin,
+		dt=100, dr=1*utils.arcsec, dev=None, meta=None):
+	from pixell import mpi
 	if dev is None: dev = device.get_device()
 	object_list = get_object_list(object_list)
-	# Set up a low-resolution geometry, either by downgrading a given geometry
-	# of by downgrading a fullsky geometry with the base_res resolution.
-	# The advantage of passing an existing geometry is that one avoids partially
-	# cut pixels, which can have very high noise.
-	shape, wcs = geo if geo is not None else enmap.fullsky_geometry2(res=base_res)
-	shape, wcs = enmap.downgrade_geometry(shape, wcs, down)
-	# Get our time range
+	dtype       = obs.tod.dtype
+	# These pools are free
+	tod_pool    = dev.pools["ft"]
+	work_pool   = dev.pools["pointing"]
+	# 1. Initial geometry. Only really used for pixel alignment, so could be skipped
+	shape0, wcs0 = geo if geo is not None else enmap.fullsky_geometry2(res=base_res)
+	# 2. Build a dynamic map, which we will use to probe which tiles are exposed
+	fshape, fwcs, _ = tiling.infer_fullsky_geometry(shape0, wcs0)
+	dynmap = dev.lib.DynamicMap(*fshape, dtype)
+	# 3. Build a pointing matrix and use it, resulting in an lmap, which knows which
+	#    tiles were hit
+	pmap = pmat.PmatMap(fshape, fwcs, obs.ctime, obs.boresight,
+		obs.point_offset, obs.polangle, sys="equ", site=obs.site, dev=dev, dtype=dtype)
+	wtod = tod_pool.zeros(obs.tod.shape, obs.tod.dtype)
+	pmap.backward(wtod, dynmap)
+	lmap = dynmap.finalize()
+	del dynmap
+	# 4. Build a tiledist (a bit overkill, but provides the functions we need)
+	#    Use pixbox="auto" (or call get_pixbound manually) to get the relevant
+	#    bounding box
+	tiledist = tiling.TileDistribution(fshape, fwcs, lmap.pixelization,
+		comm = mpi.COMM_SELF, pixbox="auto", dev=dev)
+	# 5. Construct the canvas we will paint on
+	shape, wcs = enmap.crop_geometry(fshape, fwcs, pixbox=tiledist.pixbox)
+	# 6. Do the painting
 	t1, t2 = utils.minmax(obs.ctime)
 	map  = ephem_map(shape, wcs, object_list, [t1,t2], dt=dt, dr=dr, dtype=obs.tod.dtype)
-	cuts = mask2cut_map(obs, map, dev=dev, tod_pool=dev.pools["ft"], work_pool=dev.pools["pointing"])
-	# return result as length-1 list of cuts
-	# It's a list of cuts because other cut types can return multiple cuts
-	# User must merge with other cuts and gapfill as necessary
+	# 7. Transfer to a tiled map on the gpu
+	dmap = tiledist.omap2dmap(map)
+	gwmap= tiledist.dmap2gwmap(dmap)
+	wtod[:] = 0
+	pmap.forward(wtod, gwmap)
+	# 8. can finally call mask2cut_tod
+	cuts = mask2cut_tod(wtod, dev=dev, pool=work_pool)
 	return [cuts]
 
-config.default("sun_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/sun.fits", "Location of Sun sidelobe mask")
-config.default("moon_mask", "/global/cfs/cdirs/sobs/users/sigurdkn/masks/sidelobe/moon.fits", "Location of Sun sidelobe mask")
+config.default("galcut_rad", 2.0, "Degrees of avoidance around the galaxy when the galaxy cut is enabled")
+def galaxy_cut(obs, maxlat=None, id="?", geo=None, dev=None, meta=None):
+	maxlat = config.get("galcut_rad", maxlat)*utils.degree
+	return lat_cut(obs, [-maxlat,maxlat], id=id, sys="gal", dev=dev, meta=meta)
+
+def lat_cut(obs, latrange, id="?", sys="gal", dev=None, meta=None):
+	if dev is None: dev = device.get_device()
+	# Make a dummy geometry where pixel coordinatees and gal coordinates are the same thing
+	wcs  = wcsutils.explicit(crval=[0,0], cdelt=[1,1], crpix=[1,1], ctype=["RA---CAR","DEC--CAR"])
+	pfit = pmat.PointingFit(None, wcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=sys, dtype=obs.tod.dtype, dev=dev)
+	lat, lon, psi = pfit.eval()
+	gutils.between_inplace(lat, latrange[0]/utils.degree, latrange[1]/utils.degree)
+	cuts = mask2cut_tod(lat, dev=dev, pool=dev.pools["ft"])
+	return [cuts]
+
 sidelobe_cutters = {}
-def sidelobe_cut(obs, id="?", object_list=None, geo=None, dev=None):
+def sidelobe_cut(obs, id="?", object_list=None, geo=None, dev=None, meta=None):
 	if object_list is None: object_list = ["sun", "moon"]
 	cutss = []
+	if meta is None or "sidelobes" not in meta or meta.sidelobes is None:
+		L.print("Skipping sidelobe cut - mask metadata missing", level=2, color=colors.red)
+		return cutss
 	for name in object_list:
-		if name not in sidelobe_cutters:
-			fname = config.get(name + "_mask")
-			if not fname: raise ValueError("config setting %s_mask missing for sidelobe cut" % name)
-			mask  = enmap.read_map(fname)
-			sidelobe_cutters[name] = SidelobeCutter(mask, objname=name, dtype=obs.tod.dtype, dev=dev)
-		cutter = sidelobe_cutters[name]
+		try: field = meta.sidelobes.fields.index(name)
+		except ValueError as e:
+			raise errors.DataMissing("Sidelobe mask for %s missing" % name)
+		fname = meta.sidelobes.fname
+		key   = (name, fname)
+		if key not in sidelobe_cutters:
+			mask  = enmap.read_map(fname, sel=(field,))
+			sidelobe_cutters[key] = SidelobeCutter(mask, objname=name, dtype=obs.tod.dtype, dev=dev)
+		cutter = sidelobe_cutters[key]
 		cuts   = cutter.make_cuts(obs, id=id)
 		cutss.append(cuts)
 	return cutss
@@ -83,7 +121,7 @@ class SidelobeCutter:
 		self.distmap = enmap.distance_transform(mask<1).astype(dtype)
 		self.lmap    = tiling.enmap2lmap(mask.astype(dtype), dev=self.dev)
 		self.objname = objname
-		self.sys  = "hor,on=%s" % objname
+		self.sys  = "sidelobe,on=%s" % objname
 		self.rise_tol = rise_tol
 		self.dist_tol = dist_tol
 	def make_cuts(self, obs, id="?"):

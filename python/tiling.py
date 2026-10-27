@@ -126,7 +126,7 @@ class TileDistribution:
 		# latter could be part of
 		self.work  = bunch.Bunch(lp=lp)
 		self.work.cell_inds = lp.cell_offsets_cpu//self.tsize
-		self.work.ntile     = np.sum(self.work.cell_inds>=0)
+		self.work.ntile     = int(np.sum(self.work.cell_inds>=0))
 		self.work.shape     = (self.work.ntile,self.ncomp)+self.tshape
 		# Set up the distributed tile tiling
 		downer    = distribute_global_tiles_exposed_simple(self.work.cell_inds, comm)
@@ -201,6 +201,7 @@ class TileDistribution:
 				submap[sub.rinds[0],sub.rinds[1]] = rbuf
 				# We have [nty,ntx,...,y,x] and want [...,nty,y,ntx,x]
 				submap = np.moveaxis(submap, (0,1), (-4,-2))
+				# Go to [...,nty*y,ntx*x]
 				submap = submap.reshape(submap.shape[:-4]+(submap.shape[-4]*submap.shape[-3],submap.shape[-2]*submap.shape[-1]))
 				# sub.obox will not have negative values or wrapping issues the way we have
 				# constructed things here
@@ -210,6 +211,30 @@ class TileDistribution:
 				omap[...,oy1:oy2,ox1:ox2] += submap[...,iy1:iy2,ix1:ix2]
 		if self.ompi.comm.rank == 0:
 			return omap
+	def omap2dmap(self, map, dmap=None, root=0):
+		"""Transfer from enmap map to a distributed map dmap"""
+		# To make the correspondence with dmap2omap clearer, I keep the i/o r/s
+		# prefixes the same here instead of flipping them.
+		if dmap is None: dmap = self.dmap(dtype=map.dtype, ncomp=map.shape[-3])
+		tsize = np.prod(dmap.shape[1:])
+		for i, sub in enumerate(self.ompi.subs):
+			if self.ompi.comm.rank == 0:
+				(iy1,ix1),(iy2,ix2) = sub.ibox
+				(oy1,ox1),(oy2,ox2) = sub.obox
+				submap = np.zeros(map.shape[:-2]+(sub.onty*self.tshape[0],sub.ontx*self.tshape[1]), map.dtype)
+				submap[...,iy1:iy2,ix1:ix2] = map[...,oy1:oy2,ox1:ox2]
+				# [...,nty*y,ntx*nx] → [...,nty,y,ntx,x]
+				submap = submap.reshape(submap.shape[:-2]+(sub.onty,self.tshape[0],sub.ontx,self.tshape[1]))
+				# [...,nty,y,ntx,x] → [nty,ntx,...,y,x]
+				submap = np.moveaxis(submap, (-4,-2), (0,1))
+				rbuf = submap[sub.rinds[0],sub.rinds[1]]
+			else:
+				rbuf = None
+			sbuf = np.zeros(sub.rtot*tsize, map.dtype)
+			rinfo= (sub.rcount*tsize, sub.roffs*tsize)
+			sub.comm.Scatterv((rbuf, rinfo), sbuf, root=root)
+			dmap[sub.sinds] += sbuf.reshape((len(sub.sinds),)+dmap.shape[1:])
+		return dmap
 	@property
 	def oshape(self): return (self.work.ntile,self.ncomp,self.tshape[0],self.tshape[1])
 	@property
@@ -443,23 +468,13 @@ def distribute_global_tiles_exposed_simple(loc_cells, comm):
 	owner[mask] = np.arange(nhit)*comm.size//nhit
 	return owner
 
-def get_weight_detsamps(obsinfo, joint=None):
-	if joint is None: return obsinfo.ndet.astype(int)*obsinfo.nsamp
-	ntot = []
-	for g in joint.groups:
-		ndet  = np.sum(obsinfo.ndet [g])
-		nsamp = np.sum(obsinfo.nsamp[g])
-		# int to get 8-byte, to avoid overflow
-		ntot.append(int(ndet)*nsamp)
-	return np.array(ntot)
-
-def distribute_tods_simple(obsinfo, nsplit, joint=None):
+def distribute_tods_simple(obsinfo, nsplit):
 	return bunch.Bunch(
 		owner   = np.arange(len(obsinfo))%nsplit,
 		weights = np.ones(nsplit),
 	)
 
-def distribute_tods_ra_plain(obsinfo, nsplit, joint=None, verbose=False):
+def distribute_tods_ra_plain(obsinfo, nsplit, verbose=False):
 	"""Split tods by the typical ra value without weighting."""
 	ra     = np.mean(obsinfo.sweep[:,:,0],-1)
 	order  = np.argsort(ra)
@@ -602,6 +617,10 @@ def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
 	like projecting a per-obs mask to time domain in order
 	to construct cuts."""
 	if dev is None: dev = device.get_device()
+	# Flatten input map pre-dimensions, so we can get incomp, which we will
+	# need to make sure only the T component of the output gets populated if
+	# the input map is T-only, instead of broadcasting to TQU as it otherwise would
+	map = map.preflat
 	fshape, fwcs, pixbox = infer_fullsky_geometry(map.shape, map.wcs)
 	# Set up the tiling. Have to keep track of the global tiling
 	# and the part we will actually allocate. First the global part
@@ -618,7 +637,7 @@ def enmap2lmap(map, tshape=(64,64), ncomp=3, dev=None):
 	# our local-map cells later
 	buf = np.zeros((ncomp,tinfo.nty,tshape[0],tinfo.ntx,tshape[1]),map.dtype)
 	b2d = buf.reshape(ncomp,tinfo.nty*tshape[0],tinfo.ntx*tshape[1])
-	b2d[:,tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
+	b2d[:len(map),tinfo.ibox[0,0]:tinfo.ibox[1,0],tinfo.ibox[0,1]:tinfo.ibox[1,1]] = map
 	# Reshape and then move it to the device
 	buf = np.moveaxis(buf, (0,1,2,3,4), (2,0,3,1,4))
 	buf = buf.reshape(ncell,ncomp,tshape[0],tshape[1])

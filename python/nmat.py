@@ -3,6 +3,107 @@ from pixell import utils, bunch
 from . import gutils, device
 from .logging import L
 
+
+# Idea for a new noise model based on a hierarchy of pairs
+#
+# 1. Define a hierarchy of pairs:
+#    Lvl 1: AB
+#    Lvl 2: band
+#    Lvl 3+: Nearest neighbors, chosen in a compact way,
+#    so pairs don't stradle wafers or tubes
+#    A "pair" may contain only 1 detector where convenient,
+#    but it's always either 1 or 2, no other options.
+# 2. Measure the per-bin variance for all detectors
+# 3. For each pair, also measure the per-bin covariance
+# 4. Use the covariance to transform to an orthogonal basis,
+#    with one minimal-power (diff) and maximal-power (sum)
+#    meta-detector. We automatically get a prediction for their power.
+#    For the lone detector case, skip this and treat it as a sum-detector.
+# 5. The diff-detectors are done for now. Repeat steps 3-5 for the next
+#    layer in the hierarchy using only the sum detectors.
+# 6. After finishing, we're left with a set of diffs, with a single top-level
+#    sum.
+#
+# The noise model consists of
+#  a) The orthogonalization factors: 1 DOF per full pair
+#  b) The diff variances: 1 DOF per full pair
+#  c) The final sum: 1 DOF
+# for a total Ndof <= 2*ndet*nbin, based on ndet*nbin*bsize numbers, so we
+# have bsize/2 numbers per DOF, which isn't bad.
+#
+# Applying the model would consist of doing this orthogonalization transformation,
+# dividing by the variances, and then transforming back. It should be possible to do
+# this quite fast.
+#
+# Physically, the model hard-codes the correlation structure based on the layout of
+# the focal plane, allowing for high spatial resolution for close correlations,
+# but low spatial resolution for far correlations. This will inevitably miss some of
+# the behavior, but I think that not needing to fit for a bunch of eigenvectors should
+# make the noise model much more robust. It's worth a test at least.
+
+# Update: Replaced pair hierarchy with the more general concept of pair passes,
+# represented as. Everything inside one pass can be done in parallel. All detector
+# indices are absolute.
+#  [npass][npair,2]
+# For each pair the rotation will take (d1,d2) → (diff,sum)
+#
+# Applying a model:
+# 1. Transform to the relevant basis, probably Fourier, but could be wavelet or something too
+# 2. For each pass, apply its rotations in parallel.
+#    Each rotation involves a pair of detectors, with no collisions.
+# 3. For each sample/freq/etc. in the pair, find out which bin it belongs to
+# 4. Read off the rotation parameter for that bin of that pair of that pass.
+#    Should precompute the pass-pair → rot index i.
+# 5. Apply the rotation, writing the diff-mode back to the first detector and the sum-mode
+#    back to the second detector.
+# 6. When done with all the passes, apply ivar[det,bin] for each detector.
+# 7. Go through all the passes in reverse order, unrotating.
+# 8. Transform back to time domain.
+#
+# Building a model is similar, but involves a few more steps.
+# 1. Transform to basis
+# 2. Measure var[det,bin]
+# 3. For each pair in each pass, measure cov(det1,det2,bin).
+#    From var[det1,bin], var[det2,bin] and cov, calculate
+#    rot[i,bin], var[det1,bin] = var_diff, var[det2,bin] = var_sum
+#    Then apply the rotation to det1,det2,bin
+# At the end of this, we have a fully populated rot[i,bin] and
+# var[det,bin]. Invert the latter to get ivar[det,bin]. Pretty
+# straightforward.
+#
+# What information does low-level code need?
+# 1. flat_pairs   = np.concatenate(passes, 1)
+# 2. pass_lens    = np.array([len(pass) for pass in passes])
+# 3. pass_starts  = utils.cumsum(pass_lens)
+# x. rot_inds     = actually this is is just the index into flat_pairs! So don't need this
+# 4. bsize. Constant size should be fine. Choose something hardware-friendly
+# 5. rot_cos[nrot,nbin], rot_sin[nrot,nbin]
+# 6. ivar[ndet,nbin]
+#
+# How to find the rotation? Have
+#  C = [C11 C12] = [c -s] [D  0] [ c  s] = [cD  -sS] [ c s] = [cDc+sSs  cDs-sSc]
+#      [C12 C22]   [s  c] [0  S] [-s  c]   [sD   cS] [-s c]   [sDc-cSs  sDs+cSc]
+# So we need:
+#  c²+s²   = 1
+#  c²D+s²S = C11
+#  s²D+c²S = C22
+#  sc(D-S) = C12 => D-S = C12/sc
+#
+# => D+S = (C11+C22)/2
+#  c²D-c²S+S = C11 =  c²(D-S)+S = c/s*C12+S = C12/t + S
+#  s²D-s²S+S = C22 =  s²(D-S)+S = s/c*C12+S
+# => c/s-s/c = (C11-C22)/C12
+# => 1/t+t   = (C11-C22)/C12 = Q
+# => t²-Qt + 1 = 0 => t = (Q±√(Q²-4))/2
+# or t"2-Q"t"+1 = 0 => t" = (Q"±√(Q"²-4))/2 for when the former blows up
+# => S = C11-C12*t" or S = C22-C12*t
+#    D = S + C12/sc
+# Handle two cases: |C11-C22| <= |C12|: Use Q and t. Otherwise use Q" and t"
+#
+# Bah just use eigh. It's fast enough even for lots of tiny matrices, even though it
+# could surely be greatly improved by special-casing
+
+
 class Nmat:
 	def __init__(self, dtype=np.float32, dev=None):
 		"""Initialize the noise model. In subclasses this will typically set up parameters, but not
@@ -561,6 +662,7 @@ class NmatPairRot(Nmat):
 	@staticmethod
 	def from_bunch(data, dev=None): raise NotImplementedError
 
+# TODO: This one should use dev.lib.pair_rot instead
 class PairRot:
 	def __init__(self, singles, pairs, amps, pool=None, dev=None):
 		if dev  is None: dev  = device.get_device()
@@ -935,6 +1037,230 @@ class NmatAdaptive(Nmat):
 				b["%s%02d" % (name,i)] = self.dev.get(v)
 		bunch.write(fname, b)
 
+class NmatTree(Nmat):
+	def __init__(self, tr_win=None, tr_ft=None, tr_tree=None, dev=None):
+		self.dev = dev or device.get_device()
+		self.tr_win  = tr_win  or TransWindow (dev=self.dev)
+		self.tr_ft   = tr_ft   or TransFourier(dev=self.dev, real=True)
+		self.tr_tree = tr_tree or TransTree   (dev=self.dev)
+		self.ready = self.tr_win.ready and self.tr_ft.ready and self.tr_tree.ready
+		if self.ready:
+			self.unit = self.tr_win.unit * self.tr_ft.unit * self.tr_tree.unit
+			self.norm = self.tr_win.norm * self.tr_ft.norm * self.tr_tree.norm
+			self.ivar = 1/(self.tr_tree.info.white * self.unit**2)
+			self.iD   = 1/(self.tr_tree.info.bvars * self.unit**2)
+			# Pre-multiply the backward transform's normalization
+			self.iD  *= self.norm
+			self.bsize= self.tr_tree.bsize
+	def build(self, tod, srate, obs, **kwargs):
+		tr_win = self.tr_win.build(tod, srate=srate)
+		tr_win.apply(tod)
+		tr_ft  = self.tr_ft.build (tod, srate=srate)
+		rft    = tr_ft.apply(tod)
+		tr_tree = self.tr_tree.build(rft, point_offsets=obs.point_offset, detids=obs.detids)
+		# Unmangle tod
+		tr_win.inverse(tod)
+		return NmatTree(tr_win, tr_ft, tr_tree, dev=self.dev)
+	def white(self, tod, inplace=True, nwin=None):
+		self.check_ready()
+		if not inplace: tod = tod.copy()
+		self.tr_win.apply(tod, nwin=None)
+		tod *= self.ivar[:,None]
+		self.tr_win.transpose(tod, nwin=None)
+		return tod
+	def apply(self, tod, inplace=True, nwin=None):
+		self.check_ready()
+		if not inplace: tod = tod.copy()
+		self.tr_win.apply(tod, nwin=nwin)
+		rft = self.tr_ft.apply(tod)
+		self.tr_tree.apply(rft)
+		self.dev.lib.block_scale(rft, self.iD, bsize=self.bsize, inplace=True)
+		self.tr_tree.transpose(rft)
+		self.tr_ft.transpose(rft, tod)
+		self.tr_win.transpose(tod, nwin=nwin)
+		return tod
+	def write(self, fname):
+		b = bunch.Bunch(
+			type="NmatTree",
+			tr_win  = self.tr_win .export(),
+			tr_ft   = self.tr_ft  .export(),
+			tr_tree = self.tr_tree.export(),
+		)
+		bunch.write(fname, b)
+
+# We define w = Tx and define D = cov(w) = TCT'. Now want to apply
+# C"x = (T"DT'")"x = T'D"T x
+
+# The idea here was to have Transformation classes encapsulating a
+# TOD transformation that is used when building the noise model,
+# where transofrmation could be chained without the noise model
+# itself needing to know the details. However, that has these
+# challenges:
+#
+# 1. Some transformations do forward() as part of build() while others do not
+# 2. For some transformations forward() and back() are in-place
+# 3. Some transformations build information that would be useful
+#    for the noise model
+# 4. Some transformations change the units of the data, which
+#    the noise model needs to know about for nmat.white()
+# 5. Some transformations mix up the detectors, which the
+#    noise model lneeds to know about for nmat.white()
+# 6. Transformations that use memory pools could clobber each other.
+# 7. Some transformations use blocking that may be useful in
+#    the noise model too.
+#
+# I'll still keep the transformations, and annotate them with
+# information describing these issues, but it means general chaining
+# won't work without much more thought.
+
+class Transformation:
+	def __init__(self, dev=None, info=None, inplace=False, build_behavior="plain", uses_pools=[]):
+		self.dev = dev or device.get_device()
+		self.inplace = inplace
+		self.build_behavior = build_behavior
+		self.uses_pools = uses_pools
+		# Info relects quantities built during build() that could be useful to
+		# the caller. It's packaged like this so multiple transformations'
+		# results can be merged into a single dict. This would have been useful
+		# when arbitrarily chaining transformations, but since that doesn't really
+		# work, it would probably have been better to make them normal members
+		self.info = info
+	@property
+	def ready(self): return self.info is not None
+	# Unit change when applying this transformation
+	@property
+	def unit(self): return self.info.unit if "unit" in self.info else 1.0
+	# Normalization to apply for the inverse transform
+	@property
+	def norm(self): return self.info.norm if "norm" in self.info else 1.0
+	def build(self, data, **kwargs): return self
+	def obuf(self, idata): return None
+	def apply(self, idata, odata): raise NotImplementedError
+	def transpose(self, idata, odata): raise NotImplementedError
+	def inverse(self, idata, odata, normalize=False): return NotImplementedError
+	def export(self): raise NotImplementedError
+
+class TransWindow(Transformation):
+	def __init__(self, window=2.0, dev=None, info=None):
+		super().__init__(dev=dev, info=info, inplace=True)
+		self.window  = window
+	def build(self, data, srate, **kwargs):
+		nwin = utils.nint(self.window*srate)
+		return TransWindow(window=self.window, dev=self.dev, info=bunch.Bunch(nwin=nwin))
+	def apply(self, data, dummy=None, nwin=None):
+		if nwin is None: nwin = self.info.nwin
+		gutils.apply_window(data, nwin)
+		return data
+	def transpose(self, data, dummy=None, nwin=None):
+		return self.apply(data, nwin=nwin)
+	def inverse(self, data, dummy=None, normalize=False, nwin=None):
+		if nwin is None: nwin = self.info.nwin
+		gutils.apply_window(data, nwin, -1)
+		return data
+	def export(self):
+		return bunch.Bunch(window=self.window, nwin=self.info.nwin)
+
+class TransFourier(Transformation):
+	def __init__(self, real=False, dev=None, info=None):
+		super().__init__(dev=dev, info=info, uses_pools=["ft"])
+		self.real = real
+	def build(self, data, srate, **kwargs):
+		nsamp = data.shape[-1]
+		freqs = self.dev.np.fft.rfftfreq(nsamp, 1/srate)
+		unit  = nsamp**-0.5
+		if self.real:
+			freqs = self.dev.np.repeat(freqs, 2)
+			unit *= 2**0.5
+		norm  = 1/nsamp
+		return TransFourier(real=self.real, dev=self.dev, info=bunch.Bunch(nsamp=nsamp, freqs=freqs, unit=unit, norm=norm))
+	def obuf(self, idata):
+		return self.dev.pools["ft"].zeros(idata.shape[:-1]+(idata.shape[-1]//2+1,), utils.complex_dtype(idata.dtype))
+	def apply(self, idata, odata=None):
+		if odata is None: odata = self.obuf(idata)
+		self.dev.lib.rfft(idata, odata)
+		if self.real: odata = odata.view(idata.dtype)
+		# We do not normalize here. Instead us .unit to get the relevant factor for scaling ivar to sample space
+		return odata
+	def transpose(self, idata, odata):
+		# The the transpose of an fft is its unnormalized inverse
+		return self.inverse(idata, odata, normalize=False)
+	def inverse(self, idata, odata, normalize=False):
+		if self.real: idata = idata.view(utils.complex_dtype(odata.dtype))
+		self.dev.lib.irfft(idata, odata)
+		if normalize: odata *= self.norm
+		return odata
+	def export(self):
+		return bunch.Bunch(real=self.real, nsamp=self.info.nsamp, freqs=self.dev.get(self.info.freqs), unit=self.info.unit, norm=self.info.norm)
+
+class TransTree(Transformation):
+	def __init__(self, bsize=64, mode="auto", dev=None, info=None):
+		super().__init__(dev=dev, info=info, inplace=True, build_behavior="apply")
+		self.bsize = bsize
+		self.mode  = mode
+		self.corrtol = 0.1
+	def build(self, data, point_offsets, detids, **kwargs):
+		# data is [ndet,n]
+		nbin = max(data.shape[-1]//self.bsize,1)
+		# Build passes and put them on the device with the right dtype
+		passes = gutils.build_pair_passes(point_offsets, detids=detids, mode=self.mode)
+		passes = [self.dev.np.asarray(pairs, dtype=np.int32) for pairs in passes]
+		# Measure all the variances
+		bdata  = gutils.blockify(data, self.bsize) # [ndet,nblock,bsize]
+		bvars  = self.dev.np.var(bdata, axis=-1)   # [ndet,nblock]
+		ndet, nblock = bvars.shape
+		# Handle incomplete bin
+		extra  = data.shape[-1] - bdata.shape[-2]*self.bsize
+		if extra > 0:
+			bvars[...,-1] = (bvars[...,-1]*self.bsize + self.dev.np.var(data[...,-extra:], axis=-1)*extra)/(self.bsize+extra)
+		# Estimate white noise level, since detectors will be mixed up after us.
+		# Sadly we can't in general know that we're in fourier space here, so hard to
+		# select specific frequency range
+		white  = self.dev.np.median(bvars, axis=list(range(1, bvars.ndim)))
+		# Do the passes while measuring
+		nrot   = sum([len(pairs) for pairs in passes])
+		rots   = []
+		icum   = 0
+		for ip, pairs in enumerate(passes):
+			plen    = len(pairs)
+			d1, d2  = pairs.T
+			# Might be best to just make a single function to measure
+			# covs, vars1 and vars2 in one go
+			vars1, covs, vars2  = self.dev.lib.pair_cov(data, pairs, self.bsize)
+			# Clamp correlation based on machine error estimate.
+			# An alternative would be a more robust covariance measurement
+			err = np.finfo(data.dtype).resolution * self.bsize**0.5 / self.corrtol
+			cmax= vars1**0.5 * vars2**0.5 * (1-err)
+			self.dev.np.clip(covs, -cmax, cmax, out=covs)
+			# Should be safe to decompose now
+			E, rot = self.dev.lib.eigh2(vars1, covs, vars2)
+			rots.append(rot)
+			self.dev.lib.pair_rot(data, pairs, rot, self.bsize)
+			self.dev.synchronize()
+		# In theory we have bvars already, from the eigendecomposition E above.
+		# In practice it's safer to just measure it again, to be robust against
+		# numerical cancellation in rare cases
+		bvars  = self.dev.np.var(bdata, axis=-1)   # [ndet,nblock]
+		if extra > 0:
+			bvars[...,-1] = (bvars[...,-1]*self.bsize + self.dev.np.var(data[...,-extra:], axis=-1)*extra)/(self.bsize+extra)
+		info = bunch.Bunch(passes=passes, rots=rots, bvars=bvars, white=white)
+		return TransTree(bsize=self.bsize, mode=self.mode, dev=self.dev, info=info)
+	def apply(self, data, dummy=None):
+		for pairs, rot in zip(self.info.passes, self.info.rots):
+			self.dev.lib.pair_rot(data, pairs, rot, self.bsize)
+		return data
+	def transpose(self, data, dummy=None):
+		return self.inverse(data)
+	def inverse(self, data, dummy=None):
+		for pairs, rot in zip(self.info.passes[::-1], self.info.rots[::-1]):
+			self.dev.lib.pair_rot(data, pairs, rot, self.bsize, inv=True)
+		return data
+	def export(self):
+		passes = utils.cumsum([len(pairs) for pairs in self.info.passes], endpoint=True)
+		pairs  = np.concatenate([self.dev.get(pairs) for pairs in self.info.passes],0)
+		rots   = np.concatenate([self.dev.get(rot) for rot in self.info.rots],1)
+		return bunch.Bunch(bsize=self.bsize, mode=self.mode, passes=passes, pairs=pairs,
+			rots=rots, bvars=self.dev.get(self.info.bvars), white=self.dev.get(self.info.white))
+
 class Filter:
 	def __init__(self, dev=None):
 		"""Initialize the filter. In subclasses this will typically set up parameters"""
@@ -975,7 +1301,7 @@ class Nprep:
 	@contextlib.contextmanager
 	def __call__(self, tod, obs):
 		try: yield
-		finally: return
+		finally: pass
 
 class NprepNone(Nprep): pass
 

@@ -1,14 +1,42 @@
 import time, contextlib, os, re
 import numpy as np
-from pixell import utils, colors, bunch, fft
+from pixell import utils, colors, bunch, fft, config
 from . import device
 from .logging import L
 
-class RecoverableError(Exception): pass
-class SignalOrderError(Exception): pass
-
 def round_up  (n, b): return (n+b-1)//b*b
 def round_down(n, b): return n//b*b
+
+def maybearr(arr, dtype=None, order=None, copy=None, like=None):
+	if arr is None: return None
+	ap = device.anypy(arr)
+	return ap.asarray(arr, dtype=dtype, order=order, copy=copy, like=like)
+
+def parse_slice(string): return eval("np.s_[%s]" % string)
+
+def parse_detids(detids):
+	info = np.zeros(len(detids), [("wafer","U8"),("band","U4"),("hex","U1"),("row","i"),("col","i"),("AB","U1")]).view(np.recarray)
+	info.wafer, _, rest = np.strings.partition(detids, "_")
+	info.band = np.strings.slice(rest, 0, 4)
+	info.hex  = np.strings.slice(rest, 5, 6)
+	info.row  = np.strings.slice(rest, 7, 9).astype(int)
+	info.col  = np.strings.slice(rest,10,12).astype(int)
+	info.AB   = np.strings.slice(rest,12,13)
+	return info
+
+def find_groups(arr):
+	uvals, order, edges = utils.find_equal_groups_fast(arr)
+	return uvals, [order[edges[i]:edges[i+1]] for i,uval in enumerate(uvals)]
+
+def find_band_index(detinfo):
+	"""For each detector in bandinfo, return which index in the list of bands its wafer has it belongs to"""
+	# First loop over wafers
+	bandind = np.zeros(len(detinfo),int)
+	wafers, wgroups = find_groups(detinfo.wafer)
+	for wafer, wgroup in zip(wafers, wgroups):
+		# Label each wafer's members by its band
+		_, bandind[wgroup] = np.unique(detinfo.band[wgroup], return_inverse=True)
+	return bandind
 
 def blockify(tod, bsize=10):
 	nblock = tod.shape[-1]//bsize
@@ -53,6 +81,32 @@ def detmean_ps(ftod):
 	ps /= 2*ftod.shape[0]
 	return ps
 
+def multi_cov(a, b):
+	"""Calculates the covariance of a and b over the last axis.
+	They must have the same shape. No broadcasting is done.
+	Will not produce large intermediates as long as pre-dimensions
+	do not have non-trivial strides"""
+	ap    = device.anypy(a)
+	rtype = utils.real_dtype(a.dtype)
+	ra    = a.view(rtype)
+	rb    = b.view(rtype)
+	cov   = ap.einsum("...i,...i->...", ra, rb)
+	cov  /= a.shape[-1]
+	return cov
+
+def between_inplace(x, v1, v2):
+	"""For each element in x, replace it with 0/1 if that element
+	is inside/outside the range (v1,v2) while allocating no new arrays.
+	v1 and v2 are assumed to be plain numbers, not arrays.
+	Yes, x is overwritten with the result."""
+	ap  = device.anypy(x)
+	mid = (v2+v1)/2
+	rad = (v2-v1)/2
+	x  -= mid
+	ap.abs(x, out=x)
+	ap.less(x, rad, out=x)
+	return x
+
 def split_ranges(dets, starts, lens, maxlen):
 	# Vectorized splitting of detector ranges into subranges.
 	# Probably premature optimization, since it's a bit hard to read.
@@ -81,6 +135,21 @@ def mask2range(mask):
 	start  = ap.where(diffs>0)[0]
 	stop   = ap.where(diffs<0)[0]
 	return np.array([start,stop]).T
+
+def pad(arr, n, mode="zero"):
+	if n == 0: return arr
+	N = arr.shape[-1]
+	# Not on gpu, not memory-optimized
+	oarr = np.pad(arr, [(0,0)]*(arr.ndim-1)+[(0,n)])
+	if   mode == "zero": pass
+	elif mode == "trend":
+		slope = (arr[...,-1]-arr[...,0])/(arr.shape[-1]-1)
+		oarr[...,N:] = arr[...,-1,None] + np.arange(1,1+n)*slope[...,None]
+	elif mode == "constant":
+		oarr[...,N:] = arr[...,-1,None]
+	else:
+		raise ValeError("Unknown pad mode '%s'" % str(mode))
+	return oarr
 
 @contextlib.contextmanager
 def leakcheck(dev, msg):
@@ -168,6 +237,17 @@ def safe_invert_ivar(ivar, tol=1e-6):
 	good = ivar>ref*tol
 	iivar[good] = 1/ivar[good]
 	return iivar
+
+def remove_nan(a):
+	"""Sets nans and infs to 0 in an array in-place. Should have no memory overhead.
+	Also returns the array for convenience."""
+	ap = device.anypy(a)
+	return ap.nan_to_num(a, copy=False, nan=0, posinf=0, neginf=0)
+def without_nan(a):
+	"""Returns a copy of a with nans and infs set to 0. The original
+	array is not modified."""
+	ap = device.anypy(a)
+	return ap.nan_to_num(a, copy=True, nan=0, posinf=0, neginf=0)
 
 # Runs at 0.45 ms per tile on the cpu and 0.03 ms per tile on the gpu.
 # This is much faster than calling the standard linear algebra functions,
@@ -346,6 +426,7 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 	if dev is None: dev = device.get_device()
 	if not inplace: tod = tod.copy()
 	ndet, nsamp = tod.shape
+	stride = tod.strides[-2]//tod.strides[-1]
 	B    = dev.np.empty([2,nsamp],dtype=tod.dtype) # [{a,b},nsamp]
 	B[0] = x
 	B[1] = one
@@ -356,7 +437,7 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 		# tod      = tod_mul*otod
 		# transposed: coeffs' = abmul*otod.dot(B')
 		coeffs = dev.np.zeros((2,ndet), tod.dtype) # [{a,b},ndet]
-		dev.lib.gemm("T", "N", ndet, 2, nsamp, abmul, tod, nsamp, B, nsamp, 0, coeffs, ndet)
+		dev.lib.gemm("T", "N", ndet, 2, nsamp, abmul, tod, stride, B, nsamp, 0, coeffs, ndet)
 		if tod_mul != 1: tod *= tod_mul
 	else:
 		# otod = abmul*coeffs.T.dot(B) + tod_mul*tod
@@ -364,12 +445,13 @@ def detwise_axb(tod, x, a=None, b=None, one=1, inplace=False, tod_mul=0, abmul=1
 		# In standard form
 		# [otod] = [abmul*B' tod_mul*I] [coeffs tod]'
 		coeffs = dev.np.array([a,b]) # [{a,b},ndet]
-		dev.lib.gemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, nsamp)
+		dev.lib.gemm("N", "T", nsamp, ndet, 2, abmul, B, nsamp, coeffs, ndet, tod_mul, tod, stride)
 	return tod, coeffs[0], coeffs[1]
 
-def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, dev=None, external_v=False, return_edges=False):
+def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, npad=None, dev=None, external_v=False, return_edges=False):
 	if dev  is None: dev  = device.get_device()
-	if n    is None: n    = signal.shape[-1]
+	if npad is None: npad = 0
+	if n    is None: n    = signal.shape[-1]-npad
 	if not inplace: signal = signal.copy()
 	# Allow us to work on other arrays than 2d.
 	pre, nsamp = signal.shape[:-1], signal.shape[-1]
@@ -383,6 +465,7 @@ def deslope(signal, v1=None, v2=None, w=10, inplace=False, n=None, dev=None, ext
 	one = dev.np.full(nsamp, 1, dtype=signal.dtype)
 	one[n:] = 0
 	otod = detwise_axb(signal, x, v2-v1, v1, one=one, tod_mul=1, abmul=-1, dev=dev, inplace=True)[0]
+	otod[:,n:] = 0
 	# Restore to original shape
 	otod = otod.reshape(pre+(nsamp,))
 	v1   = v1.reshape(pre)
@@ -495,135 +578,6 @@ def logint(arr, x):
 	larr = ap.log(arr)
 	return ap.exp(larr[...,ix]*(1-rx) + larr[...,ix+1]*rx)
 
-def obs_group_info(obsinfo, groups, inds=None, sampranges=None):
-	"""Given an obsinfo (ala socommon.finish_query), group definitions
-	groups[ngroup][obsinds], and optionally a list of which groups to actually include,
-	returns information about number of detectors and samples per group,
-	per member etc, which would be useful for precallocating buffers."""
-	if inds is None: inds = np.arange(len(groups))
-	info = bunch.Bunch(ndet=[], nsub=[], nsamp=[], fhwp=[], fsamp=[])
-	for ind in inds:
-		group = groups[ind]
-		ginfo = obsinfo[group]
-		info.ndet .append(np.sum(ginfo.ndet))
-		info.nsub .append(np.max(ginfo.ndet))
-		info.nsamp.append(np.max(ginfo.nsamp))
-		# max and min here so that we don't overestimate
-		# the potential downsampling factor fsamp/fhwp
-		info.fhwp .append(np.max(ginfo.fhwp))
-		info.fsamp.append(np.min(ginfo.nsamp/ginfo.dur))
-	for key in info: info[key] = np.array(info[key])
-	info.dur = info.nsamp/info.fsamp
-	if sampranges is not None:
-		# Sampranges is [ngroup,{from,to}]
-		info.nsamp = np.minimum(info.nsamp, sampranges[inds,1])-sampranges[inds,0]
-	return info
-
-def obs_group_size(obsinfo, groups, inds=None, sampranges=None):
-	if inds is None: inds = np.arange(len(groups))
-	if sampranges is None:
-		return np.array([np.sum(obsinfo.ndet[groups[i]]*obsinfo.nsamp[groups[i]]) for i in inds])
-	else:
-		nsamps = sampranges[:,1]-sampranges[:,0]
-		return np.array([np.sum(obsinfo.ndet[groups[i]])*nsamps[i] for i in inds])
-
-def obs_group_dur(obsinfo, groups, inds=None, sampranges=None):
-	if inds is None: inds = np.arange(len(groups))
-	# duration from first member of group. This assumes that a group doesn't
-	# contain multiple time-ranges
-	durs = np.array([obsinfo.dur[groups[i][0]] for i in inds])
-	if sampranges is not None:
-		nsamps = sampranges[:,1]-sampranges[:,0]
-		tfracs = np.array([nsamps[i]/obsinfo.nsamp[groups[i][0]] for i in inds])
-		durs  *= tfracs
-	return durs
-
-def time_split(joint, ginfo, post=None, maxsize=None, maxdur=None):
-	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
-	into subranges so that the total ndet*nsamp size of each is no larger than
-	maxsize. This can be needed due to memory constraints."""
-	if post is not None and post.demod:
-		nsamps = utils.ceil(ginfo.nsamp*ginfo.fhwp/ginfo.fsamp)
-		ndets  = ginfo.ndet*len(post.comps)
-	else:
-		nsamps = ginfo.nsamp
-		ndets  = ginfo.ndet
-	if post is not None and post.down:
-		nsamps = utils.ceil(nsamps/post.down)
-	nsplits = np.ones(len(joint.groups), int)
-	if maxsize is not None:
-		# calculate the total size of each group
-		sizes = nsamps*ndets
-		# number of time splits for each
-		nsplits = np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
-	if maxdur is not None:
-		nsplits = np.maximum(nsplits, utils.floor(ginfo.dur/maxdur)+1)
-	# Do the split
-	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
-		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
-	for gi, (group, name, nsplit) in enumerate(zip(joint.groups, joint.names, nsplits)):
-		# Need the number of samples the group covers. Will assume good time alignment
-		if joint.sampranges is None:
-			i0    = 0
-			nsamp = ginfo.nsamp[gi]
-		else:
-			i0    = joint.sampranges[gi,0]
-			nsamp = joint.sampranges[gi,1]-joint.sampranges[gi,0]
-		for si in range(nsplit):
-			i1 = i0 + si*nsamp//nsplit
-			i2 = i0 + (si+1)*nsamp//nsplit
-			oname = "%s:split%d" % (name,si)
-			ojoint.groups.append(group)
-			ojoint.names.append(oname)
-			ojoint.sampranges.append((i1,i2))
-	ojoint.sampranges = np.array(ojoint.sampranges)
-	return ojoint
-
-#def time_split(obsinfo, joint, maxsize=None, maxdur=None):
-#	"""Split obs groups defined by joint.{groups,names,bands,sampranges,joint}
-#	into subranges so that the total ndet*nsamp size of each is no larger than
-#	maxsize. This can be needed due to memory constraints."""
-#	nsplits = np.ones(len(joint.groups), int)
-#	ginfo   = obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-#
-#
-#
-#	if maxsize is not None:
-#		# calculate the total size of each group
-#		sizes  = obs_group_size(obsinfo, joint.groups, sampranges=joint.sampranges)
-#		# number of time splits for each
-#		nsplits= np.maximum(nsplits, utils.floor(sizes/maxsize)+1)
-#	if maxdur is not None:
-#		durs   = obs_group_dur(obsinfo, joint.groups, sampranges=joint.sampranges)
-#		nsplits= np.maximum(nsplits, utils.floor(durs/maxdur)+1)
-#	# Do the split
-#	ojoint = bunch.Bunch(groups=[], names=[], sampranges=[],
-#		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
-#	for gi, (group, name, nsplit) in enumerate(zip(joint.groups, joint.names, nsplits)):
-#		# Need the number of samples the group covers. Will assume good time alignment
-#		if joint.sampranges is None:
-#			i0    = 0
-#			nsamp = np.max(obsinfo.nsamp[group])
-#		else:
-#			i0    = joint.sampranges[gi,0]
-#			nsamp = joint.sampranges[gi,1]-joint.sampranges[gi,0]
-#		for si in range(nsplit):
-#			i1 = i0 + si*nsamp//nsplit
-#			i2 = i0 + (si+1)*nsamp//nsplit
-#			oname = "%s:split%d" % (name,si)
-#			ojoint.groups.append(group)
-#			ojoint.names.append(oname)
-#			ojoint.sampranges.append((i1,i2))
-#	ojoint.sampranges = np.array(ojoint.sampranges)
-#	return ojoint
-
-def select_groups(joint, inds):
-	return bunch.Bunch(
-		groups = [joint.groups[i] for i in inds],
-		names  = [joint.names[i]  for i in inds],
-		sampranges=np.array([joint.sampranges[i] for i in inds]),
-		bands=joint.bands, nullbands=joint.nullbands, joint=joint.joint)
-
 def alloc_rfft(ishape, idtype, axes=[-1], dev=None, pool=None):
 	if pool is None:
 		if dev is None: dev = device.get_device()
@@ -669,6 +623,8 @@ def fourier_resample(itod, otod, normalize=False, nofft=False, ipool=None, opool
 			# Chepeast to do the division here
 			otod /= norm
 	return otod
+
+def get_srate(ctime): return (len(ctime)-1)/(ctime[-1]-ctime[0])
 
 def jacobi(tod, op, iop=lambda x:x, niter=4):
 	res = op(tod)
@@ -891,14 +847,6 @@ def pair_rotate(iptod, optod, normalize=True):
 	optod[1] -= iptod[1]
 	if normalize: optod /= 2**0.5
 	return optod
-
-def check_demod(demod="auto", has_hwp=False):
-	if demod not in ["auto", "yes", "no"]:
-		raise ValueError("demod must be 'auto', 'yes' or 'no', but got '%s'" % str(demod))
-	if demod == "auto": return has_hwp
-	elif demod == "no": return False
-	elif has_hwp: return True
-	else: raise ValueError("Asked to demodulate, but no hwp present")
 
 def estimate_leakage_odr(x, y, down=10, bsize=700):
 	"""Assuming x = signal+noise1, y = signal*a + noise2, estimate
@@ -1135,3 +1083,254 @@ def _app(s, table, verbose):
 	cols = ",".join(s.columns(table))
 	sql  = "insert into main.%s (%s) select %s from other.%s" % (table, cols, cols, table)
 	_ex(s, sql, verbose)
+
+def parse_pickup(desc):
+	parser = utils.CommaArgparse()
+	parser.add_argument("mode", choices=["none", "az", "phase"])
+	parser.add_argument("-r", "--res", type=float, default=15)
+	return parser.parse_args(desc)
+
+# This and other SOPATH stuff (like in soeph) should go into a new module, and hook into the site config
+config.default("geometry_path", "$SOPATH/sore/amaurea/geometry/current", "Path to directory with standard geometries")
+def find_geometry(name):
+	if name.endswith(".fits"): return name
+	else: return os.path.join(os.path.expandvars(config.get("geometry_path")), name + ".fits")
+
+# Detector grouping
+#
+# Actually, a pair hierarchy isn't quite the right abstraction here.
+# What I really want is a set of passes of pair-rotations. This has
+# a hierarchy as a subset, but allows for the diff-detectors to
+# be further diffed if necessary, instaead of only sum-detectors
+# being diffed.
+#
+# Also in the hierarchy, the indices in lvl X are relative to
+# the number of pairs in hierarchy lvl X-1. In the passes approach,
+# all indices are indices into the raw list of detectors. This makes
+# in-place operation much easier. That approach also means we don't have
+# to carry around "pairs" with only a single duplicated member.
+#
+# The passes approach would be represented as
+#  [npass][npair,2]
+# For each pair the rotation will take (d1,d2) → (diff,sum)
+#
+# Hierarchies can still be useful as a way to build passes though
+
+def build_pair_passes(poss, detids=None, mode="auto"):
+	if mode == "auto":
+		if detids is not None and re.match(r"[^_]+_...._.r\d\dc\d\d[ABD]", detids[0]):
+			mode = "sohex"
+		else:
+			mode = "pos"
+	if mode == "pos":
+		return build_pair_passes_pos(poss)
+	elif mode == "sohex":
+		return build_pair_passes_sohex(poss, detids=detids)
+	else:
+		raise ValueError("Unknown pair pass mode '%'" % str(mode))
+
+def build_pair_passes_sohex(poss, detids, tol=1.5, band_pair_diff=True):
+	hierarchy = build_pair_hierarchy_sohex(poss, detids, tol=tol)
+	# We don't prune empty because we want to be able to tell if
+	# the band-diff level is present
+	passes = hierarchy2passes(hierarchy, prune_empty=False)
+	if band_pair_diff and len(passes[1]) > 0:
+		# We want to both difference AB-pairs and band-pairs.
+		# Lvl 1 gives us AB-diffs and sums, and lvl 2 is set up
+		# to continue with the sums only. Add diff-diffs too.
+		# Remember that the diffs are placed in index 0. We won't
+		# propagate these diff-diffs further up the hierarchy here, though
+		# it could be done. At lvl 2, we have pairs like [sum1,sum2].
+		# For each of sum1 and sum2 we want to find the corresponding diff.
+		# Find these by searching in the previous layer
+		sum_pairs  = passes[1]
+		pinds      = utils.find(passes[0][:,1], sum_pairs, default=-1)
+		# If there was no AB partner, then there will be no AB diff.
+		# We want diff-diffs here, so require both. Sum-diffs are possible,
+		# but would have to make sure we don't step on anybody's toes.
+		has_diffs  = np.all(pinds >= 0, 1)
+		diff_pairs = passes[0][pinds[has_diffs],0]
+		# And append these as operations to do in this pass
+		passes[1]  = np.concatenate([passes[1], diff_pairs], 0)
+	# Can now prune no-op layers
+	passes = [pass_ for pass_ in passes if len(pass_) > 0]
+	return passes
+
+def build_pair_passes_pos(poss, tol=1.5):
+	hierarchy = build_pair_hierarchy_pos(poss, tol=tol)
+	return hierarchy2passes(hierarchy)
+
+def print_pair_passes(passes, detids):
+	counts = np.zeros(len(detids),int)
+	for ipass, pairs in enumerate(passes):
+		print("Pass %d" % (ipass+1))
+		for i, (d1, d2) in enumerate(pairs):
+			counts[d1] += 1
+			counts[d2] += 1
+			print(" %4d %s:%02d %s:%02d" % (i+1, detids[d1], counts[d1], detids[d2], counts[d2]))
+
+def hierarchy2passes(hierarchy, prune_empty=True):
+	"""Translate from a pair-hierachy to pair passes. This involves
+	translating to absolute detector indices and dropping singletons."""
+	# Translate to absolute indices
+	inds   = np.arange(np.max(hierarchy[0])+1,dtype=int)
+	passes = []
+	for pairs in hierarchy:
+		proper= pairs[:,1] != pairs[:,0]
+		pass_ = inds[pairs[proper]]
+		inds  = inds[pairs[:,1]]
+		if len(pass_) > 0 or not prune_empty:
+			passes.append(pass_)
+	return passes
+
+def build_pair_hierarchy_sohex(poss, detids, tol=1.5):
+	# The levels are:
+	# 1. AB
+	# 2. band
+	# 3::2 rows
+	# 4::2 cols
+	d  = parse_detids(detids)
+	# We will build an binary address for each detector that encodes the
+	# hierarchy we want. The dark detectors don't fit into this, or the whole
+	# hierarchical noise model scheme, but to still sort of support them,
+	# they are remapped to a fake 4th hex
+	d  = remap_dark(d)
+	bind = find_band_index(d)
+	# Interleaved pixel address. row and col are 0:12 so fit in 4 bits, and the result
+	# will fit in 8 bits
+	rbits = np.unpackbits(d.row[:,None].astype(np.uint8), axis=1)
+	cbits = np.unpackbits(d.col[:,None].astype(np.uint8), axis=1)
+	ibits = np.concatenate([rbits[...,4:,None],cbits[...,4:,None]],-1).reshape(rbits.shape)
+	paddr = np.packbits(ibits).astype(int)
+	# The rest will just be a plain number
+	ihex  = (np.strings.encode(d.hex).view(np.uint8)-ord('A')).astype(int)
+	_, waddr = np.unique(d.wafer, return_inverse=True)
+	# Address each detector in binary
+	ind  = (d.AB != "A").astype(int) | (bind > 0) << 1 | paddr << 2 | ihex << 10 | waddr << 12
+	# Build the groups. The bottom-level groups share all bits but the least, and
+	# so on
+	hierarchy = []
+	for level in range(12):
+		isub = ind & 1
+		ind >>= 1
+		uvals, igroup = np.unique(ind, return_inverse=True)
+		pairs = np.full((len(uvals),2), -1, int)
+		pairs[igroup,isub] = np.arange(len(ind))
+		# Duplicate any pair with only one entry
+		for i in range(2):
+			missing = pairs[:,i] < 0
+			pairs[missing,i] = pairs[missing,1-i]
+		hierarchy.append(pairs)
+		# Average the positions
+		poss = np.mean(poss[pairs],1)
+		# Prepare for next loop
+		ind   = ind[pairs[:,0]]
+	# By this point we have a partial hierarchy, built up to the wafer level.
+	# The rest will be done using just the positions.
+	hierarchy += build_pair_hierarchy_pos(poss, tol=tol)
+	return hierarchy
+
+def remap_dark(detinfo):
+	detinfo = detinfo.copy()
+	dark  = np.strings.slice(detinfo.band, 0, 1) != "f"
+	idark = np.where(dark)[0]
+	if np.sum(dark) == 0: return detinfo
+	# Sort dark by wafer, row and col, then assign running numbers
+	order   = np.lexsort((detinfo.col[idark], detinfo.row[idark], detinfo.hex[idark], detinfo.wafer[idark]))
+	swaf    = detinfo.wafer[idark][order]
+	_, darkind = utils.label_runs(swaf, return_index=True)
+	darkind = utils.unmask(darkind, order)
+	# Use these to build row and AB. Should ideally spread out between row and col
+	# to average down faster, but doesn't really matter
+	new_row = darkind//2
+	new_AB  = np.strings.decode(((darkind&1).astype(np.uint8)+ord('A')).view("S1"))
+	# Also need a valid band to replace "DARK" with
+	lwafs, fwafer_light = np.unique(detinfo.wafer[~dark], return_index=True)
+	dwafs, iwafer_dark  = np.unique(detinfo.wafer[dark],  return_inverse=True)
+	dlmap = utils.find(lwafs, dwafs, default=0, sorted=True)
+	new_band = detinfo.band[~dark][fwafer_light[dlmap[iwafer_dark]]]
+	# Update detinfo
+	detinfo.hex[idark] = "D"
+	detinfo.row[idark] = new_row
+	detinfo.col[idark] = 0
+	detinfo.band[idark] = new_band
+	detinfo.AB[idark]  = new_AB
+	return detinfo
+
+# This implementation uses KDTree. An alternative would be to base it
+# on a gradually coarsening grid, using the grid not just to find neighbors,
+# but also to guide the shape of the regions. That would take some work
+# to implement though.
+def build_pair_hierarchy_pos(poss, tol=1.5):
+	"""Given poss[ndet,{xi,eta}] build a hierarchy of nearest neighbors
+	based pursely on the positions. Returns hierarchy, which is a list of
+	lists of pair-indices. A "pair" can consist of a dupilicated entry to allow for
+	missing entries. The first list gives indices of closest-pairs in poss.
+	The second list gives indices into the list of pairs from the previous
+	list, and so on.
+
+	This function isn't that good at making similar-sized groups within
+	each level of the hierarchy, nor of keeping them compact, but it does
+	an OK job. It's a bit slow though. Lower values of tol make it faster, at
+	the cost of poentially missing neighbors.
+	"""
+	# Trivial if we only have one pair. Normally recursion will terminate
+	# with the 2-condition. The 1-condition should only happen if we only
+	# had a single detector to begin with
+	if   len(poss) == 1: return [np.zeros((1,2),int)]
+	elif len(poss) == 2: return [np.arange(2)[None]]
+	from scipy.spatial import KDTree
+	# 1. Find close pairs. Not all points may be matched
+	tree = KDTree(poss)
+	pairs, dists = find_close_pairs(tree, tol=tol)
+	# 2. Disqualify ones that aren't close enough
+	rmin   = np.min(dists)
+	rtyp   = np.median(dists)
+	rlim   = rmin + tol*(rtyp-rmin)
+	good   = dists <= rlim
+	pairs  = pairs[good]
+	npair  = len(pairs)
+	# 3. Which are unmatched?
+	missing = utils.complement_inds(np.concatenate(pairs), len(poss))
+	nmiss   = len(missing)
+	# 4. Add pairs and missing to output pairs
+	opairs = np.zeros((npair+nmiss,2),int)
+	opairs[:npair] = pairs
+	opairs[npair:,0] = missing
+	opairs[npair:,1] = missing
+	# 5. Build new effective positions
+	pposs  = np.mean(poss[opairs,:],1)
+	# 6. Appent results from next passes
+	hierarchy = [opairs] + build_pair_hierarchy_pos(pposs, tol=tol)
+	return hierarchy
+
+def find_close_pairs(tree, tol=1.5):
+	# average point separation
+	poss    = tree.data
+	n       = len(poss)
+	box     = utils.minmax(poss, 0)
+	# rough area covered assuming circle. More robust than using
+	# bounding box area because bounding box can collapse
+	A       = np.pi*(np.sum((box[1]-box[0])**2)/4)
+	r0      = (A/len(poss))**0.5
+	pairs   = tree.query_pairs(r0*tol, output_type="ndarray")
+	# Avoid failing if we can't find any pairs
+	if len(pairs) < 2:
+		pairs = tree.query_pairs(r0*1e9, output_type="ndarray")
+	dists   = np.sum((poss[pairs[:,0],:] - poss[pairs[:,1],:])**2,1)
+	# Find the closest partner for each
+	besti   = np.full(n, -1,     int)
+	bestr   = np.full(n, np.inf, float)
+	for (i1,i2), dist in zip(pairs, dists):
+		if dist < bestr[i1]:
+			besti[i1] = i2
+			bestr[i1] = dist
+		if dist < bestr[i2]:
+			besti[i2] = i1
+			bestr[i2] = i1
+	# Choose lowest-indexed
+	myind   = np.arange(n)
+	islower = myind < besti
+	pairs   = np.concatenate([myind[islower,None],besti[islower,None]],1)
+	dists   = bestr[islower]
+	return pairs, dists

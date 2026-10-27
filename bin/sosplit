@@ -5,9 +5,9 @@ parser = config.ArgumentParser("sogma")
 parser.add_argument("query")
 parser.add_argument("odir")
 parser.add_argument("-C", "--context", type=str,   default="lat")
-parser.add_argument("-L", "--loader",  type=str,   default="auto")
+parser.add_argument("-L", "--loader",  type=str,   default="sofast-")
 parser.add_argument(      "--nopre",   action="store_true")
-parser.add_argument("-d", "--dsplit",  type=str,   default="tube")
+parser.add_argument("-d", "--dsplit",  type=str,   default="tube,band")
 parser.add_argument("-T", "--tsplit",  type=str,   default="day:1")
 parser.add_argument("-s", "--ssplit",  type=str,   default="crossel")
 parser.add_argument("-r", "--res",     type=float, default=1, help="degrees")
@@ -389,8 +389,8 @@ dev     = device.get_device("minimal")
 # 1. query our database. The query should cover all the data we want
 # to consider, even what will ultimately be mapped separately. It will
 # be split into parts using the --dsplit argument.
-loader  = loading.Loader(args.context, type=args.loader, dev=dev)
-obsinfo = loader.query(args.query)
+loader  = loading.get_loader(args.context, type=args.loader, dev=dev)
+obsinfo = loader.query(args.query).obsinfo
 # Avoid being confused by el > 90°
 obsinfo.baz, obsinfo.bel = normalize_bore(obsinfo.baz, obsinfo.bel)
 # 2. Split into detector groups and and sub-divisions that we want to be evenly balanced,

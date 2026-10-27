@@ -36,6 +36,10 @@ class MMDeviceMinimal(device.DeviceCpu):
 			return fft.irfft(dat, tod=out, axes=axis, n=n, normalize=False)
 		self.lib.irfft = irfft
 		self.lib.fft_factors = [2,3,5,7]
+		self.lib.bsize = 1
+		# This should be inherited instead duplicated
+		def goodlen(self, n, direction="below"):
+			return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 		# BLAS. May need to find a way to make this more compact if we need
 		# more of these functions
 		def gemm(opA, opB, m, n, k, alpha, A, ldA, B, ldB, beta, C, ldC, handle=None):
@@ -78,6 +82,9 @@ try:
 			self.lib.get_border_means= gpu_mm.get_border_means
 			self.lib.dejump          = gpu_mm.dejump
 			self.lib.gapfill         = gpu_mm.gapfill
+			# Pickup
+			self.lib.tod2pickup      = gpu_mm.tod2pickup
+			self.lib.pickup2tod      = gpu_mm.pickup2tod
 			# Low-level fft plans
 			self.lib.get_plan_size   = gpu_mm.cufft.get_plan_size
 			self.lib.get_plan_r2c    = gpu_mm.cufft.get_plan_r2c
@@ -95,6 +102,10 @@ try:
 				return gpu_mm.cufft.irfft(dat, out=out, axis=axis, n=n, plan=plan, plan_cache=plan_cache)
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
+			self.lib.bsize = 32
+			# This should be inherited instead duplicated
+			def goodlen(self, n, direction="below"):
+				return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 			# Tiling
 			self.lib.DynamicMap     = gpu_mm.DynamicMap
 			self.lib.LocalMap       = gpu_mm.LocalMap
@@ -129,6 +140,10 @@ try:
 					tod[...,nblock*bsize:] *= bscale[...,-1,None]
 				return tod
 			self.lib.block_scale = block_scale
+			# Pair-rotation
+			self.lib.pair_rot = gpu_mm.pair_rot
+			self.lib.pair_cov = gpu_mm.pair_cov
+			self.lib.eigh2    = gpu_mm.eigh2
 
 	def get_cublas_op(op):
 		# TODO add more
@@ -186,6 +201,9 @@ try:
 			self.lib.get_border_means= cpu_mm.get_border_means
 			self.lib.dejump          = cpu_mm.dejump
 			self.lib.gapfill         = cpu_mm.gapfill
+			# Pickup
+			self.lib.tod2pickup      = cpu_mm.tod2pickup
+			self.lib.pickup2tod      = cpu_mm.pickup2tod
 			# ffts. No plan caching for now
 			def rfft(dat, out=None, axis=-1, plan=None, plan_cache=None):
 				return fft.rfft(dat, ft=out, axes=axis)
@@ -194,6 +212,10 @@ try:
 				return fft.irfft(dat, tod=out, axes=axis, n=n, normalize=False)
 			self.lib.irfft = irfft
 			self.lib.fft_factors = [2,3,5,7]
+			self.lib.bsize = 1
+			# This should be inherited instead duplicated
+			def goodlen(self, n, direction="below"):
+				return fft.fft_len(n//self.bsize, factors=self.lib.factors, direction=direction)*self.lib.bsize
 			# Tiling
 			self.lib.DynamicMap     = cpu_mm.DynamicMap
 			self.lib.LocalMap       = cpu_mm.LocalMap
@@ -224,47 +246,12 @@ try:
 			self.lib.dgmm = dgmm
 			# Scaling
 			self.lib.block_scale = cpu_mm.block_scale
+			# Pair-rotation
+			self.lib.pair_rot = cpu_mm.pair_rot
+			self.lib.pair_cov = cpu_mm.pair_cov
+			self.lib.eigh2    = cpu_mm.eigh2
 
 	device_types.cpu = MMDeviceCpu
 
 except ImportError:
 	pass
-
-	# What do we need to make a sotodlib device?
-	# 1. LocalMap
-	#    Must contain .arr, a device array reshapable to (ntile,ncomp,tyshape,txshape)
-	#    Must contain .pixelization, a LocalPixelization
-	#    Must be constructable from (pixelization, arr)
-	#    Must be passable to map2tod, tod2map
-	#    (tyshape,txshape) must be (64,64)
-	# 2. LocalPixelization
-	#    Must contain .cell_offsets_cpu. These are offsets from the start of .arr
-	#    of each tile for a (3,64,64) tile.
-	# 3. DynamicMap
-	#    Must be passable to tod2map
-	#    Must be constructable from (shape, dtype)
-	#    Must contain .finalize(), which returns a LocalMap
-	# 4. map2tod
-	#    Must accept (LocalMap, tod, pointing, plan, [response])
-	#    pointing is [{y,x,psi},ndet,nsamp]
-	#    plan is PointingPlan
-	#    If implemented with sotodlib, we have a mismatch. sotodlib wants
-	#     (ncomp,tyshape,txshape,ntile), but we have (ntile,ncomp,tyshape,txshape).
-	#     Will moveaxis be enough, or must we make it contiguous too?
-	#    sotodlib expects to compute the pointing on the fly. Is there an
-	#     interface for passing in precomputed pointing? Yes, but it doesn't
-	#     support bilinear interpolation, which we use in sogma. It also doesn't
-	#     support response. Must either generalize it, or add a new CoordSys
-	#     that represents precomputed pointing. The latter is probably simplest.
-	#    PointingFit calculates the pointing using .dot(), which will hopefully
-	#     use threads, otherwise it will be very slow.
-	#    How does sotodlib handle sky wrapping?
-	# 5. tod2map
-	#    Must accept (tod, LocalMap/DyamicMap, pointing, plan, [response])
-	#    sotodlib needs thread_intervals, which must be precomputed using
-	#    _get_proj_threads. Store a whole P in DynamicMap/LocalMap/PointingPrePlan/PointingPlan?
-	# 6. PointingPlan
-	#    Must be constructable from (preplan, pointing)
-	# 7. PointingPrePlan
-	#    Must be constructable from (pointing, ny, nx, periodic_xcoord=True)
-	#    For sotodlib this and PointingPlan can be dummies

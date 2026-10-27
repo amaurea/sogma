@@ -1,7 +1,7 @@
 import numpy as np, os, warnings
 import time, h5py
 from pixell import utils, bunch, enmap, colors, wcsutils, bench, config
-from . import nmat, pmat, tiling, gutils, device, socal
+from . import nmat, pmat, tiling, gutils, device, socal, errors
 from .logging import L
 
 # Prior handling
@@ -101,7 +101,7 @@ class MLMapmaker:
 		# Technically SignalCut clobbers, but not in the sense we care about here
 		for signal in signals[:-1]:
 			if signal.clobbers:
-				raise gutils.SignalOrderError("Clobbering %s %s not last in list!" % (type(signal).__name__, signal.name))
+				raise errors.SignalOrderError("Clobbering %s %s not last in list!" % (type(signal).__name__, signal.name))
 		self.signals  = signals
 		self.dev      = dev or device.get_device()
 		self.dtype    = dtype
@@ -143,14 +143,14 @@ class MLMapmaker:
 			# If our previous pass didn't include this id, then that means we too will end up
 			# skipping it, so might as well do so right away. This isn't really an error, but it's
 			# convenient to raise an exception.
-			if not signal_guess.has(id): raise gutils.RecoverableError("Skipped in previous pass")
+			if not signal_guess.has(id): raise errors.RecoverableError("Skipped in previous pass")
 			model     = self.dev.pools["ft"].zeros(gtod.shape, gtod.dtype)
 			signal_guess.forward(model, id)
 			gtod -= model
 			obs.fill.gapfill(gtod, dev=self.dev)
 		if deslope:
 			# Deslope must happen here, since it's the noise that must be periodic, not the signal
-			gutils.deslope(gtod, w=5, inplace=True)
+			gutils.deslope(gtod, w=5, npad=obs.npad, inplace=True)
 		t3 = self.dev.time()
 		# Apply any filter. There usually won't be one, since we do maximum-likelihood
 		# mapmaking most of the time, but this is used by the planet mapmaker
@@ -172,7 +172,7 @@ class MLMapmaker:
 				# we instead use a dummy noise model with tiny weight
 				msg = f"FAILED to build a noise model for observation='{id}' : '{e}'"
 				if signal_guess is None:
-					raise gutils.RecoverableError(msg)
+					raise errors.RecoverableError(msg)
 				else:
 					iN = nmat.NmatNull(dev=self.dev)
 					L.print(msg + ". Nulling", level=2, color=colors.red)
@@ -187,11 +187,12 @@ class MLMapmaker:
 			gtod += model
 		t4 = self.dev.time()
 		# And apply it to the tod
+		moo = self.dev.pools["pointing"].array(gtod)
 		gtod = iN.apply(gtod)
 		t5 = self.dev.time()
 		# This is our last chance to safely abort, so check that our data makes sense
 		if not self.dev.np.isfinite(self.dev.np.sum(gtod)):
-			raise gutils.RecoverableError(f"Invalid value in N\"tod")
+			raise errors.RecoverableError(f"Invalid value in N\"tod")
 		# Add the observation to each of our signals
 		for signal in self.signals:
 			signal.add_obs(id, obs, iN, gtod)
@@ -439,14 +440,7 @@ class SignalMap(Signal):
 		# signal_cut to be safest, but only uses .clear which should be the same for all
 		# of them anyway
 		if pmap is None:
-			try:
-				pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, site=obs.site, dev=self.dev, dtype=iNd.dtype)
-			except RuntimeError:
-				# This happens if the pointing fit goes badly wrong, which
-				# can happen if the tod crosses the poles. Too late to cancel
-				# the tod at this point, so instead we will skip it just in this
-				# signal
-				pmap = pmat.PmatDummy()
+			pmap = pmat.PmatMap(self.fshape, self.fwcs, obs.ctime, obs.boresight, obs.point_offset, obs.polangle, sys=self.sys, response=obs.response, site=obs.site, dev=self.dev, dtype=iNd.dtype)
 			self.dev.garbage_collect()
 		if pcut is None:
 			# This doesn't have to match the exact cut type in SignalCut.
@@ -527,7 +521,8 @@ class SignalMap(Signal):
 			tod = self.dev.pools["tod"].full((ndet,nsamp), 1, d.tod_dtype)
 			# override windowing, since we're downsampled
 			d.iN.white(tod, nwin=0)
-			d.pcut.clear(tod)
+			# FIXME: should have a pcut.clear here, but need a downsampled pcut in that case
+			#d.pcut.clear(tod)
 			pmap.backward(tod, dxlink)
 			t2  = time.time()
 			L.print("Init map %s %6.3f %s" % ("xlink", t2-t1, id), level=2)
@@ -1186,6 +1181,105 @@ class SignalElMod(Signal):
 	# e.g. rhs and ivar. It doesn't mean an actual sky map
 	valid_outputs = ["map"]
 
+class SignalPickup(Signal):
+	def __init__(self, comm, res=15*utils.arcmin, phase=False,
+			prior=None, dev=None, name="pickup", ofmt="{name}_{id}",
+			dtype=np.float32, outputs=[]):
+		Signal.__init__(self, name=name, ofmt=ofmt, outputs=outputs, ext="fits")
+		self.comm  = comm
+		self.dev   = dev   or self.get_device()
+		self.prior = prior or PriorDiv()
+		self.dtype = dtype
+		self.phase = phase
+		self.res   = res
+		self.off   = 0
+		self.data  = {}
+		self.rhs   = []
+		self.idiv  = []
+	def reset(self):
+		Signal.reset(self)
+		self.dof  = 0
+		self.data = {}
+		self.rhs  = []
+		self.idiv = []
+	def new(self): return SignalPickup(self.comm, res=self.res, phase=self.phase,
+			prior=self.prior.new(), dev=self.dev, name=self.name, ofmt=self.ofmt,
+			dtype=self.dtype, outputs=self.outputs)
+	def add_obs(self, id, obs, iN, iNd):
+		iNd     = iNd.copy() # This copy can be avoided if build_obs is split into two parts
+		pcut    = pmat.PmatCutFull(obs.cuts, dev=self.dev)
+		P       = pmat.PmatPickup(obs.boresight[1], self.res, phase=self.phase, dev=self.dev)
+		# Build our RHS
+		ndet    = obs.tod.shape[0]
+		obs_rhs = self.dev.np.zeros((ndet,P.nx), self.dtype)
+		pcut.clear(iNd)
+		P.backward(iNd, obs_rhs)
+		obs_rhs = self.dev.get(obs_rhs)
+		# Build our preconditioner. Fully diagonal for now.
+		obs_div = self.dev.np.ones((ndet,P.nx), self.dtype)
+		iNd[:]   = 0
+		P.forward(iNd, obs_div)
+		#pcut.clear(iNd) # unnecessary since white is diagonal
+		iN.white(iNd)
+		pcut.clear(iNd)
+		obs_div[:] = 0
+		P.backward(iNd, obs_div)
+		with utils.nowarn():
+			obs_idiv = utils.without_nan(1/self.dev.get(obs_div)) # back to the cpu
+		# Keep track of our degrees of freedom
+		ndof = obs_rhs.size
+		self.data[id] = bunch.Bunch(P=P, ndet=ndet, i1=self.off, i2=self.off+ndof)
+		self.off += ndof
+		self.rhs.append(obs_rhs.reshape(-1))
+		self.idiv.append(obs_idiv.reshape(-1))
+		self.dev.garbage_collect()
+	def prepare(self):
+		"""Process the added observations, determining our degrees of freedom etc.
+		Should be done before calling forward and backward."""
+		if self.ready: return
+		self.rhs = np.concatenate(self.rhs)  if len(self.rhs)  > 0 else np.zeros(0, self.dtype)
+		self.idiv= np.concatenate(self.idiv) if len(self.idiv) > 0 else np.zeros(0, self.dtype)
+		self.prior.prepare(self)
+		self.prior.b(self.rhs)
+		self.prior.iM(self.idiv)
+		self.dof = ArrayZipper(self.rhs.shape, dtype=self.dtype, comm=self.comm)
+		self.ready = True
+	def forward(self, id, tod, pickup):
+		if id not in self.data: return
+		d = self.data[id]
+		d.P.forward(tod, pickup[d.i1:d.i2].reshape((d.ndet,d.P.nx)))
+	def backward(self, id, tod, pickup):
+		if id not in self.data: return
+		d = self.data[id]
+		d.P.backward(tod, pickup[d.i1:d.i2].reshape((d.ndet,d.P.nx)))
+	def precon(self, pickup):
+		return pickup*self.idiv
+	def to_work  (self, x): return self.dev.np.array(x)
+	def from_work(self, x): return self.dev.get(x)
+	def owork(self): return self.dev.np.zeros(self.rhs.shape, self.rhs.dtype)
+	def write(self, prefix, m, tag=None, suffix="", force=False):
+		if tag is None: tag = "map" # e.g. cut_map as opposed to cut_ivar
+		if not force and tag not in self.outputs: return
+		# Will output a file per obs
+		for id, d in self.data.items():
+			if self.phase: pickup = np.moveaxis(m[d.i1:d.i2].reshape((d.ndet,2,d.P.nx//2)),1,0)
+			else:          pickup = m[d.i1:d.i2].reshape((d.ndet,d.P.nx))
+			wcs    = wcsutils.explicit(crval=[d.P.baz0/utils.degree,0], cdelt=[d.P.dbaz/utils.degree,1], crpix=[1,1])
+			pickup = enmap.enmap(pickup, wcs, copy=False)
+			oname  = self.ofmt.format(name=self.name, id=id.replace(":","_"))
+			oname = "%s%s_%s%s.%s" % (prefix, oname, tag, suffix, self.ext)
+			enmap.write_map(oname, pickup)
+		return None
+	def written(self, prefix):
+		# No way to check this given the per-id name format
+		return True
+	def write_misc(self, prefix):
+		if "rhs"  in self.outputs: self.write(prefix, self.rhs, tag="rhs")
+		if "ivar" in self.outputs: self.write(prefix, gutils.safe_inv(self.idiv), tag="ivar")
+		if "div"  in self.outputs: self.write(prefix, gutils.safe_inv(self.idiv), tag="ivar")
+		if "bin"  in self.outputs: self.write(prefix, self.precon(self.rhs), tag="bin")
+	valid_outputs = ["map","ivar","rhs","div","bin"]
+
 # Actually, doing this as an actual Signal might be cleanest.
 # Requries no changes to Mapmaker, make_map, etc.
 # Slightly hacky since it would have no degrees of freedom though.
@@ -1328,6 +1422,20 @@ class PriorSubSamp(Prior):
 	def A(self, ival, oval):
 		oval += self.penalty*ival
 
+class PriorDiv(Prior):
+	def __init__(self, strength=1e-3):
+		self.strength = strength
+		self.penalty  = None
+	def prepare(self, signal):
+		with utils.nowarn():
+			self.penalty = self.strength/signal.idiv
+			gutils.remove_nan(self.penalty)
+	def new(self): return PriorDiv(strength=self.strength)
+	def iM(self, iprec):
+		iprec += self.penalty
+	def A(self, ival, oval):
+		oval += self.penalty*ival
+
 def restore_winding(bore, ref):
 	el,  az,  roll  = bore
 	el0, az0, roll0 = ref
@@ -1389,56 +1497,50 @@ class TDumper:
 	def write(self, prefix, ctime, dettod):
 		np.savetxt(prefix + ".txt", np.concatenate([ctime[None], dettod],0).T, fmt="%20.12e")
 
+catch_map = {
+		"none":     (),
+		"load":     (errors.LoadError,),
+		"recover":  (errors.RecoverableError,),
+		"expected": (errors.ExpectedError,),
+		"all":      (Exception,),
+}
+
+def make_catch_list(ignore):
+	return sum([catch_map[tok] for tok in ignore.split(",")],())
+
 # Mapmaking function
-def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, signal_guess=None, restart=False):
+def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, signal_guess=None, restart=False):
 	if prefix is None: prefix = ""
 	# Skip if we're already done
 	if cont and (os.path.exists(prefix + ".empty") or all([signal.written(prefix) for signal in mapmaker.signals])):
 		L.print("Skipped %s: Already done" % prefix, level=2, color=colors.gray)
 		return None
-	# Groups is a list of obsinfo entries that should be mapped jointly
-	# (as a big super-tod with full noise correlations)
-	if joint is None: joint = trivial_joint(obsinfo)
-	# Inds is a list of indices into joint groups, giving which groups this mpi task
-	# should care about
-	if inds is None: inds = distribute_tasks(obsinfo, joint, comm)
+	# Inds is a list of indices into obsinfo that this task will handle
+	if inds is None: inds = distribute_tasks(loadinfo.obsinfo, comm)
 	# Set up exception types we will ignore
-	if   ignore == "all":     etypes, load_catch = (Exception,), "all"
-	elif ignore == "missing": etypes, load_catch = (utils.DataMissing,), "expected"
-	elif ignore == "recover": etypes, load_catch = (utils.DataMissing, gutils.RecoverableError), "all"
-	elif ignore == "none":    etypes, load_catch = (), "none"
-	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
+	catch = make_catch_list(ignore)
 	# Accept either a list of integers or a single integer
 	try: dump = list(dump)
 	except TypeError: dump = [dump]
 	dev = mapmaker.dev
-	# Check if we'll be demodulating
-	if len(inds) > 0:
-		ginfo = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		post  = post_settings(ginfo)
-	# Set up memory pools. Setting these up before-hand is
-	# actually more memory-efficient, as long as our estimate is
-	# good.
-	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo, dtype=mapmaker.dtype)
+	if prealloc:
+		loadinfo.prealloc()
+		setup_buffers(dev, loadinfo.obsinfo[inds], dtype=mapmaker.dtype)
 	tdumper = TDumper(mapmaker, prefix=prefix)
 	# Start map from scartch
 	mapmaker.reset()
 	# Add our observations
 	for i, ind in enumerate(inds):
-		name   = joint.names[ind]
-		subids = obsinfo.id[joint.groups[ind]]
 		t1     = time.time()
+		id     = loadinfo.obsinfo.id[ind]
 		try:
-			data  = loader.load_multi(subids, samprange=joint.sampranges[ind], catch=load_catch, dets=dets, detids=detids, post=post, dtype=mapmaker.dtype)
-			# I keep calculating this. It should be a standard member of data
-			# Should probably promote data to a full class
-			srate = (len(data.ctime)-1)/(data.ctime[-1]-data.ctime[0])
-		except etypes as e:
-			L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
+			data  = loadinfo.load(id, dets=dets, detids=detids)
+		except catch as e:
+			L.print("Skipped %d %s: %s" % (ind, id, str(e)), level=2, color=colors.red)
 			continue
 		if len(data.errors) > 0:
 			# Partial skip
-			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
+			L.print("Skipped parts %s" % errors.format_multi_exception(data.errors), level=2, color=colors.red)
 		# Do configurable autocuts that are indpendent of the loading method here.
 		# Might want to wrap it into some higher-level load function.
 		# Autocut and gapfill cost about the same as add_obs, so they definitely
@@ -1446,26 +1548,21 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 		t2    = time.time()
 		tdumper.register(i, ind, data.ctime)
 		tdumper.write_data(ind, data.tod, "load")
-		socal.autocut(data, dev=dev, id=name)
-		data.fill.gapfill(data.tod, dev=dev)
-		tdumper.write_data(ind, data.tod, "socut")
-		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal
-		socal.autocal(data, prefix=prefix + name.replace(":","_") + "_", dev=dev)
+		# Autocalibration. Controlled by config:elmod_cal and config:cmod_cal.
+		# Can't be moved into loader as is, because it needs prefix for the optional
+		# write. autocal is not in use anyway...
+		socal.autocal(data, prefix=prefix + id.replace(":","_") + "_", dev=dev)
 		tdumper.write_data(ind, data.tod, "socal")
-
-		#bunch.write(prefix + "tod_down40.hdf", bunch.Bunch(dets=data.detids, bore=gutils.downgrade(data.boresight,40), ctime=gutils.downgrade(data.ctime,40), tod=dev.get(gutils.downgrade(data.tod, 40))))
-		#1/0
-
 		t3    = time.time()
 		try:
-			mapmaker.add_obs(name, data, deslope=False, signal_guess=signal_guess)
-		except etypes as e:
-			L.print("Skipped %d %s: %s" % (ind, name, str(e)), level=2, color=colors.red)
+			mapmaker.add_obs(id, data, deslope=False, signal_guess=signal_guess)
+		except catch as e:
+			L.print("Skipped %d %s: %s" % (ind, id, str(e)), level=2, color=colors.red)
 			continue
 		dev.garbage_collect()
 		del data
 		t4    = time.time()
-		L.print("Processed %d %s in %6.3f. Read %6.3f Autocal %6.3f Add %6.3f" % (ind, name, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
+		L.print("Processed %d %s in %6.3f. Read %6.3f Autocal %6.3f Add %6.3f" % (ind, id, t4-t1, t2-t1, t3-t2, t4-t3), level=2)
 
 	nobs = comm.allreduce(len(mapmaker.datas))
 	if nobs == 0:
@@ -1505,7 +1602,7 @@ def make_map_core(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix
 # a new mapmaker. Easiest if I can create a new empty mapmaker based
 # on the old one.
 # Mapmaking function
-def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None, dump=[], npass=1, maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, restart=False):
+def make_map(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], npass=1, maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, restart=False):
 	"""Like make_map_core, but performs multipass mapmaking. Each pass produces its own set of files.
 	If npass > 1, then the the 1-based pass number appended to the prefix, e.g. pass1, pass2, etc.
 	This function has no overhead compared to make_map when only one pass is used. On subsequent
@@ -1525,16 +1622,15 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 		if cant_run or done:
 			L.print("Skipped %s: Already done" % prefix, level=2, color=colors.gray)
 			return
-	if joint is None: joint = trivial_joint(obsinfo)
 	# Set up task distribution here. Not really necessary, since make_map would do
 	# so anyway, but doing it here makes it more explicit that we rely on the distribution
 	# being the same between passes.
-	if inds is None: inds = distribute_tasks(obsinfo, joint, comm)
+	if inds is None: inds = distribute_tasks(loadinfo.obsinfo, comm)
 	# Ok, onto the actual mapmaking passes
 	prev_evaluator = None
 	for ipass in range(npass):
 		pass_prefix = make_prefix(prefix, ipass)
-		mapmaker    = make_map_core(mapmaker.new(), loader, obsinfo, comm, joint=joint, inds=inds, prefix=pass_prefix,
+		mapmaker    = make_map_core(mapmaker.new(), loadinfo, comm, inds=inds, prefix=pass_prefix,
 			dump=dump, maxiter=utils.iorlast(maxiter,ipass), maxerr=utils.iorlast(maxerr,ipass), prealloc=prealloc,
 			ignore=ignore, cont=False, dets=dets, detids=detids, signal_guess=prev_evaluator, restart=restart)
 		if not mapmaker: return None
@@ -1542,299 +1638,90 @@ def make_map(mapmaker, loader, obsinfo, comm, joint=None, inds=None, prefix=None
 			prev_evaluator = mapmaker.evaluator()
 	return mapmaker
 
-def make_maps_perobs(mapmaker, loader, obsinfo, comm, comm_per, joint=None, inds=None, prefix=None, dump=[], npass=1, maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, restart=False):
+def make_maps_perobs(mapmaker, loadinfo, comm, comm_per, inds=None, prefix=None, dump=[], npass=1, maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, restart=False):
 	"""Like make_map, but makes one map per subobs. NB! The communicators in the mapmaker
 	signals must be COMM_SELF for this to work."""
-	if joint is None:
-		joint = trivial_joint(obsinfo)
-	if inds is None:
-		inds = list(range(comm.rank, len(joint.groups), comm.size))
-	if prefix is None:
-		prefix = ""
+	obsinfo = loadinfo.obsinfo
+	if inds is None: inds = list(range(comm.rank, loadinfo.nobs, comm.size))
+	if prefix is None: prefix = ""
 	if prealloc:
-		ginfo = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		setup_buffers(mapmaker.dev, ginfo, dtype=mapmaker.dtype)
-
+		loadinfo.prealloc()
+		setup_buffers(mapmaker.dev, obsinfo[inds], dtype=mapmaker.dtype)
 	# Map indivdual tods
 	for ind in inds:
-		name    = joint.names[ind]
-		subpre  = prefix + name.replace(":","_") + "_"
-		L.print("Mapping %s" % name)
-		make_map(mapmaker, loader, obsinfo, comm_per, prefix=subpre, dump=dump, joint=joint, inds=[ind], npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids, restart=restart)
+		id = obsinfo.id[ind]
+		subpre  = prefix + id.replace(":","_") + "_"
+		L.print("Mapping %s" % id)
+		make_map(mapmaker, loadinfo, comm_per, prefix=subpre, dump=dump, inds=[ind], npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids, restart=restart)
 
 config.default("depth1_maxdur", 24, "Max duration in hours for depth-1 maps. Lower values use less memory to store maps. Longer than 24 hours would no longer be depth-1")
-def make_maps_depth1(mapmaker, loader, obsinfo, comm, comm_per, joint=None, prefix=None, dump=[], npass=1, maxiter=500, maxdur=None, maxerr=1e-7, fullinfo=None, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, restart=False):
+def make_maps_depth1(mapmaker, loadinfo, comm, comm_per, prefix=None, dump=[], npass=1, maxiter=500, maxdur=None, maxerr=1e-7, fullinfo=None, fullquery="obs", prealloc=True, ignore="recover", cont=False, dets=None, detids=None, restart=False):
 	# Find scanning periods. We want to base this on the full
 	# set of observations, so depth-1 maps cover consistent periods
 	# even if 
-	from pixell import bench
 	if prefix   is None: prefix = ""
-	if joint    is None: joint = trivial_joint(obsinfo)
-	# FIXME: might want obs,+bad here, to make the depth-1 periods independent
-	# of our cuts. But currently that causes a segfault in sqlite?
-	if fullinfo is None: fullinfo = loader.query("obs")
+	if fullinfo is None: fullinfo = loadinfo.loader.query(fullquery)
+	obsinfo = loadinfo.obsinfo
 	maxdur  = config.get("depth1_maxdur")*utils.hour
-	periods = gutils.find_scan_periods(fullinfo, maxdur=maxdur)
-	# Which period each group belongs to. So pinds is [ngroup]
-	gfirst  = np.array([g[0] for g in joint.groups])
-	gpids   = utils.find_range(periods, obsinfo.ctime[gfirst]+obsinfo.dur[gfirst]/2)
+	periods = gutils.find_scan_periods(fullinfo.obsinfo, maxdur=maxdur)
+	# Which period each obs belongs to. pid = period-id, with a unique integer
+	# for each period (or negative for no-match)
+	pids    = utils.find_range(periods, obsinfo.ctime+obsinfo.dur/2)
 	# Get rid of groups that don't belong to a period. This shouldn't happen
-	bad = gpids<0
+	bad = pids<0
 	if np.any(bad):
-		L.print("Warning: %d obs with no period! %s" % (np.sum(bad), ", ".join(obsinfo.id[gfirst[bad]])), color=colors.red, id=0)
-	# Indices of the groups we will map
+		L.print("Warning: %d obs with no period! %s" % (np.sum(bad), ", ".join(obsinfo.id[bad])), color=colors.red, id=0)
+	# inds = obs-indices
 	inds  = np.where(~bad)[0]
-	# Which period each of those groups belongs to
-	gpids = gpids[inds]
-	# Group the groups by period. group-group i will consist
-	# of groups inds[order[edges[i]:edges[i+1]]]
-	pids, order, edges = utils.find_equal_groups_fast(gpids)
-	my_pinds = list(range(comm.rank, len(pids), comm.size))
+	pids  = pids[inds]
+	# Group by period. pinds = period-indices. These are indices into pids
+	upids, order, edges = utils.find_equal_groups_fast(pids)
+	my_pinds = list(range(comm.rank, len(upids), comm.size))
+	# Group nr. pind = my_pinds[i] consists of obs inds=order[edges[pind]:edges[pind+1]]
 	if prealloc:
-		# All the obs-inds that I'm responsible for
-		my_inds = np.concatenate([inds[order[edges[pind]:edges[pind+1]]] for pind in my_pinds])
-		ginfo   = gutils.obs_group_info(obsinfo, joint.groups, inds=my_inds, sampranges=joint.sampranges)
-		setup_buffers(mapmaker.dev, ginfo, dtype=mapmaker.dtype)
-	# Now loop over and map each of our group-groups
+		loadinfo.prealloc()
+		setup_buffers(mapmaker.dev, obsinfo, dtype=mapmaker.dtype)
 	for pind in my_pinds:
-		pid     = pids[pind]
+		pid     = upids[pind]
 		my_inds = inds[order[edges[pind]:edges[pind+1]]]
 		# Name after period
 		name    = "%10.0f" % periods[pid][0]
 		subpre  = prefix + name + "_"
 		L.print("Mapping period %10.0f:%10.0f with %d obs" % (*periods[pid], len(my_inds)))
-		make_map(mapmaker, loader, obsinfo, comm_per, joint=joint, inds=my_inds, prefix=subpre, dump=dump, npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids, restart=restart)
-
-config.default("dump_tdown", 500, "TOD downsampling in dump-mode")
-config.default("dump_fdown", 250, "PS downsampling in dump-mode")
-config.default("dump_fdown_lowf", 10, "Low-freq PS downsampling in dump-mode")
-config.default("dump_fmax_lowf",   4, "Low-freq PS max freq")
-
-def dump_tod(loader, obsinfo, noise_model, comm, joint=None, inds=None, prefix=None,
-		tdown=None, fdown=None, fdown_lowf=None, fmax_lowf=4, prealloc=True, dev=None, ignore="recover", dets=None, detids=None):
-	if prefix is None: prefix = ""
-	tdown = config.get("dump_tdown", tdown)
-	fdown = config.get("dump_fdown", fdown)
-	fdown_lowf = config.get("dump_fdown_lowf", fdown_lowf)
-
-	# Groups is a list of obsinfo entries that should be mapped jointly
-	# (as a big super-tod with full noise correlations)
-	if joint is None: joint = trivial_joint(obsinfo)
-	# Inds is a list of indices into joint groups, giving which groups this mpi task
-	# should care about
-	if inds is None:
-		# Use the first entry in groups as representative
-		gfirst = np.array([g[0] for g in joint.groups])
-		dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
-		inds = np.where(dist.owner == comm.rank)[0]
-	# Set up exception types we will ignore
-	if   ignore == "all":     etypes = (Exception,)
-	elif ignore == "missing": etypes = (utils.DataMissing,)
-	elif ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
-	elif ignore == "none":    etypes = ()
-	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
-	if dev is None: dev = device.get_device()
-	# Set up memory pools. Setting these up before-hand is
-	# actually more memory-efficient, as long as our estimate is
-	# good.
-	if len(inds) > 0:
-		ginfo  = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		post   = post_settings(ginfo)
-	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo, dtype=mapmaker.dtype)
-	# Process our observations
-	for i, ind in enumerate(inds):
-		name   = joint.names[ind]
-		subids = obsinfo.id[joint.groups[ind]]
-		subpre = prefix + name.replace(":","_") + "_"
-		t1     = time.time()
-		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, post=post)
-		except etypes as e:
-			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
-			continue
-		if len(data.errors) > 0:
-			# Partial skip
-			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
-		t2    = time.time()
-
-		# Output tod. Want cut regions clearly marked in dumped tod, so clear
-		# them. But do it on a copy so any later ffts aren't messed up
-		otod = data.tod.copy()
-		data.cuts.clear(otod, dev=dev)
-		otod = dev.get(gutils.downgrade(otod, tdown))
-		dt   = (data.ctime[-1]-data.ctime[0])/(len(data.ctime)-1)
-		twcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[dt*tdown,1])
-		enmap.write_map(subpre + "tod.fits", enmap.enmap(otod, twcs))
-
-		bunch.write(subpre + "data_tdown.hdf", bunch.Bunch(tod=otod, bore=gutils.downgrade(data.boresight, tdown), ctime=gutils.downgrade(data.ctime, tdown), dets=data.detids))
-
-		## Output ps
-		#ft   = dev.lib.rfft(data.tod)
-		#nsamp= data.tod.shape[1]
-		#normexp = -1
-		#ft  *= nsamp**normexp
-
-		#ps   = dev.np.abs(ft)**2
-		#ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
-		#df   = 1/(dt*data.tod.shape[1])
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
-		#enmap.write_map(subpre + "ps.fits", enmap.enmap(ops, fwcs))
-
-		## Output high-res ps for low freq
-		#ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
-		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		#ops  = ops[:,:nbin]
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		#enmap.write_map(subpre + "ps_lowf.fits", enmap.enmap(ops, fwcs))
-		#del ps
-
-		## Output freq corrmat. Uses same resolution as coarse ps
-		#ndet, nfreq = ft.shape
-		#nbin = utils.floor(fmax_lowf/(df*fdown))
-		#bft  = ft[:,:nbin*fdown].reshape(ndet,nbin,fdown)
-		#cbft = dev.np.conj(bft)
-		#fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
-		#v    = dev.np.einsum("ddb->db", fcov)**-0.5
-		#fcorr= fcov*v[:,None,:]*v[None,:,:]
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
-		#enmap.write_map(subpre + "corr_lowf.fits", enmap.enmap(dev.get(fcorr), fwcs))
-		#del bft, cbft
-
-		## Same, but high resolution, for a subset of detectors
-		#ndet, nfreq = ft.shape
-		#thin = 100
-		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		#bft  = ft[:,:nbin*fdown_lowf].reshape(ndet,nbin,fdown_lowf)
-		#cbft = dev.np.conj(bft[::thin])
-		#fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
-		#v    = dev.np.sum(dev.np.abs(bft)**2,-1)**-0.5
-		#fcorr= fcov*v[::thin,None,:]*v[None,:,:]
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		#enmap.write_map(subpre + "corr_lowf2.fits", enmap.enmap(dev.get(fcorr), fwcs))
-		#del bft, cbft
-
-		## Build the noise model
-		#ft2  = ft.copy()
-		#iN   = noise_model.build_fourier(ft2, srate=1/dt, nsamp=data.tod.shape[1])
-		## Apply it. Unhealthy modes should stand out here
-		#iN.apply(ft2, nofft=True)
-
-		#ps   = dev.np.abs(ft2)**2
-		#ops  = dev.get(gutils.downgrade(ps, fdown)/data.tod.shape[1])
-		#df   = 1/(dt*data.tod.shape[1])
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown,1])
-		#enmap.write_map(subpre + "iNps.fits", enmap.enmap(ops, fwcs))
-
-		## Output high-res ps for low freq
-		#ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
-		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		#ops  = ops[:,:nbin]
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		#enmap.write_map(subpre + "iNps_lowf.fits", enmap.enmap(ops, fwcs))
-		#del ps
-
-		#d2   = dev.np.arange(ndet)
-		#d1   = d2[::thin]
-		#finds= dev.np.arange(nbin*fdown_lowf)
-		#fcov = iN.eval_cov(d1=d1, d2=d2, finds=finds)
-		## Same averaging as we do with the data
-		#fcov = dev.np.sum(fcov.reshape(fcov.shape[:2]+(nbin,fdown_lowf)),-1)
-		## Need the diagonal for normalization
-		#v    = iN.eval_var(d=d2, finds=finds)
-		#v    = dev.np.sum(v.reshape(v.shape[:1]+(nbin,fdown_lowf)),-1)**-0.5
-		#fcorr= fcov*v[::thin,None,:]*v[None,:,:]
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		#enmap.write_map(subpre + "corrmodel_lowf2.fits", enmap.enmap(fcorr, fwcs))
-
-		## Choose a single nmat bin and see what happens there.
-		## Let's try a bin that's wider than the number of detectors to be safe
-		#bi = np.where(iN.bins[:,1]-iN.bins[:,0] > ndet//8)[0][0]
-		#b1, b2 = iN.bins[bi]
-		#debug = bunch.Bunch(bi=bi, bin=iN.bins[bi], freqs=iN.bins[bi]*df,
-		#	V=iN.V[bi], iD=iN.iD[bi], iE=iN.iE[bi], dpre=ft2[:,b1:b2].copy())
-
-		## Try to manually project out the dark modes
-		#dark  = np.array(["DARK" in band for band in data.bands])
-		#light = ~dark
-		#iiN11 = iN.det_slice(light).inv()
-		#d2    = ft2.copy(); d2[light] = 0
-		#ft2[light] += iiN11.apply(iN.apply(d2, nofft=True)[light], nofft=True)
-
-		#debug.dark  = dark
-		#debug.dpost = ft2[:,b1:b2]
-		#bunch.write(subpre + "debug.hdf", debug)
-
-		## Output high-res ps for low freq
-		#ps   = dev.np.abs(ft)**2
-		#ops  = dev.get(gutils.downgrade(ps, fdown_lowf)/data.tod.shape[1])
-		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		#ops  = ops[:,:nbin]
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		#enmap.write_map(subpre + "ps_deproj.fits", enmap.enmap(ops, fwcs))
-		#del ps
-
-		#nbin = utils.floor(fmax_lowf/(df*fdown_lowf))
-		#bft  = ft[:,:nbin*fdown_lowf].reshape(ndet,nbin,fdown_lowf)
-		#cbft = dev.np.conj(bft[::thin])
-		#fcov = dev.np.einsum("dbf,ebf->deb",cbft,bft).real
-		#v    = dev.np.sum(dev.np.abs(bft)**2,-1)**-0.5
-		#fcorr= fcov*v[::thin,None,:]*v[None,:,:]
-		#fwcs = wcsutils.explicit(crval=[0,0], crpix=[1,1], cdelt=[df*fdown_lowf,1])
-		#enmap.write_map(subpre + "corr_deproj.fits", enmap.enmap(fcorr, fwcs))
-
-		dev.garbage_collect()
-		del data
-		t3    = time.time()
-		L.print("Processed %s in %6.3f. Read %6.3f Add %6.3f" % (name, t3-t1, t2-t1, t3-t2), level=2)
+		make_map(mapmaker, loadinfo, comm_per, inds=my_inds, prefix=subpre, dump=dump, npass=npass, maxiter=maxiter, maxerr=maxerr, prealloc=False, ignore=ignore, cont=cont, dets=dets, detids=detids, restart=restart)
 
 config.default("fplane_srate",  10.0, "Sample-rate of focal plane movies")
 config.default("fplane_detrad", 1.2,  "Radius of disk drawn for each detector, in arcmin")
 config.default("fplane_filter", "hpass", "Comma-sep list of filters to apply to focal plane movies")
-def fplane_movie(shape, wcs, loader, obsinfo, comm, joint=None, inds=None, prefix=None,
+def fplane_movie(shape, wcs, loadinfo, comm, inds=None, prefix=None,
 		prealloc=True, dev=None, ignore="recover", dets=None, detids=None, srate=None, detrad=None,
 		filters=None, autocrop=False):
 	srate  = config.get("fplane_srate",  srate)
 	detrad = config.get("fplane_detrad", detrad)*utils.arcmin
 	filters= config.get("fplane_filter", filters).split(",")
 	if prefix is None: prefix = ""
-	# Groups is a list of obsinfo entries that should be mapped jointly
-	# (as a big super-tod with full noise correlations)
-	if joint is None: joint = trivial_joint(obsinfo)
-	# Inds is a list of indices into joint groups, giving which groups this mpi task
-	# should care about
-	if inds is None:
-		# Use the first entry in groups as representative
-		gfirst = np.array([g[0] for g in joint.groups])
-		dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
-		inds = np.where(dist.owner == comm.rank)[0]
+	if inds is None: inds = np.arange(comm.rank, loadinfo.nobs, comm.size)
 	# Set up exception types we will ignore
-	if   ignore == "all":     etypes = (Exception,)
-	elif ignore == "missing": etypes = (utils.DataMissing,)
-	elif ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
-	elif ignore == "none":    etypes = ()
-	else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
+	catch = make_catch_list(ignore)
 	if dev is None: dev = device.get_device()
+	obsinfo = loadinfo.obsinfo
 	# Set up memory pools. Setting these up before-hand is
 	# actually more memory-efficient, as long as our estimate is
 	# good.
-	if len(inds) > 0:
-		ginfo  = gutils.obs_group_info(obsinfo, joint.groups, inds=inds, sampranges=joint.sampranges)
-		post   = post_settings(ginfo)
-	if prealloc and len(inds) > 0: setup_buffers(dev, ginfo, dtype=mapmaker.dtype)
+	if prealloc and len(inds) > 0: setup_buffers(dev, obsinfo[inds], dtype=loadinfo.loader.dtype)
 	# Process our observations
 	for i, ind in enumerate(inds):
-		name   = joint.names[ind]
-		subids = obsinfo.id[joint.groups[ind]]
-		subpre = prefix + name.replace(":","_") + "_"
+		id     = obsinfo.id[ind]
+		subpre = prefix + id.replace(":","_") + "_"
 		t1     = dev.time()
 		try:
-			data = loader.load_multi(subids, samprange=joint.sampranges[ind], dets=dets, detids=detids, post=post)
-		except etypes as e:
-			L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
+			data = loadinfo.load(id, dets=dets, detids=detids)
+		except catch as e:
+			L.print("Skipped %s: %s" % (id, str(e)), level=2, color=colors.red)
 			continue
 		if len(data.errors) > 0:
 			# Partial skip
-			L.print("Skipped parts %s" % str(data.errors[-1]), level=2, color=colors.red)
+			L.print("Skipped parts %s" % errors.format_multi_exception(data.errors), level=2, color=colors.red)
 		t2 = dev.time()
 		# We usually want to downsample quite a lot to avoid the movies being uselessly slow
 		# TODO: Should move this into gutils or something
@@ -1871,7 +1758,6 @@ def fplane_movie(shape, wcs, loader, obsinfo, comm, joint=None, inds=None, prefi
 		for bi, b1 in enumerate(np.arange(0, onsamp, bsize)):
 			t5 = dev.time()
 			b2 = min(b1+bsize, onsamp)
-			print(bi, b1, b2)
 			blockpre = subpre + "%03d_" % bi
 			# Build the video from the downsampled tod
 			with dev.pools["ft"].as_allocator():
@@ -1890,206 +1776,37 @@ def fplane_movie(shape, wcs, loader, obsinfo, comm, joint=None, inds=None, prefi
 		del data
 		tread = t2-t1
 		tdown = t3-t2
-		L.print("Processed %s in %6.3f. Read %6.3f down %6.3f proj %6.3f write %6.3f" % (name, t7-t1, tread, tdown, tproj, twrite), level=2)
-
-class SimpleLoader:
-	def __init__(self, fname_fun=None, empty_fun=None):
-		# Must import before ArgumentParser is initialized to import args from config
-		import numpy as np, os, time, sys
-		from pixell import config, utils, mpi, colors, bench
-		from . import logging, mapmaking, loading, device, gutils
-		# Have to do all imports that could contain configuration before
-		# building config.ArgumentParser because these may define variables.
-		# This means we can't bail out early when called with wrong arguments;
-		# we have to wait for potentially slow imports first. Oh well.
-		parser = config.ArgumentParser("sogma")
-		parser.add_argument(      "--odir",    type=str, default=".")
-		parser.add_argument("-C", "--context", type=str, default="lat", help="Either a config.yaml, context.yaml or a telescope name, like lat, satp1, etc.. The most general is config.yaml, which works with both the sofast and soslow loaders. Using just a context only works with sofast, and must be a context that includes the preprocess database. Telescope names expand to the default preprocess context using $SOPATH, which should point to the SO top-level directory (the one that contains the metadata directory).")
-		parser.add_argument("-Q", "--query",   type=str, default=None)
-		parser.add_argument("-p", "--prefix",  type=str, default=None)
-		parser.add_argument("-v", "--verbose", action="count", default=1)
-		parser.add_argument("-q", "--quiet",   action="count", default=0)
-		parser.add_argument("-L", "--loader",  type=str, default="auto")
-		parser.add_argument("-D", "--device",  type=str, default="auto")
-		parser.add_argument(      "--ignore",  type=str, default="recover")
-		parser.add_argument("-j", "--joint",   type=str, default="oband", help="full, obs, oband, wafer, wband or none")
-		parser.add_argument("-s", "--split",   type=float, default=0.75, help="Split obs-groups in time to keep them smaller than this many giga-samples. Larger groups use more memory. Small groups have more edge effects and may be slower to read in.")
-		parser.add_argument(      "--tsplit",  type=float, default=None, help="Split obs-groups in time to keep them shorter than this many seconds. See also --split")
-		parser.add_argument(      "--sel",     type=str, default=":")
-		parser.add_argument(      "--dets",    type=str, default=None, help="Path to file with white-list of channel ids, e.g. sch_ufm_mv21_1755145838_3_338. See --detids if you want to use detector ids instead")
-		parser.add_argument(      "--detids",  type=str, default=None, help="Path to file with white-list of detector ids, e.g. Mv21_f090_Ar00c02A. One per line. See --dets if you want to use channel ids instead")
-		parser.add_argument("-c", "--cont",    action="store_true")
-		self.parser = parser
-		self.comm   = mpi.COMM_WORLD
-		self.fname_fun = fname_fun
-		self.empty_fun = empty_fun
-	def add_argument(self, *args, **kwargs):
-		self.parser.add_argument(*args, **kwargs)
-	def init(self):
-		import numpy as np, os, time, sys
-		from pixell import utils, mpi, colors, bench
-		from . import logging, mapmaking, loading, device, gutils
-		args = self.parser.parse_args()
-		mpi.install_abort_hook()
-		dev  = device.get_device(args.device)
-		# Set up our logging
-		verbosity  = args.verbose-args.quiet
-		L = logging.Logger(dev, id=self.comm.rank, level=verbosity, fmt="{id:3d} {t:8.3f} {mem:5.2f} {dmem_pools:5.2f} {dmem_rest:5.2f} {dmem_unknown:5.2f} {msg:s}").setdefault()
-		bench.set_verbose(verbosity >= 4)
-		L.print("Init", level=0, id=0, color=colors.lgreen)
-		# Benchmarking
-		bench.set_tfun(dev.time)
-		# Set up our data loader
-		loader  = loading.Loader(args.context, type=args.loader, dev=dev)
-		obsinfo = loader.query(args.query)
-		if len(obsinfo) == 0:
-			L.print("No tods selected", level=0, id=0, color=colors.red)
-			raise utils.DataMissing("No data selected")
-		# Optional detector restriction
-		dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
-		detids = gutils.read_detnames(args.detids) if args.detids is not None else None
-		# joint gives subobs to map jointly. It has entries
-		# .names[ngroup]     Name of each group
-		# .groups[ngroup][:] Indices into obsinfo for ach group member
-		# .bands[nband]      List of bands involved
-		# .joint     False if joint mapmaking isn't actually enabled. Groups will just be one subobs each
-		joint   = loader.group_obs(obsinfo, mode=args.joint)
-		ginfo   = gutils.obs_group_info(obsinfo, joint.groups, sampranges=joint.sampranges)
-		post    = mapmaking.post_settings(ginfo)
-		joint   = gutils.time_split(joint, ginfo, post=post, maxsize=args.split*1e9, maxdur=args.tsplit)
-		#joint   = gutils.time_split(obsinfo, joint, maxsize=args.split*1e9, maxdur=args.tsplit)
-		# group selection. Sadly this can't be done with the query-level selection, as that
-		# happens before grouping.
-		jinds   = eval("list(range(%d))[%s]" % (len(joint.groups), args.sel))
-		joint   = gutils.select_groups(joint, jinds)
-		ngroup  = len(joint.groups)
-		L.print("Processing %d tods with %d mpi tasks" % (ngroup, self.comm.size), level=0, id=0, color=colors.lgreen)
-		prefix = args.odir + "/"
-		if args.prefix: prefix += args.prefix + "_"
-		utils.mkdir(args.odir)
-		# Write out our arguments
-		if self.comm.rank == 0:
-			with open(prefix + "args.txt", "w") as ofile:
-				ofile.write(" ".join(sys.argv) + "\n")
-		# Useful to have in log-files too
-		L.print(" ".join(sys.argv), level=0, id=0, color=colors.lgreen)
-		# Set up exception types we will ignore
-		if   args.ignore == "all":     etypes = (Exception,)
-		elif args.ignore == "missing": etypes = (utils.DataMissing,)
-		elif args.ignore == "recover": etypes = (utils.DataMissing, gutils.RecoverableError)
-		elif args.ignore == "none":    etypes = ()
-		else: raise ValueError("Unrecognized error ignore setting '%s'" % str(ignore))
-		if dev is None: dev = device.get_device()
-		# Register interface
-		locs = locals()
-		for name in ["args", "dev", "loader", "L", "verbosity", "obsinfo", "joint", "post", "ginfo", "etypes", "dets", "detids", "prefix"]:
-			setattr(self, name, locs[name])
-	def get_obs(self, ind):
-		name   = self.joint.names[ind]
-		subids = self.obsinfo.id[self.joint.groups[ind]]
-		return self.loader.load_multi(subids, samprange=self.joint.sampranges[ind], dets=self.dets, detids=self.detids, post=self.demod)
-	def obs_iter(self, inds=None, fname_fun=None, empty_fun=None):
-		from . import tiling
-		if fname_fun is None: fname_fun = self.fname_fun
-		if empty_fun is None: empty_fun = self.empty_fun
-		if empty_fun is None: empty_fun = lambda self,name: fname_fun(self,name).replace(".txt", ".empty")
-		if inds is None:
-			# Use the first entry in groups as representative
-			gfirst = np.array([g[0] for g in self.joint.groups])
-			dist = tiling.distribute_tods_simple(self.obsinfo[gfirst], self.comm.size)
-			inds = np.where(dist.owner == self.comm.rank)[0]
-		for ind in inds:
-			name   = self.joint.names[ind]
-			subpre = self.prefix + name.replace(":","_") + "_"
-			if self.args.cont and fname_fun and (os.path.isfile(fname_fun(self, name)) or os.path.isfile(empty_fun(self, name))):
-				L.print("Skipped %s: done" % (name), level=2, color=colors.gray)
-				continue
-			try:
-				obs = self.get_obs(ind)
-				yield bunch.Bunch(obs=obs, ind=ind, name=name, subpre=subpre)
-				del obs
-			except self.etypes as e:
-				if empty_fun: utils.touch(empty_fun(self, name))
-				L.print("Skipped %s: %s" % (name, str(e)), level=2, color=colors.red)
+		L.print("Processed %s in %6.3f. Read %6.3f down %6.3f proj %6.3f write %6.3f" % (id, t7-t1, tread, tdown, tproj, twrite), level=2)
 
 config.default("taskdist", "ra", "Method used to assign tods to mpi tasks")
-def distribute_tasks(obsinfo, joint, comm, taskdist=None):
+def distribute_tasks(obsinfo, comm, taskdist=None):
 	# FIXME: This doesn't know about the coordinate system we're using!
 	# It assumes equatorial coordinates.
 	taskdist = config.get("taskdist", taskdist)
-	gfirst   = np.array([g[0] for g in joint.groups])
-	weight   = tiling.get_weight_detsamps(obsinfo, joint=joint)
+	weight   = obsinfo.ndet.astype(int)*obsinfo.nsamp
 	if taskdist == "simple":
-		dist = tiling.distribute_tods_simple(obsinfo[gfirst], comm.size)
+		dist = tiling.distribute_tods_simple(obsinfo, comm.size)
 	elif taskdist == "ra0":
-		dist = tiling.distribute_tods_ra_plain(obsinfo[gfirst], comm.size)
+		dist = tiling.distribute_tods_ra_plain(obsinfo, comm.size)
 	elif taskdist == "ra":
-		dist = tiling.distribute_tods_ra(obsinfo[gfirst], comm.size, weight)
+		dist = tiling.distribute_tods_ra(obsinfo, comm.size, weight)
 	elif taskdist == "semibrute":
-		dist = tiling.distribute_tods_semibrute(obsinfo[gfirst], comm.size, weight)
+		dist = tiling.distribute_tods_semibrute(obsinfo, comm.size, weight)
 	else:
 		raise ValueError("Unrecognized task distribution method '%s'" % str(taskdist))
 	inds = np.where(dist.owner == comm.rank)[0]
 	return inds
 
-def setup_buffers(dev, ginfo, post=None, dtype=np.float32, nopoint=False):
-	# Need to know if we're demodulating, since if affects buffer sizes
-	post = post_settings(ginfo, post)
-	ctype = utils.complex_dtype(dtype)
-	# ndown is the post-demodulation sample count
-	if post.demod:
-		dmul   = len(post.comps)
-		ndown  = utils.ceil(ginfo.nsamp*np.abs(ginfo.fhwp)/ginfo.fsamp)
-	else:
-		dmul  = 1
-		ndown = ginfo.nsamp
-	if post.down:
-		ndown = utils.ceil(ndown/post.down)
-	ndet   = ginfo.ndet*dmul
-	nf     = ginfo.nsamp//2+1
-	nfdown = ndown//2+1
-	ndet_ndown = np.max(ndet*ndown)
-	nsub_nsamp = np.max(ginfo.nsub*ginfo.nsamp)
-	nsub_ndown = np.max(ginfo.nsub*ndown)
-	ndet_nfdown= np.max(ndet*nfdown)
-	nsub_nf    = np.max(ginfo.nsub*nf)
-	# Pools for main analysis. These are not used for scratch during loading,
-	# except for the final load_multi
-	dev.pools["tod"].empty(ndet_ndown,  dtype=dtype)
-	if not nopoint: dev.pools["pointing"].empty((3, ndet_ndown), dtype=dtype)
-	# Pools used when reading in data
-	dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
-	if post.demod:
-		#dev.pools["itod"].empty(nsub_nsamp,      dtype=dtype)
-		dev.pools["wtod"].empty(nsub_nsamp,      dtype=dtype)
-		dev.pools["dtod"].empty(nsub_ndown*dmul, dtype=dtype)
-	else:
-		# HACK: overlay the itod on pointing. This will work fine as long
-		# as they aren't used at the same time, which is currently the case,
-		# and as long as swap isn't used with them
-		#dev.pools.pools["itod"] = dev.pools.pools["pointing"].proxy("itod")
-		pass
-	# Pools for fourier transforms. ft will be used both for the full-res per-subid data
-	# and the potentiallyd emodulated full data
-	dev.pools["ft"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
-	dev.pools["fft_scratch"].empty(max(ndet_nfdown,nsub_nf), dtype=ctype)
-
-def trivial_joint(obsids):
-	"""Make a group-info corresponding to a no grouping"""
-	groups=[[i] for i in range(len(obsids))]
-	return bunch.Bunch(groups=groups, names=obsids.id, sampranges=[None for i in range(len(obsids))])
-
-config.default("demod", "auto", "Whether to demodulate. yes, no or auto. yes always tries to demodulate, causing the load to fail if it can't. no never demodulates. auto demodulates if the hwp is present, and otherwise does nothing")
-config.default("comps", "TQU", "Which components to construct when demodulating. Can be TQU or QU")
-config.default("down", 0.0, "Downsampling factor. Set to 0 to disable downsampling")
-
-def post_settings(ginfo, demod=None, comps=None, down=None):
-	fhwp  = np.mean(np.abs(ginfo.fhwp))
-	return bunch.Bunch(
-		demod = gutils.check_demod(config.get("demod", demod), has_hwp=fhwp>0),
-		comps = config.get("comps", comps),
-		down  = config.get("down", down) or None,
-	)
+# This should be moved into mapmaker.prealloc and signal.prealloc at some point,
+# similarly to how the loaders do it
+def setup_buffers(dev, obsinfo, dtype=np.float32, nopoint=False):
+	# +2 to also fit fft version
+	nflat = np.max(obsinfo.ndet*(obsinfo.nsamp+2))
+	dev.pools["tod"]        .empty(nflat,     dtype=dtype)
+	dev.pools["ft"]         .empty(nflat,     dtype=dtype)
+	dev.pools["fft_scratch"].empty(nflat,     dtype=dtype)
+	if not nopoint:
+		dev.pools["pointing"] .empty((3,nflat), dtype=dtype)
 
 # Zippers
 # These package our degrees of freedomf or the CG solver

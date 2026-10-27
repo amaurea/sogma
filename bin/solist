@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import sys, contextlib, yaml, datetime, re
 from pixell import config, sqlite
-from sogma.loaders import socommon
+from sogma.loaders import socommon, soquery
 from sogma import soeph
 parser = config.ArgumentParser("sogma")
 parser.add_argument("query")
@@ -42,10 +42,10 @@ else:             idcol, idname = "subobs_id", "subid"
 
 with sqlite.open(obsdb_path) as db:
 	with sqlite.open(predb_path) if predb_path else contextlib.nullcontext() as pdb:
-		res_db, pycode, slices = socommon.eval_query(db, args.query, predb=pdb, subobs=not args.fullobs)
+		res_db, pycode, slices = soquery.eval_query(db, args.query, predb=pdb, subobs=not args.fullobs)
 		# Add tags column
-		res_db = socommon.add_tags_column(res_db)
-		info = socommon.finish_query(res_db, pycode, slices, sweeps=True, output="resultset")
+		res_db = soquery.add_tags_column(res_db)
+		info = soquery.finish_query(res_db, pycode, slices, sweeps=True, output="resultset")
 		if len(info) == 0:
 			if not args.quiet: print("0 matches")
 		else:

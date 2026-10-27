@@ -1426,13 +1426,13 @@ def _smart_array_cast(values, dtype=None, field_detail=None):
 
 class ObsFileDb:
     """Stub with the small subset of ObsFileDb functionality we use in sogma"""
-    def __init__(self, map_file):
+    def __init__(self, map_file, prefix=None):
         if isinstance(map_file, sqlite3.Connection):
             self.conn = map_file
         else:
             self.conn = sqlite3.connect(map_file)
         self.conn.row_factory = sqlite3.Row  # access columns by name
-        self.prefix = os.path.split(os.path.abspath(map_file))[0] + '/'
+        self.prefix = prefix or os.path.split(os.path.abspath(map_file))[0] + '/'
     # Retrieval
     def get_detsets(self, obs_id):
         """Returns a list of all detsets represented in the observation

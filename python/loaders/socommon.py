@@ -173,13 +173,7 @@ def context_lookup(context, name):
 	except KeyError: return None
 
 def get_prepdb(context):
-	"""I used to have preprocess under context.metadata,
-	but sotodlib expects to be able to load that using the
-	standard metadata system, which doesn't work. So put it
-	at the top with the obsdb and obsfiledb. This function
-	makes the migration smoother"""
-	try: return context["prepdb"]
-	except KeyError: return cmeta_lookup(context, "preprocess")
+	return cmeta_lookup(context, "preprocess")
 
 def read_yaml(fname):
 	with open(fname, "r") as ifile:

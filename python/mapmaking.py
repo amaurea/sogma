@@ -1512,7 +1512,7 @@ def make_catch_list(ignore):
 def make_map_core(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], maxiter=500, maxerr=1e-7, prealloc=True, ignore="recover", cont=False, dets=None, detids=None, signal_guess=None, restart=False):
 	if prefix is None: prefix = ""
 	# Skip if we're already done
-	if cont and (os.path.exists(prefix + ".empty") or all([signal.written(prefix) for signal in mapmaker.signals])):
+	if cont and (os.path.exists(prefix + ".empty") or os.path.exists(prefix + ".done") or all([signal.written(prefix) for signal in mapmaker.signals])):
 		L.print("Skipped %s: Already done" % prefix, level=2, color=colors.gray)
 		return None
 	# Inds is a list of indices into obsinfo that this task will handle
@@ -1619,6 +1619,9 @@ def make_map(mapmaker, loadinfo, comm, inds=None, prefix=None, dump=[], npass=1,
 		final_prefix = make_prefix(prefix,npass-1)
 		cant_run     = os.path.exists(first_prefix + ".empty")
 		done         = all([signal.written(final_prefix) for signal in mapmaker.signals])
+		# .empty and .done play much the same role, but have different meanings.
+		# .empty means it failed, while .done means it ran, but for some reason the files weren't kept
+		done         = done or os.path.exists(first_prefix + ".done")
 		if cant_run or done:
 			L.print("Skipped %s: Already done" % prefix, level=2, color=colors.gray)
 			return
@@ -1801,7 +1804,7 @@ def distribute_tasks(obsinfo, comm, taskdist=None):
 # similarly to how the loaders do it
 def setup_buffers(dev, obsinfo, dtype=np.float32, nopoint=False):
 	# +2 to also fit fft version
-	nflat = np.max(obsinfo.ndet*(obsinfo.nsamp+2))
+	nflat = np.max(obsinfo.ndet*(obsinfo.nsamp+2), initial=0)
 	dev.pools["tod"]        .empty(nflat,     dtype=dtype)
 	dev.pools["ft"]         .empty(nflat,     dtype=dtype)
 	dev.pools["fft_scratch"].empty(nflat,     dtype=dtype)

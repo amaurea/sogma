@@ -63,6 +63,18 @@ class Simplecut:
 	def merge(cuts):
 		# Currently implemented via Sampcut
 		return Sampcut.merge([cut.to_sampcut() for cut in cuts]).simplify().to_simple()
+	@staticmethod
+	def from_mask(mask):
+		"""Construct from binary mask. Inefficient"""
+		ndet, nsamp = mask.shape
+		edge  = np.zeros_like(mask[:,:1])
+		mask  = np.concatenate([edge,mask,edge],1)
+		diffs = np.diff(mask,axis=1)
+		dets, edges = np.where(diffs)
+		dets   = dets[0::2]
+		starts = edges[0::2]
+		lens   = edges[1::2]-starts
+		return Simplecut(dets, starts, lens, nsamp=nsamp, ndet=ndet)
 	def simplify(self): return self.to_sampcut().simplify().to_simple()
 	def pad(self, n): return self.to_sampcut().pad(n).to_simple()
 	@staticmethod

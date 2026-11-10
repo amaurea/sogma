@@ -7,7 +7,7 @@ parser = config.ArgumentParser("sogma")
 parser.add_argument("query")
 parser.add_argument("-C", "--context", type=str, default="lat")
 parser.add_argument("-q", "--quiet",   action="store_true")
-parser.add_argument("-p", "--nopre",   action="store_true")
+parser.add_argument("-p", "--noprep",  action="store_true")
 parser.add_argument("-f", "--fullobs", action="store_true")
 parser.add_argument("-T", "--all-tags",action="store_true")
 args = parser.parse_args()
@@ -33,7 +33,7 @@ def get_tags(tagstr, filter=True):
 # Get our obsdb
 context = socommon.get_expanded_context(args.context)
 obsdb_path = context["obsdb"]
-predb_path = socommon.cmeta_lookup(context, "preprocess") if not args.nopre else None
+prepdb_path = socommon.cmeta_lookup(context, "preprocess") if not args.noprep else None
 # Register ephemerides for any object queries
 soeph.setup()
 
@@ -41,8 +41,8 @@ if args.fullobs:  idcol, idname = "obs_id",    "obsid"
 else:             idcol, idname = "subobs_id", "subid"
 
 with sqlite.open(obsdb_path) as db:
-	with sqlite.open(predb_path) if predb_path else contextlib.nullcontext() as pdb:
-		res_db, pycode, slices = soquery.eval_query(db, args.query, predb=pdb, subobs=not args.fullobs)
+	with sqlite.open(prepdb_path) if prepdb_path else contextlib.nullcontext() as pdb:
+		res_db, pycode, slices = soquery.eval_query(db, args.query, prepdb=pdb, subobs=not args.fullobs)
 		# Add tags column
 		res_db = soquery.add_tags_column(res_db)
 		info = soquery.finish_query(res_db, pycode, slices, sweeps=True, output="resultset")

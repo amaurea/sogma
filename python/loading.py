@@ -76,15 +76,16 @@ class LoadHelper:
 		L.print("Init", level=0, id=0, color=colors.lgreen)
 		# Benchmarking
 		bench.set_tfun(dev.time)
-		# Optional detector restriction
-		dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
-		detids = gutils.read_detnames(args.detids) if args.detids is not None else None
-		# Ephemerides
-		soeph.setup()
 		# Set up our data loader
 		split  = args.split*1e9 if args.split else None
 		fast_fail = args.ignore == "none"
 		loader = loading.get_loader(args.context, type=args.loader, split=split, tsplit=args.tsplit, dev=dev, fast_fail=fast_fail, group=args.joint)
+		# Ephemerides
+		soeph.setup()
+		# Optional detector restriction
+		dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
+		detids = gutils.read_detnames(args.detids) if args.detids is not None else None
+		# Actually read the data
 		linfo  = loader.query(args.query, dets=dets, detids=detids)
 		linfo  = linfo[gutils.parse_slice(args.sel)]
 		if linfo.nobs == 0:

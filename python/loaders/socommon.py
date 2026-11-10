@@ -135,7 +135,14 @@ def expand_context(context, tags=None):
 	tags = expand_tags(tags)
 	return _expand_context_helper(context, tags)
 
-def expand_tags(tags):
+def expand_tags(tags, maxiter=256):
+	for it in range(maxiter):
+		otags = _expand_tags_helper(tags)
+		if otags == tags: break
+		tags = otags
+	return tags
+
+def _expand_tags_helper(tags):
 	otags = tags.copy()
 	for key in otags:
 		otags[key] = otags[key].format(**tags)
@@ -156,18 +163,31 @@ def find_label(cmeta, name, whole=False):
 		for key in ["label", "name"]: # both not standardized?
 			if key in entry and entry[key] == name:
 				return entry["db"] if not whole else entry
+
 def cmeta_lookup(context, name):
 	val = find_label(context["metadata"], name)
 	return val.format(**context["tags"]) if val else None
+
+def context_lookup(context, name):
+	try: return context[name]
+	except KeyError: return None
+
+def get_prepdb(context):
+	return cmeta_lookup(context, "preprocess")
+
 def read_yaml(fname):
 	with open(fname, "r") as ifile:
 		return yaml.safe_load(ifile)
 
-def get_expanded_context(context_or_config_or_name):
+def get_siteconfig(path=None):
+	if path is None: path = find_site()
+	siteconfig = read_yaml(path)
+	return siteconfig
+
+def get_expanded_context(context_or_config_or_name, siteconfig=None):
 	"""Given either a config, a context or a telescope name, returns
 	the info sofast actually needs, which is a context object with
 	a preprocess archive entry, and {} tags expanded"""
-	# Get tags from site
 	try: tags = read_yaml(find_site())["tags"]
 	except FileNotFoundError: tags = {}
 	if re.match(r"^\w+$", context_or_config_or_name):
@@ -175,28 +195,20 @@ def get_expanded_context(context_or_config_or_name):
 		cpath = find_context(context_or_config_or_name)
 	else:
 		cpath = context_or_config_or_name
+	if siteconfig is None or isinstance(siteconfig, str):
+		siteconfig = get_siteconfig(path=siteconfig)
 	# Read the yaml file
 	context = read_yaml(cpath)
-	# Is it a config file? If so, it will have a context_file entry
-	if "context_file" in context:
-		cpath = os.path.join(os.path.dirname(cpath), context["context_file"])
-		ppath = os.path.join(os.path.dirname(cpath), context["archive"]["index"])
-		context = read_yaml(cpath)
-	else: ppath = None
+	context = {**siteconfig, **context}
 	# Set up our tags, which we will use to expand things
-	tags.update(context["tags"])
+	tags    = {**siteconfig["tags"], **context["tags"]}
 	# Add cdir to tags, so we can have context-dir relative paths
 	tags["cdir"] = os.path.dirname(cpath)
 	# Ok, by now we have a context dict. Expand curly braces in it
 	context = expand_context(context, tags=tags)
 	context["tags"] = tags
-	# Set the preprocess path if we have one from config
-	if ppath:
-		entry = find_label(context["metadata"], "preprocess", whole=True)
-		if entry: entry["db"] = ppath
-		else: context["metadata"].append({"db":ppath, "label":"preprocess", "unpack":"preprocess"})
 	# Check that we actually have a preprocess entry in the end
-	if not find_label(context["metadata"], "preprocess"):
+	if not get_prepdb(context):
 		raise ValueError("Could not infer preprocess archive from '%s'" % (context_or_config_or_name))
 	return context
 

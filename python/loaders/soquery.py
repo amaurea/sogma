@@ -17,18 +17,18 @@ from . import minisotodlib
 #    This parsing stuff is getting brittle and hard to maintain. The long-term solution is
 #    probably a proper parser.
 
-def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, tags=None, pre_cols=None, subobs=True, _obslist=None):
+def eval_query(obsdb, simple_query, prepdb=None, default_good=True, cols=None, tags=None, prep_cols=None, subobs=True, _obslist=None):
 	"""Given an obsdb SQL and a Simple Query, evaluate the
 	query and return a new SQL object (pointing to a temporary
 	file) containing the resulting observations."""
 	if cols is None: cols = sqlite.columns(obsdb, "obs")
 	if tags is None: tags = get_tags(obsdb)
-	if pre_cols is None and predb is not None: pre_cols = sqlite.columns(predb, "map")
+	if prep_cols is None and prepdb is not None: prep_cols = sqlite.columns(prepdb, "map")
 	if not simple_query: simple_query = "1"
 	# Check if we have a subobsdb or not
 	is_subobs = "subobs_id" in cols
 	# Main parse of the simple query
-	qinfo = parse_query(simple_query, cols, tags, pre_cols=pre_cols, default_good=default_good)
+	qinfo = parse_query(simple_query, cols, tags, prep_cols=prep_cols, default_good=default_good)
 	qjoin = ""
 	# By default, order by obs_id or subobs id
 	if is_subobs: qsort = "order by subobs_id"
@@ -38,7 +38,7 @@ def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, ta
 	res_db  = sqlite.SQL()
 	with sqlite.attach(obsdb, res_db, "res", mode="rw"):
 		# Attach preprocess db if available
-		with sqlite.attach(obsdb, predb, "pre", mode="r") if predb else contextlib.nullcontext():
+		with sqlite.attach(obsdb, prepdb, "prep", mode="r") if prepdb else contextlib.nullcontext():
 			if qinfo.idfile:
 				# Ok, an obslist was passed. The _oblist stuff is
 				# so we can reuse an already read in obslist in the
@@ -71,9 +71,9 @@ def eval_query(obsdb, simple_query, predb=None, default_good=True, cols=None, ta
 	# Ok, do the subobs expansion
 	with subobs_expansion(res_db) as subobs_db:
 		res_db.close() # don't need this one any more
-		return eval_query(subobs_db, simple_query, predb=predb, default_good=default_good, tags=tags, pre_cols=pre_cols, _obslist=_obslist)
+		return eval_query(subobs_db, simple_query, prepdb=prepdb, default_good=default_good, tags=tags, prep_cols=prep_cols, _obslist=_obslist)
 
-def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
+def parse_query(simple_query, cols, tags, prep_cols=None, default_good=True):
 	"""Gven a Simple Query, return an sqlite selection for an obsdb.
 	When cols contains 'band' and wafer_slots_list only has one entry,
 	as in a subobsdb, it will fully handle selections like ws0,f090.
@@ -239,7 +239,7 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		query += " and (det_type = 'OPTC')"
 	# Filter on valid preprocess
 	pjoin = ""
-	if pre_cols is not None:
+	if prep_cols is not None:
 		if not prep_sel["set"]: prep_sel["good"] = True
 		if prep_sel["good"] and prep_sel["bad"]:
 			# Want both good and bad, so no prep restriction required
@@ -247,13 +247,13 @@ def parse_query(simple_query, cols, tags, pre_cols=None, default_good=True):
 		elif prep_sel["good"] and not prep_sel["bad"]:
 			if "band" in cols:
 				# band is present if we have a subobsdb
-				pjoin = " join pre.map on obs.obs_id = pre.map.[obs:obs_id]"
-				if "dets:wafer_slot" in pre_cols:
-					pjoin += " and instr(obs.wafer_slots_list, pre.map.[dets:wafer_slot])"
-				if "dets:wafer.bandpass" in pre_cols:
-					pjoin += " and obs.band = pre.map.[dets:wafer.bandpass]"
+				pjoin = " join prep.map on obs.obs_id = prep.map.[obs:obs_id]"
+				if "dets:wafer_slot" in prep_cols:
+					pjoin += " and instr(obs.wafer_slots_list, prep.map.[dets:wafer_slot])"
+				if "dets:wafer.bandpass" in prep_cols:
+					pjoin += " and obs.band = prep.map.[dets:wafer.bandpass]"
 			else:
-				query += "  and obs.obs_id in (select [obs:obs_id] from pre.map)"
+				query += "  and obs.obs_id in (select [obs:obs_id] from prep.map)"
 		elif prep_sel["bad"] and not prep_sel["good"]:
 			# Selecting only bad was cumbersome to implement...
 			raise ValueError("Selecting only bad observations not supported yet")

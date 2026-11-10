@@ -7,17 +7,22 @@ from .socommon import cmeta_lookup
 
 class SoFastLoader(socommon.Loader):
 	"""Uses memory pools tod and ft"""
-	def __init__(self, context_or_config_or_name, dev=None, dtype=np.float32, pool_map={}):
+	def __init__(self, contextfile, dev=None, dtype=np.float32, pool_map={}):
 		super().__init__(dev=dev, pool_map=pool_map, dtype=dtype)
-		self.context   = socommon.get_expanded_context(context_or_config_or_name)
+		self.context   = socommon.get_expanded_context(contextfile)
 		self.obsdb     = sqlite.open(self.context["obsdb"])
-		self.predb     = sqlite.open(socommon.cmeta_lookup(self.context, "preprocess"))
-		self.fast_meta = FastMeta(self.context)
+		self.prepdb    = sqlite.open(socommon.get_prepdb(self.context))
+		self.fast_meta = FastMeta(self.context, self.prepdb)
 		# Precompute the set of valid tags. Sadly this requires a scan through the whole
 		# database, but it's not that slow so far
 		self.tags      = soquery.get_tags(self.obsdb.conn)
+		# This loader optimally comes with custom geometry and ephemeris directories
+		if "geometries" in self.context:
+			config.default("geometry_path", self.context["geometries"], "Path to directory with standard geometries")
+		if "ephemerides" in self.context:
+			config.default("asteroid_path", self.context["ephemerides"], "Path to directory with asteroid ephemerides")
 	def query(self, query=None, dets=None, detids=None):
-		res_db, pycode, slices = soquery.eval_query(self.obsdb.conn, query, tags=self.tags, predb=self.predb)
+		res_db, pycode, slices = soquery.eval_query(self.obsdb.conn, query, tags=self.tags, prepdb=self.prepdb)
 		obsinfo = soquery.finish_query(res_db, pycode, slices)
 		# If detectors are restricted, estimate how many we will end up with
 		if dets   is not None: obsinfo.ndet = np.minimum(obsinfo.ndet, len(dets))
@@ -76,16 +81,17 @@ class SoFastLoader(socommon.Loader):
 
 class SoFastLoadInfo(socommon.LoadInfo): pass
 
-config.default("cuts_optional", False, "If true, it's not an error for the expected cuts to be missing from the preprocess database")
+config.default("cuts_optional", "", "comma-separated list of cuts to silently skip if they are missing")
 class FastMeta:
-	def __init__(self, context):
+	def __init__(self, context, prep_index):
 		self.context   = context
-		self.obsfiledb = minisotodlib.ObsFileDb(context["obsfiledb"])
+		obsfileprefix  = socommon.context_lookup(context, "obsfiledb.prefix")
+		self.obsfiledb = minisotodlib.ObsFileDb(context["obsfiledb"], obsfileprefix)
 		# Open the database files we need for later obs lookups
 		# 1. The preprocess archive index. Example:
 		# /global/cfs/cdirs/sobs/sat-iso/preprocessing/satp1_20250108_init/process_archive.sqlite
 		# Opening the actual file has to wait until we know what subid we have.
-		self.prep_index = sqlite.open(cmeta_lookup(context, "preprocess"))
+		self.prep_index = prep_index
 		# 2. The det_cal index. Example:
 		# /global/cfs/cdirs/sobs/metadata/satp1/manifests/det_cal/satp1_det_cal_240312m/det_cal_local.sqlite
 		self.dcal_index = sqlite.open(cmeta_lookup(context, "det_cal"))
@@ -196,13 +202,13 @@ class FastMeta:
 					# These have order sin(1a),cos(1a),sin(2a),cos(2a),...
 					paman.wrap("hwpss_coeffs", pl.read("pre_hwpss_stats/coeffs","d"), [(0,"dets")])
 			with bench.mark("fm_cuts"):
-				optional = config.get("cuts_optional")
+				optional = config.get("cuts_optional").split(",")
 				glitches = "glitches_pre_hwpss" if has_hwp else "glitches"
-				paman.wrap("cuts_glitch", read_cuts(pl, glitches+"/glitch_flags",optional=optional), [(0,"dets"),(1,"samps")])
-				paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps",  optional=optional), [(0,"dets"),(1,"samps")])
-				paman.wrap("jumps_2pi",   read_cuts(pl, "jumps_2pi/jump_flag",  optional=optional), [(0,"dets"),(1,"samps")])
-				paman.wrap("jumps_slow",  read_cuts(pl, "jumps_slow/jump_flag", optional=optional), [(0,"dets"),(1,"samps")])
-				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional=optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_glitch", read_cuts(pl, glitches+"/glitch_flags",optional="glitch" in optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("cuts_smurf",  read_cuts(pl, "smurfgaps/smurfgaps",  optional="smurf" in optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("jumps_2pi",   read_cuts(pl, "jumps_2pi/jump_flag",  optional="2pi" in optional), [(0,"dets"),(1,"samps")])
+				paman.wrap("jumps_slow",  read_cuts(pl, "jumps_slow/jump_flag", optional="slow" in optional), [(0,"dets"),(1,"samps")])
+				#paman.wrap("cuts_turn",   read_cuts(pl, "turnaround_flags/turnarounds", optional="turn" in optional), [(0,"dets"),(1,"samps")])
 			try:
 				good = np.diff(np.concatenate([[0],pl.read("valid_data/ends")])) > 0
 			except KeyError:
@@ -223,8 +229,8 @@ class FastMeta:
 			finfos = self.obsfiledb.get_files(obsid)[detset]
 		# Get the filter params
 		with bench.mark("fm_status"):
-			#status = read_wiring_status(finfos[0][0])
-			status = self.wiring_cache.get(finfos[0][0])
+			try: status = self.wiring_cache.get(finfos[0][0])
+			except FileNotFoundError as e: raise errors.DataMissing(str(e))
 		with bench.mark("fm_iir"):
 			iir_params = bunch.Bunch()
 			pre = "AMCc.SmurfProcessor.Filter."

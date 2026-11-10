@@ -50,14 +50,20 @@ else: raise ValueError("Unknown mode '%s'" % (str(args.mode)))
 comm_all   = mpi.COMM_WORLD
 comm_per   = mpi.COMM_SELF if separate else mpi.COMM_WORLD
 mpi.install_abort_hook()
+# Set up our device
+dev = device.get_device(args.device)
 dtype      = {32:np.float32, 64:np.float64}[args.bits]
+# Set up our data loader. This should happen before we set up the geometry and ephemerides
+# because the loader may tell us where to look
+split     = args.split*1e9 if args.split else None
+fast_fail = args.ignore == "none"
+loader    = loading.get_loader(args.context, type=args.loader, group=args.joint, split=split, tsplit=args.tsplit, fast_fail=fast_fail, dev=dev, dtype=dtype)
+# Geometry
 gfile      = gutils.find_geometry(args.area)
 shape, wcs = enmap.read_map_geometry(gfile)
 if args.dump == "none" or "": dump = []
 else: dump = [int(w) for w in args.dump.split(",")]
 ocomps     = utils.parse_ints(args.ocomps)
-# Set up our device
-dev = device.get_device(args.device)
 # Set up our logging
 verbosity  = args.verbose-args.quiet
 L = logging.Logger(dev, id=comm_all.rank, level=verbosity, fmt="{id:3d} {t:8.3f} {mem:5.2f} {dmem_pools:5.2f} {dmem_rest:5.2f} {dmem_unknown:5.2f} {msg:s}").setdefault()
@@ -65,18 +71,12 @@ bench.set_verbose(verbosity >= 4)
 L.print("Init", level=0, id=0, color=colors.lgreen)
 # Benchmarking
 bench.set_tfun(dev.time)
-# Set up our memory pools. This shouldn't be necessary if I make
-# the interface a bit nicer
-dev.pools.want("tod", "ft", "pointing", "plan", "nmat_work", "cut")
 # Register ephemerides
 soeph.setup()
 # Optional detector restriction
 dets   = gutils.read_detnames(args.dets)   if args.dets   is not None else None
 detids = gutils.read_detnames(args.detids) if args.detids is not None else None
-# Set up our data loader
-split     = args.split*1e9 if args.split else None
-fast_fail = args.ignore == "none"
-loader    = loading.get_loader(args.context, type=args.loader, group=args.joint, split=split, tsplit=args.tsplit, fast_fail=fast_fail, dev=dev, dtype=dtype)
+# Actually read the data
 linfo   = loader.query(args.query, dets=dets, detids=detids)
 linfo   = linfo[gutils.parse_slice(args.sel)]
 if linfo.nobs == 0:
